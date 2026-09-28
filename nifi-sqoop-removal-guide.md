@@ -1,10 +1,10 @@
-# CFM 4.12.0 Sqoop 제거 NiFi Flow 구현 명세
+# CFM 4.12.0 Sqoop 제거 통합 설계 및 NiFi Flow 구현 명세
 
 > 기준: CFM 4.12.0 / Apache NiFi 2.6.0, Oracle → HDFS Parquet → Hive External Staging → `INSERT OVERWRITE`
 
 ## 1. 구현 범위와 전제
 
-이 문서는 [상세 설계](./nifi-sqoop-removal-design.md)를 NiFi Canvas에 그대로 옮길 수 있도록 Process Group, Processor, Controller Service, Parameter Context, Connection, 오류 처리 및 로그를 구현 수준으로 매핑한다.
+이 문서는 Sqoop 제거를 위한 아키텍처 설계와 NiFi Canvas 구현 명세를 하나로 통합한다. 설계 원칙, 상태 및 검증 모델부터 Process Group, Processor, Controller Service, Parameter Context, PostgreSQL DDL, 오류 처리와 로그까지 포함한다.
 
 예시 이름은 다음 규칙을 사용한다.
 
@@ -17,6 +17,100 @@ Attribute     : load.* / partition.* / error.* / event.*
 ```
 
 테이블 DDL, 컬럼 목록, 업무 WHERE 조건은 실제 대상별로 확정해야 한다. 테이블명과 컬럼명은 JDBC bind parameter가 될 수 없으므로 승인된 Parameter Context에서만 공급한다.
+
+---
+
+## 설계 개요와 핵심 보장
+
+### AS-IS와 TO-BE
+
+```text
+AS-IS
+Oracle → Kylo ImportSqoop → Sqoop Mapper → HDFS
+       → Hive External 임시 테이블 → INSERT OVERWRITE → 건수 검증
+
+TO-BE
+Oracle → NiFi Partition Manifest → ExecuteSQLRecord 병렬 Worker → HDFS
+       → 영속 완료 판정 → Hive External Staging 검증
+       → 단일 INSERT OVERWRITE → Target 사후 검증
+```
+
+Sqoop Mapper가 제공하던 분할 조회와 전체 Job 실패 의미를 NiFi Processor의 단순 병렬 실행만으로 대체해서는 안 된다. TO-BE는 데이터 처리 영역과 제어 영역을 분리한다.
+
+- Data plane: Oracle 조회, Record 변환, HDFS 파일 기록
+- Control plane: Run/Partition/File 상태, 완료 barrier, 검증, 게시 소유권과 복구
+
+### 불변 실행 식별자와 격리
+
+매 실행에 UUID `run_id`를 발급하고 FlowFile, PostgreSQL 관리 행, HDFS 경로와 로그에 동일하게 사용한다.
+
+```text
+job_key       = 적재 Job의 영구 식별자
+business_key  = 업무일자 또는 적재 범위 식별자
+run_id        = 한 번의 실행을 나타내는 UUID
+snapshot_scn  = 해당 run이 읽는 Oracle 고정 SCN
+partition_id  = split 범위 식별자
+```
+
+```text
+/data/nifi/stage/<job_key>/run_id=<run_id>/part=<partition_id>/part-xxxx.parquet
+```
+
+실패한 run의 파일은 다른 실행 및 최종 테이블과 섞이지 않는다. 재실행은 이전 run을 수정하지 않고 새 `run_id`를 사용한다.
+
+### Oracle 읽기 일관성
+
+여러 JDBC Connection이 서로 다른 시점의 데이터를 읽지 않도록 시작 시점에 SCN을 한 번 고정한다. source metrics, partition 예상 건수와 실제 데이터 조회는 모두 동일한 `AS OF SCN`을 사용한다.
+
+Flashback Query를 사용할 수 없다면 Oracle snapshot table, 불변 업무 마감 조건 또는 원천 변경이 없는 배치 구간을 사용한다. 추출 전후 `COUNT(*)`가 같다는 사실만으로 동일 시점 데이터는 보장되지 않는다.
+
+### 범위 파티셔닝
+
+`INSP_DTL_SEQ` 범위는 하한 포함·상한 미포함으로 생성하고 마지막 범위만 최댓값을 포함한다.
+
+```text
+partition 0   : seq >= b0   AND seq < b1
+partition 1   : seq >= b1   AND seq < b2
+partition N-1 : seq >= bN-1 AND seq <= max_seq
+```
+
+NULL은 사전 실패 또는 별도 `IS NULL` 파티션 중 하나로 명시한다. 각 range의 expected count를 동일 SCN에서 계산하고 그 합이 source count와 같은지 Worker 실행 전에 확인한다.
+
+### 완료 판정의 원장
+
+`Wait/Notify`와 NiFi Queue는 wake-up 수단이며 최종 원장이 아니다. PostgreSQL의 Run, Partition, File Manifest를 다시 조회하여 다음 조건을 모두 만족할 때만 추출 완료로 판정한다.
+
+```text
+manifest partition 수 = run.expected_partition_count
+모든 partition 상태 = SUCCESS
+FAILED/PENDING/RUNNING partition 수 = 0
+SUM(partition.actual_row_count) = run.source_count
+file audit의 chunk 수와 row count = 각 partition 결과
+```
+
+이 원칙 때문에 Notify 중복, cache 초기화 또는 NiFi 재기동이 발생해도 잘못 게시되지 않는다.
+
+### 검증 및 게시 원칙
+
+검증은 다음 네 경계를 통과한다.
+
+1. Source: Oracle SCN 기준 count, min/max, NULL, 업무 집계
+2. Extract: partition/file count, HDFS 성공 여부, row count 합계
+3. Staging: Hive external table count, schema, PK 중복과 업무 집계
+4. Target: `INSERT OVERWRITE` 후 동일 업무 범위의 count와 품질 지표
+
+건수만 일치하면 누락과 중복이 상쇄될 수 있으므로 PK NULL/중복, 주요 금액 합계, 코드별 건수 및 필요한 경우 canonical hash를 함께 사용한다. 원천 0건은 기본적으로 게시하지 않는다.
+
+게시 직전 `STAGING_VALIDATED → PUBLISHING` 상태를 publish token으로 compare-and-set하고, token 소유권을 확인한 단 하나의 FlowFile만 `INSERT OVERWRITE`를 실행한다. Hive 결과가 불명확한 timeout은 `PUBLISH_UNKNOWN`으로 남기고 자동 재실행하지 않는다.
+
+### 실패 원칙
+
+- 파티션 하나라도 최종 실패하면 전체 run을 실패시키고 게시를 금지한다.
+- 일시적 Oracle/HDFS 오류만 제한 재시도한다.
+- `ORA-01555`, 권한, SQL, schema 및 검증 오류는 즉시 실패한다.
+- 한 run의 일부 파티션만 새 SCN으로 다시 읽지 않는다.
+- 늦게 완료된 다른 파티션은 실패 run의 격리 경로에만 남고 성공 상태를 되돌리지 못한다.
+- NiFi 재기동 후 PostgreSQL manifest를 기준으로 stale partition만 동일 SCN으로 복구한다.
 
 ---
 
@@ -145,43 +239,354 @@ JDBC type 주요 값은 `NUMERIC=2`, `BIGINT=-5`, `VARCHAR=12`, `DATE=91`, `TIME
 
 운영 데이터에는 schema inference를 사용하지 않는다. Oracle JDBC schema를 상속하되, Oracle `NUMBER`, `DATE`, `TIMESTAMP`, CLOB 처리 결과가 Hive DDL과 일치하는지 사전 시험하고 필요하면 `ConvertRecord`를 추가해 명시적 schema로 변환한다.
 
-### 4.1 구현에 필요한 관리 스키마 확장
+### 4.1 PostgreSQL 관리 및 로그 스키마
 
-상세 설계의 기본 DDL에 아래 필드를 추가한다. 자료형과 partial unique index 문법은 실제 관리 DB에 맞춘다.
+PostgreSQL 13 이상을 기준으로 한다. 식별자는 따옴표 없이 소문자로 생성한다. NiFi에서는 UUID 값을 `VARCHAR` JDBC parameter로 전달하고 SQL에서 `CAST(? AS uuid)`로 변환하면 Driver별 UUID binding 차이를 줄일 수 있다.
 
-```sql
--- NIFI_LOAD_RUN 추가 필드
-ACTIVE_FLAG         CHAR(1) DEFAULT 'Y',
-PUBLISH_TOKEN       VARCHAR(64),
-PUBLISH_STARTED_AT  TIMESTAMP,
-
--- NIFI_LOAD_PARTITION 추가 필드
-CLAIM_TOKEN         VARCHAR(64),
-CLAIMED_AT          TIMESTAMP,
-FRAGMENT_COUNT      INTEGER,
-
--- 활성 실행 중복 방지. DB별 partial index 또는 별도 lock table로 구현
-UNIQUE (JOB_KEY, BUSINESS_KEY, ACTIVE_FLAG)
-```
-
-`NIFI_LOAD_FILE`은 다음 필드를 최소로 갖는다.
+#### Schema와 Run 테이블
 
 ```sql
-CREATE TABLE NIFI_LOAD_FILE (
-    RUN_ID          VARCHAR(64) NOT NULL,
-    PARTITION_ID    VARCHAR(20) NOT NULL,
-    CHUNK_INDEX     INTEGER NOT NULL,
-    FRAGMENT_COUNT  INTEGER NOT NULL,
-    HDFS_PATH       VARCHAR(1000) NOT NULL,
-    RECORD_COUNT    BIGINT NOT NULL,
-    BYTE_COUNT      BIGINT,
-    STATUS          VARCHAR(20) NOT NULL,
-    WRITTEN_AT      TIMESTAMP NOT NULL,
-    PRIMARY KEY (RUN_ID, PARTITION_ID, CHUNK_INDEX)
+CREATE SCHEMA IF NOT EXISTS nifi_ops;
+
+CREATE TABLE nifi_ops.load_run (
+    run_id                       uuid PRIMARY KEY,
+    job_key                      varchar(200) NOT NULL,
+    business_key                 varchar(200) NOT NULL,
+    status                       varchar(40) NOT NULL,
+    snapshot_scn                 numeric(38, 0),
+    source_count                 bigint,
+    source_null_split_count      bigint,
+    source_min_split             numeric(38, 0),
+    source_max_split             numeric(38, 0),
+    expected_partition_count     integer,
+    success_partition_count      integer NOT NULL DEFAULT 0,
+    failed_partition_count       integer NOT NULL DEFAULT 0,
+    extracted_count              bigint NOT NULL DEFAULT 0,
+    staging_count                bigint,
+    target_count                 bigint,
+    hdfs_run_path                varchar(1000),
+    stage_table_name             varchar(255),
+    publish_token                uuid,
+    retry_of_run_id              uuid REFERENCES nifi_ops.load_run(run_id),
+    version_no                   integer NOT NULL DEFAULT 0,
+    parameters                   jsonb NOT NULL DEFAULT '{}'::jsonb,
+    started_at                   timestamptz NOT NULL DEFAULT clock_timestamp(),
+    heartbeat_at                 timestamptz NOT NULL DEFAULT clock_timestamp(),
+    extract_completed_at         timestamptz,
+    publish_started_at           timestamptz,
+    published_at                 timestamptz,
+    completed_at                 timestamptz,
+    error_stage                  varchar(80),
+    error_code                   varchar(100),
+    error_message                varchar(2000),
+    CONSTRAINT ck_load_run_status CHECK (status IN (
+        'CREATED', 'SNAPSHOT_FIXED', 'EXTRACTING',
+        'EXTRACTED_VALIDATED', 'STAGING_VALIDATED',
+        'PUBLISHING', 'PUBLISHED', 'SUCCESS',
+        'FAILED_MANIFEST', 'FAILED_EXTRACT',
+        'FAILED_STAGE_VALIDATION', 'FAILED_PUBLISH',
+        'PUBLISH_UNKNOWN', 'FAILED_TARGET_VALIDATION',
+        'FAILED_SNAPSHOT_EXPIRED', 'TIMED_OUT'
+    )),
+    CONSTRAINT ck_load_run_counts CHECK (
+        COALESCE(source_count, 0) >= 0
+        AND COALESCE(expected_partition_count, 0) >= 0
+        AND success_partition_count >= 0
+        AND failed_partition_count >= 0
+        AND extracted_count >= 0
+    )
 );
+
+-- 동일 Job과 업무키에는 활성 run 하나만 허용한다.
+CREATE UNIQUE INDEX uq_load_run_active
+    ON nifi_ops.load_run (job_key, business_key)
+    WHERE status IN (
+        'CREATED', 'SNAPSHOT_FIXED', 'EXTRACTING',
+        'EXTRACTED_VALIDATED', 'STAGING_VALIDATED',
+        'PUBLISHING', 'PUBLISHED', 'PUBLISH_UNKNOWN'
+    );
+
+CREATE INDEX ix_load_run_status_heartbeat
+    ON nifi_ops.load_run (status, heartbeat_at);
+
+CREATE INDEX ix_load_run_job_started
+    ON nifi_ops.load_run (job_key, started_at DESC);
 ```
 
-Run이 `SUCCESS` 또는 최종 실패 상태가 되면 `ACTIVE_FLAG='N'`으로 같은 트랜잭션에서 변경한다.
+Partial unique index가 활성 실행 lock 역할을 한다. 최종 상태로 변경되면 같은 `job_key + business_key`의 새 run을 생성할 수 있다.
+
+#### Partition Manifest
+
+```sql
+CREATE TABLE nifi_ops.load_partition (
+    run_id                  uuid NOT NULL
+                            REFERENCES nifi_ops.load_run(run_id) ON DELETE RESTRICT,
+    partition_id            varchar(40) NOT NULL,
+    lower_bound             numeric(38, 0),
+    upper_bound             numeric(38, 0),
+    upper_inclusive         boolean NOT NULL DEFAULT false,
+    is_null_partition       boolean NOT NULL DEFAULT false,
+    status                  varchar(20) NOT NULL DEFAULT 'PENDING',
+    expected_row_count      bigint NOT NULL,
+    actual_row_count        bigint,
+    fragment_count          integer,
+    file_count              integer,
+    byte_count              bigint,
+    attempt_count           integer NOT NULL DEFAULT 0,
+    claim_token             uuid,
+    worker_node             varchar(200),
+    started_at              timestamptz,
+    heartbeat_at            timestamptz,
+    completed_at            timestamptz,
+    error_code              varchar(100),
+    error_message           varchar(2000),
+    PRIMARY KEY (run_id, partition_id),
+    CONSTRAINT ck_load_partition_status CHECK (status IN (
+        'PENDING', 'RUNNING', 'RETRY', 'SUCCESS', 'FAILED', 'TIMED_OUT'
+    )),
+    CONSTRAINT ck_load_partition_counts CHECK (
+        expected_row_count >= 0
+        AND COALESCE(actual_row_count, 0) >= 0
+        AND COALESCE(fragment_count, 0) >= 0
+        AND COALESCE(file_count, 0) >= 0
+        AND COALESCE(byte_count, 0) >= 0
+        AND attempt_count >= 0
+    ),
+    CONSTRAINT ck_load_partition_bounds CHECK (
+        is_null_partition
+        OR (lower_bound IS NOT NULL AND upper_bound IS NOT NULL
+            AND lower_bound <= upper_bound)
+    )
+);
+
+CREATE INDEX ix_load_partition_status
+    ON nifi_ops.load_partition (run_id, status);
+
+CREATE INDEX ix_load_partition_recovery
+    ON nifi_ops.load_partition (status, heartbeat_at)
+    WHERE status IN ('RUNNING', 'RETRY');
+```
+
+#### HDFS File Manifest
+
+```sql
+CREATE TABLE nifi_ops.load_file (
+    run_id                  uuid NOT NULL,
+    partition_id            varchar(40) NOT NULL,
+    chunk_index             integer NOT NULL,
+    fragment_identifier     varchar(100),
+    fragment_count          integer NOT NULL,
+    hdfs_path               varchar(1500) NOT NULL,
+    record_count            bigint NOT NULL,
+    byte_count              bigint,
+    checksum                varchar(128),
+    status                  varchar(20) NOT NULL DEFAULT 'WRITTEN',
+    written_at              timestamptz NOT NULL DEFAULT clock_timestamp(),
+    updated_at              timestamptz NOT NULL DEFAULT clock_timestamp(),
+    PRIMARY KEY (run_id, partition_id, chunk_index),
+    FOREIGN KEY (run_id, partition_id)
+        REFERENCES nifi_ops.load_partition(run_id, partition_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT uq_load_file_path UNIQUE (hdfs_path),
+    CONSTRAINT ck_load_file_status CHECK (status IN ('WRITTEN', 'VERIFIED', 'FAILED')),
+    CONSTRAINT ck_load_file_counts CHECK (
+        chunk_index >= 0 AND fragment_count > 0
+        AND record_count >= 0 AND COALESCE(byte_count, 0) >= 0
+    )
+);
+
+CREATE INDEX ix_load_file_partition_status
+    ON nifi_ops.load_file (run_id, partition_id, status);
+```
+
+PutHDFS 성공 후 다음 UPSERT를 실행한다. 동일 chunk 재시도는 행을 추가하지 않고 결과를 갱신한다.
+
+```sql
+INSERT INTO nifi_ops.load_file (
+    run_id, partition_id, chunk_index,
+    fragment_identifier, fragment_count,
+    hdfs_path, record_count, byte_count, status
+) VALUES (
+    CAST(? AS uuid), ?, ?, ?, ?, ?, ?, ?, 'WRITTEN'
+)
+ON CONFLICT (run_id, partition_id, chunk_index)
+DO UPDATE SET
+    fragment_identifier = EXCLUDED.fragment_identifier,
+    fragment_count      = EXCLUDED.fragment_count,
+    hdfs_path           = EXCLUDED.hdfs_path,
+    record_count        = EXCLUDED.record_count,
+    byte_count          = EXCLUDED.byte_count,
+    status              = 'WRITTEN',
+    updated_at          = clock_timestamp();
+```
+
+#### Validation 결과
+
+```sql
+CREATE TABLE nifi_ops.load_validation (
+    validation_id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    run_id                 uuid NOT NULL
+                           REFERENCES nifi_ops.load_run(run_id) ON DELETE RESTRICT,
+    stage                  varchar(30) NOT NULL,
+    metric_name            varchar(150) NOT NULL,
+    expected_value         text,
+    actual_value           text,
+    tolerance              text,
+    result                 varchar(10) NOT NULL,
+    query_version          varchar(50) NOT NULL,
+    details                jsonb NOT NULL DEFAULT '{}'::jsonb,
+    measured_at            timestamptz NOT NULL DEFAULT clock_timestamp(),
+    CONSTRAINT ck_load_validation_stage CHECK (stage IN (
+        'SOURCE', 'PARTITION', 'HDFS', 'STAGING', 'TARGET'
+    )),
+    CONSTRAINT ck_load_validation_result CHECK (result IN ('PASS', 'FAIL', 'WARN'))
+);
+
+CREATE INDEX ix_load_validation_run_stage
+    ON nifi_ops.load_validation (run_id, stage, result);
+
+CREATE UNIQUE INDEX uq_load_validation_metric
+    ON nifi_ops.load_validation (run_id, stage, metric_name, query_version);
+```
+
+`expected_value`와 `actual_value`는 count뿐 아니라 hash 및 문자열 지표도 저장할 수 있도록 `text`로 둔다. 숫자 비교와 허용 오차 판정은 검증 SQL에서 수행하고 결과를 함께 저장한다.
+
+#### PostgreSQL 로그 테이블
+
+```sql
+CREATE TABLE nifi_ops.load_event (
+    event_id               uuid PRIMARY KEY,
+    event_time             timestamptz NOT NULL DEFAULT clock_timestamp(),
+    event_level            varchar(10) NOT NULL,
+    event_name             varchar(80) NOT NULL,
+    run_id                 uuid,
+    job_key                varchar(200),
+    business_key           varchar(200),
+    partition_id           varchar(40),
+    chunk_index            integer,
+    process_group          varchar(100),
+    processor_name         varchar(150),
+    processor_id           varchar(100),
+    node_id                varchar(200),
+    attempt_no             integer,
+    row_count              bigint,
+    byte_count             bigint,
+    duration_ms            bigint,
+    error_class            varchar(40),
+    error_code             varchar(100),
+    message                varchar(2000),
+    details                jsonb NOT NULL DEFAULT '{}'::jsonb,
+    CONSTRAINT ck_load_event_level CHECK (event_level IN (
+        'TRACE', 'DEBUG', 'INFO', 'WARN', 'ERROR'
+    )),
+    CONSTRAINT ck_load_event_values CHECK (
+        COALESCE(attempt_no, 0) >= 0
+        AND COALESCE(row_count, 0) >= 0
+        AND COALESCE(byte_count, 0) >= 0
+        AND COALESCE(duration_ms, 0) >= 0
+    )
+);
+
+-- 실행 추적과 오류 검색을 위한 B-tree index
+CREATE INDEX ix_load_event_run_time
+    ON nifi_ops.load_event (run_id, event_time DESC);
+
+CREATE INDEX ix_load_event_job_time
+    ON nifi_ops.load_event (job_key, event_time DESC);
+
+CREATE INDEX ix_load_event_error
+    ON nifi_ops.load_event (event_time DESC, event_name)
+    WHERE event_level IN ('WARN', 'ERROR');
+
+-- 대용량 시계열 검색과 보존 삭제 지원
+CREATE INDEX ix_load_event_time_brin
+    ON nifi_ops.load_event USING brin (event_time);
+```
+
+`load_event.run_id`에는 의도적으로 Foreign Key를 두지 않는다. Run 정리 또는 비정상 초기화 상황에서도 운영 로그가 독립적으로 남고, 이벤트 기록 실패가 제어 트랜잭션을 방해하지 않게 하기 위해서다.
+
+로그 보존 예시는 다음과 같다. 운영에서는 PostgreSQL scheduler 또는 외부 운영 Job으로 실행한다.
+
+```sql
+DELETE FROM nifi_ops.load_event
+ WHERE event_time < clock_timestamp() - interval '90 days';
+
+VACUUM (ANALYZE) nifi_ops.load_event;
+```
+
+이벤트량이 일 수백만 건 이상이면 `event_time` 월 단위 partition table로 전환하고 다음 달 partition을 미리 생성한다.
+
+#### 원자적 Claim 함수
+
+NiFi에서 `UPDATE` 영향 건수 대신 단일 Boolean 결과를 받으려면 다음 PostgreSQL 함수를 `ExecuteSQLRecord`로 호출할 수 있다.
+
+```sql
+CREATE OR REPLACE FUNCTION nifi_ops.claim_partition(
+    p_run_id uuid,
+    p_partition_id varchar,
+    p_claim_token uuid,
+    p_worker_node varchar
+) RETURNS boolean
+LANGUAGE sql
+AS $$
+    WITH claimed AS (
+        UPDATE nifi_ops.load_partition p
+           SET status = 'RUNNING',
+               claim_token = p_claim_token,
+               worker_node = p_worker_node,
+               attempt_count = attempt_count + 1,
+               started_at = COALESCE(started_at, clock_timestamp()),
+               heartbeat_at = clock_timestamp(),
+               error_code = NULL,
+               error_message = NULL
+          FROM nifi_ops.load_run r
+         WHERE p.run_id = p_run_id
+           AND p.partition_id = p_partition_id
+           AND p.status IN ('PENDING', 'RETRY')
+           AND r.run_id = p.run_id
+           AND r.status = 'EXTRACTING'
+        RETURNING 1
+    )
+    SELECT EXISTS (SELECT 1 FROM claimed);
+$$;
+
+CREATE OR REPLACE FUNCTION nifi_ops.claim_publish(
+    p_run_id uuid,
+    p_publish_token uuid
+) RETURNS boolean
+LANGUAGE sql
+AS $$
+    WITH claimed AS (
+        UPDATE nifi_ops.load_run
+           SET status = 'PUBLISHING',
+               publish_token = p_publish_token,
+               publish_started_at = clock_timestamp(),
+               heartbeat_at = clock_timestamp(),
+               version_no = version_no + 1
+         WHERE run_id = p_run_id
+           AND status = 'STAGING_VALIDATED'
+        RETURNING 1
+    )
+    SELECT EXISTS (SELECT 1 FROM claimed);
+$$;
+```
+
+#### 권한 예시
+
+```sql
+-- 역할은 DBA가 사전에 생성한다.
+GRANT USAGE ON SCHEMA nifi_ops TO nifi_runtime;
+GRANT SELECT, INSERT, UPDATE ON ALL TABLES IN SCHEMA nifi_ops TO nifi_runtime;
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA nifi_ops TO nifi_runtime;
+GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA nifi_ops TO nifi_runtime;
+
+ALTER DEFAULT PRIVILEGES IN SCHEMA nifi_ops
+    GRANT SELECT, INSERT, UPDATE ON TABLES TO nifi_runtime;
+ALTER DEFAULT PRIVILEGES IN SCHEMA nifi_ops
+    GRANT USAGE, SELECT ON SEQUENCES TO nifi_runtime;
+```
+
+NiFi runtime에는 일반 운영 중 `DELETE`, `TRUNCATE`, `DROP` 권한을 부여하지 않는다. 보존 삭제와 스키마 변경은 별도 DBA 역할로 수행한다.
 
 ---
 
@@ -342,8 +747,8 @@ AND range gap count = 0
 ```mermaid
 flowchart TD
     I[Input: partition<br/>Round Robin] --> A[20_Set_Claim_Token<br/>UpdateAttribute]
-    A --> B[21_Claim_Partition<br/>PutSQL CAS]
-    B --> C[22_Verify_Claim<br/>ExecuteSQLRecord]
+    A --> B[21_Claim_Partition<br/>ExecuteSQLRecord function]
+    B --> C[22_Extract_Claim_Result<br/>EvaluateJsonPath]
     C --> D{23_Is_Owner<br/>RouteOnAttribute}
     D -->|no| DROP[Terminate duplicate worker]
     D -->|yes| E[24_Build_Oracle_SQL<br/>ReplaceText]
@@ -373,21 +778,18 @@ flowchart TD
 
 ### 8.2 Claim 구현
 
-20에서 `partition.claim.token=${UUID()}`를 생성한다. 21은 다음 조건부 갱신을 실행한다.
+20에서 `partition.claim.token=${UUID()}`를 생성한다. 21은 4.1에서 정의한 PostgreSQL 함수를 호출한다.
 
 ```sql
-UPDATE NIFI_LOAD_PARTITION
-   SET status='RUNNING',
-       claim_token=?,
-       worker_node=?,
-       attempt_count=attempt_count+1,
-       started_at=CURRENT_TIMESTAMP
- WHERE run_id=?
-   AND partition_id=?
-   AND status IN ('PENDING','RETRY');
+SELECT nifi_ops.claim_partition(
+    CAST(? AS uuid),
+    ?,
+    CAST(? AS uuid),
+    ?
+) AS claimed;
 ```
 
-`PutSQL`은 영향 행 수를 성공/실패 판정에 사용하지 않으므로 22에서 `run_id + partition_id`를 조회한다. 조회된 `claim_token`이 현재 FlowFile과 일치하고 Run 상태가 `EXTRACTING`일 때만 진행한다. 이 패턴이 동일 파티션의 이중 Worker를 막는다.
+parameter 순서는 `run_id`, `partition_id`, `claim_token`, `worker_node`이다. 21은 `CS_DBCP_META`와 JSON array writer를 사용하고, 22는 `$[0].claimed`를 추출한다. 값이 true인 FlowFile만 Oracle 조회로 진행한다. 함수 내부의 조건부 `UPDATE ... RETURNING`이 소유권 획득과 결과 반환을 한 PostgreSQL statement에서 수행하므로 동일 파티션의 이중 Worker를 막는다.
 
 ### 8.3 Extract SQL 생성
 
@@ -449,7 +851,7 @@ load.hdfs.part.path = ${load.hdfs.path}/part=${partition.id}
 
 `replace`는 run 전용 경로와 결정적 파일명인 경우에만 허용한다.
 
-34는 `(run_id, partition_id, chunk_index)` unique key로 `NIFI_LOAD_FILE`을 upsert한다. 저장 값은 `record.count`, `absolute.hdfs.path`, file size, fragment count, status=`WRITTEN`이다. 동일 chunk 재시도는 같은 행을 갱신한다.
+34는 `(run_id, partition_id, chunk_index)` unique key로 `nifi_ops.load_file`을 upsert한다. 저장 값은 `record.count`, `absolute.hdfs.path`, file size, fragment count, status=`WRITTEN`이다. 동일 chunk 재시도는 같은 행을 갱신한다.
 
 32 `ValidateRecord`는 Reader=`CS_PARQUET_READER`, validation schema=`CS_SCHEMA_REGISTRY`의 승인 버전, Writer=`CS_PARQUET_WRITER`로 설정한다. `invalid` 또는 `failure`가 한 건이라도 발생하면 해당 partition 전체를 실패시킨다. 대용량 재직렬화 비용이 허용되지 않으면 이 Processor를 제거할 수 있지만, 그 경우 동일 schema 검증을 staging Hive 조회에서 필수로 수행한다.
 
@@ -597,7 +999,7 @@ SELECT COUNT(*) AS STAGE_COUNT,
   FROM #{HIVE.STAGE.DB}.${load.stage.table}
 ```
 
-46은 `NIFI_LOAD_VALIDATION`에 지표별 PASS/FAIL을 저장하고, 모두 PASS일 때만 `STAGING_VALIDATED`로 CAS 갱신한다.
+46은 `nifi_ops.load_validation`에 지표별 PASS/FAIL을 저장하고, 모두 PASS일 때만 `STAGING_VALIDATED`로 CAS 갱신한다.
 
 ---
 
@@ -606,8 +1008,8 @@ SELECT COUNT(*) AS STAGE_COUNT,
 ```mermaid
 flowchart TD
     I[Input: staging-valid] --> T[50_Create_Publish_Token]
-    T --> C[51_CAS_PUBLISHING<br/>PutSQL]
-    C --> V[52_Verify_Publish_Owner<br/>ExecuteSQLRecord]
+    T --> C[51_Claim_Publish<br/>ExecuteSQLRecord function]
+    C --> V[52_Extract_Claim_Result<br/>EvaluateJsonPath]
     V --> R{53_Is_Publish_Owner}
     R -->|no| X[Terminate duplicate publish]
     R -->|yes| B[54_Build_Insert_Overwrite_SQL<br/>ReplaceText]
@@ -617,16 +1019,16 @@ flowchart TD
     S --> O[Output: published]
 ```
 
-50에서 `publish.token=${UUID()}`를 만들고 51에서 다음 CAS를 수행한다.
+50에서 `publish.token=${UUID()}`를 만들고 51에서 4.1의 PostgreSQL 함수를 호출한다.
 
 ```sql
-UPDATE NIFI_LOAD_RUN
-   SET status='PUBLISHING', publish_token=?, publish_started_at=CURRENT_TIMESTAMP
- WHERE run_id=?
-   AND status='STAGING_VALIDATED';
+SELECT nifi_ops.claim_publish(
+    CAST(? AS uuid),
+    CAST(? AS uuid)
+) AS claimed;
 ```
 
-52에서 token 소유권을 재조회하여 한 FlowFile만 55로 진입한다.
+parameter 순서는 `run_id`, `publish_token`이다. 52가 `$[0].claimed`를 추출하고 true인 한 FlowFile만 55로 진입한다.
 
 54 SQL 예시:
 
@@ -710,43 +1112,92 @@ flowchart TD
 
 ```mermaid
 flowchart LR
-    I[Input event FlowFile] --> A[90_AttributesToJSON]
-    A --> B[91_PutDatabaseRecord<br/>NIFI_LOAD_EVENT]
-    B -->|success| C[92_LogMessage]
-    B -->|failure| D[93_Event_DLQ<br/>PutFile or Kafka]
-    C --> E{94_Alert_Required}
-    E -->|yes| F[95_PutEmail or enterprise alert]
+    I[Input event FlowFile] --> P[90_Prepare_Event_Attributes<br/>UpdateAttribute]
+    P --> A[91_AttributesToJSON]
+    A --> B[92_PutSQL<br/>nifi_ops.load_event]
+    B -->|success| C[93_LogMessage]
+    B -->|failure| D[94_Event_DLQ<br/>PutFile or Kafka]
+    C --> E{95_Alert_Required}
+    E -->|yes| F[96_PutEmail or enterprise alert]
     E -->|no| T[Terminate]
 ```
 
-업무 상태를 바꾸는 `NIFI_LOAD_RUN/PARTITION/FILE/VALIDATION` 기록은 각 주 흐름에서 동기적으로 처리한다. PG-90 이벤트는 관측용이며, 이벤트 DB 장애가 데이터 FlowFile을 무한 정지시키지 않도록 로컬 보호 DLQ 또는 운영 Kafka로 보낸다.
+업무 상태를 바꾸는 `nifi_ops.load_run/load_partition/load_file/load_validation` 기록은 각 주 흐름에서 동기적으로 처리한다. PG-90 이벤트는 관측용이며, 이벤트 DB 장애가 데이터 FlowFile을 무한 정지시키지 않도록 로컬 보호 DLQ 또는 운영 Kafka로 보낸다.
 
-### 14.2 `NIFI_LOAD_EVENT`
+### 14.2 PostgreSQL 이벤트 기록
+
+테이블은 4.1의 `nifi_ops.load_event` DDL을 사용한다. `90_Prepare_Event_Attributes`는 아래 PostgreSQL 컬럼명과 동일한 attribute를 만들고, `91_AttributesToJSON`은 해당 attribute 목록을 FlowFile content로 직렬화한다. `92_PutSQL`은 `CS_DBCP_META`, Batch Size=1, Support Fragmented Transactions=false로 설정한다.
+
+`UpdateAttribute` 동적 Property 예시는 다음과 같다.
+
+```text
+event_id      = ${UUID()}
+event_time    = ${now():format("yyyy-MM-dd'T'HH:mm:ss.SSSXXX","UTC")}
+event_level   = ${event.level}
+event_name    = ${event.name}
+run_id        = ${load.run.id}
+job_key       = ${load.job.key}
+business_key  = ${load.business.key}
+partition_id  = ${partition.id}
+chunk_index   = ${chunk.index}
+process_group = ${event.process.group}
+processor_name = ${event.processor.name}
+node_id       = ${hostname(true)}
+attempt_no    = ${partition.retry.count}
+row_count     = ${event.row.count}
+duration_ms   = ${event.duration.ms}
+error_class   = ${error.class}
+error_code    = ${error.code}
+message       = ${error.message}
+```
+
+`AttributesToJSON`은 Destination=`flowfile-content`, Attributes List=`event_id,event_time,event_level,event_name,run_id,job_key,business_key,partition_id,chunk_index,process_group,processor_name,node_id,attempt_no,row_count,duration_ms,error_class,error_code,message`로 설정한다. 이 content는 DLQ와 운영 분석에 사용하고, DB INSERT는 아래 prepared SQL을 사용한다.
 
 ```sql
-CREATE TABLE NIFI_LOAD_EVENT (
-    EVENT_ID       VARCHAR(64) PRIMARY KEY,
-    EVENT_TIME     TIMESTAMP NOT NULL,
-    EVENT_LEVEL    VARCHAR(10) NOT NULL,
-    EVENT_NAME     VARCHAR(80) NOT NULL,
-    RUN_ID         VARCHAR(64),
-    JOB_KEY        VARCHAR(200),
-    BUSINESS_KEY   VARCHAR(200),
-    PARTITION_ID   VARCHAR(20),
-    CHUNK_INDEX    VARCHAR(20),
-    PROCESS_GROUP  VARCHAR(100),
-    PROCESSOR_NAME VARCHAR(150),
-    NODE_ID        VARCHAR(200),
-    ATTEMPT_NO     INTEGER,
-    ROW_COUNT      BIGINT,
-    BYTE_COUNT     BIGINT,
-    DURATION_MS    BIGINT,
-    ERROR_CLASS    VARCHAR(40),
-    ERROR_CODE     VARCHAR(100),
-    MESSAGE        VARCHAR(2000),
-    DETAILS_JSON   TEXT
+INSERT INTO nifi_ops.load_event (
+    event_id, event_time, event_level, event_name,
+    run_id, job_key, business_key, partition_id, chunk_index,
+    process_group, processor_name, node_id,
+    attempt_no, row_count, duration_ms,
+    error_class, error_code, message
+) VALUES (
+    CAST(? AS uuid), CAST(? AS timestamptz), ?, ?,
+    CAST(NULLIF(?, '') AS uuid), ?, ?, ?, CAST(NULLIF(?, '') AS integer),
+    ?, ?, ?,
+    CAST(NULLIF(?, '') AS integer), CAST(NULLIF(?, '') AS bigint),
+    CAST(NULLIF(?, '') AS bigint),
+    NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, '')
 );
 ```
+
+`sql.args.1`부터 `sql.args.18`까지 위 컬럼 순서로 매핑하고 type은 문자열 전달이 가능한 `VARCHAR(12)`를 사용한다. PostgreSQL `CAST/NULLIF`가 UUID, timestamp 및 숫자 변환을 담당하므로 선택 숫자 값이 비어 있어도 INSERT가 실패하지 않는다.
+
+생성되는 JSON 예시는 다음과 같다.
+
+```json
+{
+  "event_id": "0199d100-1111-7000-8000-000000000001",
+  "event_time": "2026-09-28T05:10:12.123Z",
+  "event_level": "INFO",
+  "event_name": "PARTITION_SUCCESS",
+  "run_id": "0199d100-2222-7000-8000-000000000002",
+  "job_key": "ORACLE_INSP_DTL_DAILY",
+  "business_key": "2026-09-28",
+  "partition_id": "0003",
+  "chunk_index": 2,
+  "process_group": "PG-30 Partition and Run Gate",
+  "processor_name": "34_Mark_Partition_SUCCESS",
+  "node_id": "nifi-02.example.com",
+  "attempt_no": 1,
+  "row_count": 500000,
+  "duration_ms": 82451,
+  "error_class": null,
+  "error_code": null,
+  "message": "partition validation passed"
+}
+```
+
+이벤트 INSERT 실패는 main flow 상태를 되돌리지 않고 JSON content를 DLQ에 저장하되, Run/Partition/File/Validation 상태 기록 실패는 해당 단계 자체를 실패시킨다.
 
 ### 14.3 필수 이벤트
 
@@ -868,12 +1319,13 @@ stateDiagram-v2
     PUBLISHING --> PUBLISHED: HiveQL 성공 응답
     PUBLISHED --> SUCCESS: target DQ PASS
 
-    CREATED --> FAILED
-    SNAPSHOT_FIXED --> FAILED
-    EXTRACTING --> FAILED
-    EXTRACTED_VALIDATED --> FAILED
-    STAGING_VALIDATED --> FAILED
+    CREATED --> FAILED_MANIFEST
+    SNAPSHOT_FIXED --> FAILED_MANIFEST
+    EXTRACTING --> FAILED_EXTRACT
+    EXTRACTED_VALIDATED --> FAILED_STAGE_VALIDATION
+    STAGING_VALIDATED --> FAILED_PUBLISH
     PUBLISHING --> PUBLISH_UNKNOWN
+    PUBLISHING --> FAILED_PUBLISH
     PUBLISHED --> FAILED_TARGET_VALIDATION
 ```
 

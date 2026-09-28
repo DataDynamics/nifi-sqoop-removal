@@ -63,11 +63,11 @@ NULL 값은 사전 검증에서 실패시키거나 `IS NULL` 전용 파티션으
 NiFi Queue나 `Wait/Notify` cache만으로 작업 완료 여부를 판정하지 않는다. 관리 DB의 Run, Partition, File Manifest가 상태의 최종 원장이다.
 
 ```text
-NIFI_LOAD_RUN
-NIFI_LOAD_PARTITION
-NIFI_LOAD_FILE
-NIFI_LOAD_VALIDATION
-NIFI_LOAD_EVENT
+nifi_ops.load_run
+nifi_ops.load_partition
+nifi_ops.load_file
+nifi_ops.load_validation
+nifi_ops.load_event
 ```
 
 `Wait/Notify`는 완료 확인을 빠르게 깨우는 용도로 사용한다. 게시 직전에는 반드시 Manifest를 다시 조회해 다음 조건을 확인한다.
@@ -83,7 +83,7 @@ NIFI_LOAD_EVENT
 파티션 Worker와 게시 Flow는 고유 token을 사용한 compare-and-set 방식으로 소유권을 획득한다.
 
 ```sql
-UPDATE NIFI_LOAD_RUN
+UPDATE nifi_ops.load_run
    SET status = 'PUBLISHING', publish_token = ?
  WHERE run_id = ?
    AND status = 'STAGING_VALIDATED';
@@ -184,16 +184,14 @@ processor_name, node_id, attempt_no, row_count, duration_ms,
 error_class, error_code, message
 ```
 
-업무 상태와 검증 결과는 관리 테이블에 동기적으로 기록하고, 운영 관측 로그는 JSON 형식의 `LogMessage`와 `NIFI_LOAD_EVENT`에 저장한다. SQL 원문, 자격증명 및 원천 행 데이터는 로그에 남기지 않는다.
+업무 상태와 검증 결과는 PostgreSQL 관리 테이블에 동기적으로 기록하고, 운영 관측 로그는 JSON 형식의 `LogMessage`와 `nifi_ops.load_event`에 저장한다. SQL 원문, 자격증명 및 원천 행 데이터는 로그에 남기지 않는다.
 
 ## 문서 구성
 
 1. [Sqoop 병렬 처리 및 전환 사전 분석](./sqoop.md)
    - 기존 Sqoop Mapper, split-by, 성능과 정합성 특성
-2. [CFM 4.12.0 기반 Sqoop 제거 상세 설계](./nifi-sqoop-removal-design.md)
-   - 목표 아키텍처, 관리 모델, 검증, 실패 및 복구 정책
-3. [Processor 단위 NiFi Flow 구현 명세](./nifi-flow-implementation.md)
-   - Processor별 연결, Property, Parameter Context, SQL, Mermaid Flow, 로그 및 운영 설정
+2. [CFM 4.12.0 Sqoop 제거 통합 설계 및 NiFi Flow 구현 명세](./nifi-sqoop-removal-guide.md)
+   - 아키텍처, 상태·검증 모델, PostgreSQL DDL, Processor별 연결, Property, Parameter Context, SQL, Mermaid Flow, 로그 및 운영 설정
 
 ## 구현 전 확인 항목
 

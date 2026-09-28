@@ -179,7 +179,10 @@ Coordinator에서 Worker로 가는 Connection은 `Round Robin` Load Balance를 �
 | `HIVE.JDBC.URL` | 환경별 HiveServer2 URL | N | HiveQL 실행 |
 | `HIVE.USER` | service account | N | Hive 계정 |
 | `HADOOP.CONF.FILES` | `core-site.xml,hdfs-site.xml` 절대경로 | N | PutHDFS |
+| `HDFS.AUTH.MODE` | `simple` | N | 비-Ker버 HDFS 인증 방식 문서화 |
 | `HDFS.STAGE.ROOT` | `/data/nifi/stage` | N | staging root |
+| `HDFS.PERMISSIONS.UMASK` | `027` | N | PutHDFS 생성 파일/경로 umask |
+| `HDFS.REPLICATION` | 환경 기본값 또는 `3` | N | 필요 시 PutHDFS replication override |
 | `WORKER.CONCURRENT.TASKS` | `2` | N | 노드당 추출 병렬도 |
 | `ORACLE.POOL.MAX` | `8` | N | 전체 노드 정책과 맞춤 |
 | `EXTRACT.FETCH.SIZE` | `5000` | N | JDBC fetch size |
@@ -227,7 +230,7 @@ JDBC type 주요 값은 `NUMERIC=2`, `BIGINT=-5`, `VARCHAR=12`, `DATE=91`, `TIME
 |---|---|---|
 | `CS_DBCP_ORACLE` | `HikariCPConnectionPool` | URL/계정/ojdbc, Max Total=`${ORACLE.POOL.MAX}`, validation query=`SELECT 1 FROM DUAL` |
 | `CS_DBCP_META` | `HikariCPConnectionPool` | 관리 DB, Max Total 10~20, autocommit 정책 확인 |
-| `CS_HIVE3_DBCP` | 환경에 맞는 Hive3 Connection Pool | Kerberos principal/keytab 또는 workload identity |
+| `CS_HIVE3_DBCP` | 환경에 맞는 Hive3 Connection Pool | HiveServer2의 실제 인증 방식 적용 |
 | `CS_JSON_READER` | `JsonTreeReader` | Schema Access=`Infer Schema`는 제어 레코드에만 사용 |
 | `CS_JSON_WRITER_ARRAY` | `JsonRecordSetWriter` | Output Grouping=`Array`, pretty print=false |
 | `CS_JSON_WRITER_LINE` | `JsonRecordSetWriter` | Output Grouping=`One Line per Object` |
@@ -235,7 +238,6 @@ JDBC type 주요 값은 `NUMERIC=2`, `BIGINT=-5`, `VARCHAR=12`, `DATE=91`, `TIME
 | `CS_PARQUET_READER` | `ParquetReader` | ValidateRecord에서 기록 결과 schema를 다시 읽음 |
 | `CS_SCHEMA_REGISTRY` | 조직 표준 Schema Registry | target Avro schema를 버전으로 고정 |
 | `CS_DMC_CLIENT` | `DistributedMapCacheClientService` | 모든 NiFi 노드가 공유하는 외부/공용 cache endpoint |
-| `CS_KERBEROS_HDFS` | 배포판 지원 Kerberos User Service | service principal/keytab |
 
 운영 데이터에는 schema inference를 사용하지 않는다. Oracle JDBC schema를 상속하되, Oracle `NUMBER`, `DATE`, `TIMESTAMP`, CLOB 처리 결과가 Hive DDL과 일치하는지 사전 시험하고 필요하면 `ConvertRecord`를 추가해 명시적 schema로 변환한다.
 
@@ -623,6 +625,8 @@ SCN, partition bound, count는 숫자 정규식으로 검증한 뒤 SQL에 사�
 
 ## 6. PG-00 Trigger
 
+### 6.1 Processor 흐름
+
 ```mermaid
 flowchart LR
     A[00_Generate_Schedule<br/>GenerateFlowFile] --> B[01_Set_Trigger_Attributes<br/>UpdateAttribute]
@@ -631,11 +635,13 @@ flowchart LR
     C -->|invalid| E[PG-90 Fatal Error]
 ```
 
-| ID | Processor | 핵심 설정 | Relationship |
-|---|---|---|---|
-| 00 | `GenerateFlowFile` | Primary only, CRON 또는 상위 scheduler 입력, Custom Text=`{}` | success→01 |
-| 01 | `UpdateAttribute` | `load.job.key=#{JOB.KEY}`, `load.business.key=${now():format('yyyy-MM-dd','Asia/Seoul')}`, `load.trigger.type=SCHEDULE` | success→02 |
-| 02 | `RouteOnAttribute` | 업무키 형식과 필수값 검증 | valid→PG-10, unmatched→Fatal |
+### 6.2 주요 Processor 설정
+
+| ID | Processor | Scheduling | 주요 Properties | Relationship |
+|---|---|---|---|---|
+| 00 | `GenerateFlowFile` | Primary, 1, CRON | Custom Text=`{}`, Unique FlowFiles=true | success→01 |
+| 01 | `UpdateAttribute` | Primary, 1, input driven | `load.job.key=#{JOB.KEY}`, `load.business.key=${now():format('yyyy-MM-dd','Asia/Seoul')}`, `load.trigger.type=SCHEDULE` | success→02 |
+| 02 | `RouteOnAttribute` | Primary, 1 | 업무키 정규식, Job key와 필수 Parameter 존재 여부 검증 | valid→PG-10, unmatched→PG-90 Fatal |
 
 외부에서 업무일자를 전달받는 경우 `HandleHttpRequest` 등을 직접 worker에 연결하지 않고 인증된 상위 orchestration flow가 이 Process Group의 Input Port를 호출하도록 한다.
 
@@ -675,25 +681,26 @@ flowchart TD
 
 ### 7.2 주요 Processor 설정
 
-| ID | Processor | Scheduling | 주요 Properties |
-|---|---|---|---|
-| 10 | `UpdateAttribute` | Primary, 1 | `load.run.id=${UUID()}`, `load.started.at=${now():format("yyyy-MM-dd'T'HH:mm:ss.SSSX","UTC")}`, run HDFS path와 stage table 계산 |
-| 11 | `PutSQL` | Primary, 1 | `CS_DBCP_META`, Batch Size=1, SQL Statement 사용, `(job_key,business_key,active_flag)` unique lock |
-| 12 | `ExecuteSQLRecord` | Primary, 1 | Oracle pool, SQL=`SELECT current_scn AS SNAPSHOT_SCN FROM v$database`, JSON array writer |
-| 13 | `EvaluateJsonPath` | Primary, 1 | `load.snapshot.scn=$[0].SNAPSHOT_SCN`, Destination=`flowfile-attribute` |
-| 14 | `RouteOnAttribute` | Primary, 1 | `${load.snapshot.scn:matches('^[0-9]+$')}` |
-| 15 | `ExecuteSQLRecord` | Primary, 1 | 아래 source metric SQL, JSON array writer, timeout 적용 |
-| 16 | `EvaluateJsonPath` | Primary, 1 | count/min/max/null/DQ 값을 attribute로 추출 |
-| 17 | `RouteOnAttribute` | Primary, 1 | empty source, NULL split 정책, min/max 유효성 분기 |
-| 18 | `PutSQL` | Primary, 1 | SCN/metrics 저장 후 Run을 `EXTRACTING`으로 갱신; 상태 이력에는 `SNAPSHOT_FIXED` 이벤트도 기록 |
-| 19 | `ExecuteSQLRecord` | Primary, 1 | 동일 SCN에서 range와 expected row count 생성; Max Rows Per FlowFile=0, Output Batch Size=0 |
-| 19A | `UpdateAttribute` | Primary, 1 | `load.partition.count=${record.count}`; SplitRecord 전에 보존 |
-| 19B | `PutSQL` | Primary, 1 | Run의 `EXPECTED_PARTITION_COUNT` 저장; Support Fragmented Transactions=false, Batch Size=1 |
-| 20 | `SplitRecord` | Primary, 1 | Reader=JSON, Writer=JSON line, Records Per Split=1 |
-| 21 | `EvaluateJsonPath` | Primary, 1 | partition id/lower/upper/expected/null flag 추출 |
-| 22 | `PutSQL` | Primary, 1 | manifest 행 INSERT, unique(run_id,partition_id) |
-| 24 | `PutSQL` | Primary, 1 | 0건 파티션은 `SUCCESS`, actual=0으로 즉시 완료 |
-| 25 | `UpdateAttribute` + `ReplaceText` | Primary, 1 | control content를 `{}`로 축소; 분할 전 저장한 `load.partition.count` 유지 |
+| ID | Processor | Scheduling | 주요 Properties | Relationship |
+|---|---|---|---|---|
+| 10 | `UpdateAttribute` | Primary, 1 | `load.run.id=${UUID()}`, 시작시각, run HDFS path와 stage table 계산 | success→11 |
+| 11 | `PutSQL` | Primary, 1 | `CS_DBCP_META`, Batch Size=1, Fragmented=false, active partial unique index로 lock | success→12, retry→RetryFlowFile, failure→오류 분류 |
+| 12 | `ExecuteSQLRecord` | Primary, 1 | `CS_DBCP_ORACLE`, current SCN SQL, `CS_JSON_WRITER_ARRAY`, Max Rows=0 | success→13, failure→PG-90 |
+| 13 | `EvaluateJsonPath` | Primary, 1 | `load.snapshot.scn=$[0].SNAPSHOT_SCN`, Destination=attribute | matched→14, failure/unmatched→PG-90 |
+| 14 | `RouteOnAttribute` | Primary, 1 | `${load.snapshot.scn:matches('^[0-9]+$')}` | valid→15, unmatched→PG-90 |
+| 15 | `ExecuteSQLRecord` | Primary, 1 | `CS_DBCP_ORACLE`, source metrics SQL, JSON array writer, Query Timeout | success→16, failure→PG-90 |
+| 16 | `EvaluateJsonPath` | Primary, 1 | count/min/max/null/DQ 값을 attribute로 추출 | matched→17, failure/unmatched→PG-90 |
+| 17 | `RouteOnAttribute` | Primary, 1 | empty source, NULL 정책, min/max 유효성 | valid→18, invalid→PG-90 |
+| 18 | `PutSQL` | Primary, 1 | `CS_DBCP_META`, SCN/metrics 저장, status=`EXTRACTING`, Fragmented=false | success→19, retry/failure→PG-90 |
+| 19 | `ExecuteSQLRecord` | Primary, 1 | 동일 SCN manifest SQL, JSON writer, Max Rows=0, Output Batch=0 | success→19A, failure→PG-90 |
+| 19A | `UpdateAttribute` | Primary, 1 | `load.partition.count=${record.count}` | success→19B |
+| 19B | `PutSQL` | Primary, 1 | expected partition count 저장, Batch Size=1, Fragmented=false | success→20, retry/failure→PG-90 |
+| 20 | `SplitRecord` | Primary, 1 | Reader=`CS_JSON_READER`, Writer=`CS_JSON_WRITER_LINE`, Records Per Split=1 | splits→21, original→25, failure→PG-90 |
+| 21 | `EvaluateJsonPath` | Primary, 1 | partition id/lower/upper/expected/null flag 추출 | matched→22, failure/unmatched→PG-90 |
+| 22 | `PutSQL` | Primary, 1 | manifest INSERT, Batch Size≤partition 수, Fragmented=true | success→23, retry/failure→PG-90 |
+| 23 | `UpdateAttribute` 또는 PG-90 port | Primary, 1 | `event.name=PARTITION_CREATED`, `event.level=DEBUG` | expected>0→Worker, expected=0→24 |
+| 24 | `PutSQL` + `Notify` | Primary, 1 | 0건 partition을 SUCCESS/actual=0 처리 후 run progress signal | success→terminate, failure→PG-90 |
+| 25 | `UpdateAttribute` + `ReplaceText` | Primary, 1 | control content=`{}`, 저장된 `load.partition.count` 유지 | success→PG-30 run-control |
 
 중복 Run lock INSERT 실패는 일반 DB 장애와 구분해야 한다. SQLState/벤더코드로 unique violation이면 `DUPLICATE_ACTIVE_RUN`으로 종료하고, 연결 장애만 제한 재시도한다.
 
@@ -776,7 +783,31 @@ flowchart TD
     CTRL --> O[Output: partition-control]
 ```
 
-### 8.2 Claim 구현
+### 8.2 주요 Processor 설정
+
+PG-20의 Connection은 PG-10에서 들어오는 입력에만 Round Robin Load Balance를 적용한다. 각 Worker Processor는 All Nodes에서 동작하며 동시성은 Oracle pool 상한을 넘지 않게 한다.
+
+| ID | Processor | Scheduling | 주요 Properties | Relationship |
+|---|---|---|---|---|
+| 20 | `UpdateAttribute` | All Nodes, `${WORKER.CONCURRENT.TASKS}` | `partition.claim.token=${UUID()}`, worker node와 시작시각 설정 | success→21 |
+| 21 | `ExecuteSQLRecord` | All Nodes, worker concurrency | `CS_DBCP_META`, `claim_partition` 호출, JSON array writer, Max Rows=0 | success→22, failure→PG-90/제한 재시도 |
+| 22 | `EvaluateJsonPath` | All Nodes, worker concurrency | `partition.claimed=$[0].claimed` | matched→23, failure/unmatched→PG-90 |
+| 23 | `RouteOnAttribute` | All Nodes, worker concurrency | `${partition.claimed:equals('true')}` | true→24, false→중복 Worker 종료 |
+| 24 | `ReplaceText` | All Nodes, worker concurrency | Replacement Strategy=Entire text, partition 유형별 Oracle SQL 생성 | success→25, failure→PG-90 |
+| 25 | `ExecuteSQLRecord` | All Nodes, `${WORKER.CONCURRENT.TASKS}` | `CS_DBCP_ORACLE`, `CS_PARQUET_WRITER`, Fetch/Rows/Timeout은 아래 표 참조 | success→26, failure→27 |
+| 26 | `RouteOnAttribute` | All Nodes, worker concurrency | `${fragment.index:equals('0')}` | first→29, other→31 |
+| 27 | `RouteOnAttribute` | All Nodes, worker concurrency | Oracle vendor code/SQLState로 transient, ORA-01555, permanent 분류 | transient→28, non-retryable→PG-90 |
+| 28 | `RetryFlowFile` | All Nodes, worker concurrency | Retry Attribute=`partition.retry.count`, Maximum=`#{PARTITION.RETRY.MAX}`, Penalize=true | retry→24, exceeded/failure→PG-90 |
+| 29 | `DuplicateFlowFile` | All Nodes, worker concurrency | Copies=1; 첫 chunk에서 data와 control 분기 | original→31, duplicate→30 |
+| 30 | `ReplaceText` + `UpdateAttribute` | All Nodes, worker concurrency | content=`{}`, partition control 속성과 `fragment.count` 유지 | success→PG-30 partition-control |
+| 31 | `UpdateAttribute` | All Nodes, worker concurrency | chunk index/count, 결정적 filename, HDFS part path 설정 | success→32 |
+| 32 | `ValidateRecord` | All Nodes, worker concurrency | Reader=`CS_PARQUET_READER`, Writer=`CS_PARQUET_WRITER`, validation schema 고정 | valid→33, invalid/failure→PG-90 |
+| 33 | `PutHDFS` | All Nodes, HDFS 부하 기준 | Hadoop config만 설정, Kerberos service 미설정, umask, replication, replace, Write and rename | success→34, failure→35 |
+| 34 | `PutSQL` | All Nodes, worker concurrency | `CS_DBCP_META`, `load_file` UPSERT, Batch=1, Fragmented=false | success→36, retry/failure→PG-90 |
+| 35 | `RetryFlowFile` | All Nodes, worker concurrency | HDFS 전용 retry attribute, 최대 횟수와 penalty 설정 | retry→33, exceeded/failure→PG-90 |
+| 36 | `Notify` | All Nodes, worker concurrency | Cache=`CS_DMC_CLIENT`, key=`run_id:partition_id`, counter=`chunks`, delta=1 | success→data FlowFile 종료, failure→PG-90 |
+
+### 8.3 Claim 구현
 
 20에서 `partition.claim.token=${UUID()}`를 생성한다. 21은 4.1에서 정의한 PostgreSQL 함수를 호출한다.
 
@@ -791,7 +822,7 @@ SELECT nifi_ops.claim_partition(
 
 parameter 순서는 `run_id`, `partition_id`, `claim_token`, `worker_node`이다. 21은 `CS_DBCP_META`와 JSON array writer를 사용하고, 22는 `$[0].claimed`를 추출한다. 값이 true인 FlowFile만 Oracle 조회로 진행한다. 함수 내부의 조건부 `UPDATE ... RETURNING`이 소유권 획득과 결과 반환을 한 PostgreSQL statement에서 수행하므로 동일 파티션의 이중 Worker를 막는다.
 
-### 8.3 Extract SQL 생성
+### 8.4 Extract SQL 생성
 
 중간 파티션:
 
@@ -827,7 +858,7 @@ sql.args.3 = upper bound, NUMERIC(2)
 
 `Output Batch Size=0`이어야 한 ResultSet의 `fragment.count`, `fragment.index`, `fragment.identifier`가 완전하게 생성된다. 파티션 크기가 너무 커 session/repository 압력이 생기면 Output Batch를 켜기보다 논리 파티션 수를 늘린다.
 
-### 8.4 Chunk 기록
+### 8.5 Chunk 기록
 
 31에서 다음 속성을 만든다.
 
@@ -843,13 +874,15 @@ load.hdfs.part.path = ${load.hdfs.path}/part=${partition.id}
 | Property | 값 |
 |---|---|
 | Hadoop Configuration Resources | `#{HADOOP.CONF.FILES}` |
-| Kerberos User Service | `CS_KERBEROS_HDFS` |
+| Kerberos User Service | 설정하지 않음 |
 | Directory | `${load.hdfs.part.path}` |
 | Conflict Resolution Strategy | `replace` |
 | Writing Strategy | `Write and rename` |
+| Permissions umask | `#{HDFS.PERMISSIONS.UMASK}` |
+| Replication | `#{HDFS.REPLICATION}` 또는 공란으로 HDFS 기본값 사용 |
 | Concurrent Tasks | Worker 동시성과 HDFS 부하에 맞춰 설정 |
 
-`replace`는 run 전용 경로와 결정적 파일명인 경우에만 허용한다.
+HDFS에는 Kerberos가 적용되지 않았으므로 `Kerberos User Service`, principal, keytab을 구성하지 않는다. NiFi 프로세스를 실행하는 OS 사용자가 HDFS client의 effective user가 되므로 staging root와 하위 경로에 필요한 POSIX 권한 또는 ACL을 사전에 부여한다. `core-site.xml`의 인증 방식과 `fs.defaultFS`가 실제 HDFS 환경을 가리키는지 확인한다. `replace`는 run 전용 경로와 결정적 파일명인 경우에만 허용한다.
 
 34는 `(run_id, partition_id, chunk_index)` unique key로 `nifi_ops.load_file`을 upsert한다. 저장 값은 `record.count`, `absolute.hdfs.path`, file size, fragment count, status=`WRITTEN`이다. 동일 chunk 재시도는 같은 행을 갱신한다.
 
@@ -897,6 +930,26 @@ flowchart TD
     RP --> RQ
     SU --> OUT[Output: extracted-valid]
 ```
+
+### 9.2 주요 Processor 설정
+
+| ID | Processor | Scheduling | 주요 Properties | Relationship |
+|---|---|---|---|---|
+| 30 | `Wait` | Primary, 1 | Cache=`CS_DMC_CLIENT`, partition signal key/counter, target=`${fragment.count}`, expiration 설정 | success/expired→31, wait→자기 입력 queue, failure→PG-90 |
+| 31 | `ExecuteSQLRecord` | Primary, 1 | `CS_DBCP_META`, `load_file`의 file/row/failed 합계 조회, JSON writer | success→32, failure→재시도/PG-90 |
+| 32 | `EvaluateJsonPath` | Primary, 1 | audit file count, row count, failed count와 run status 추출 | matched→33, failure/unmatched→PG-90 |
+| 33 | `RouteOnAttribute` | Primary, 1 | chunk 수, expected rows, deadline, run status 비교 | complete→34, pending→35, mismatch/timeout→PG-90 |
+| 34 | `PutSQL` | Primary, 1 | claim token 조건으로 partition SUCCESS 및 실제 count/file/byte 저장, Fragmented=false | success→36, retry/failure→PG-90 |
+| 35 | `RetryFlowFile` | Primary, 1 | partition gate polling count, deadline 전 penalty | retry→31, exceeded/failure→PG-90 |
+| 36 | `Notify` | Primary, 1 | key=`${load.run.id}`, counter=`partitions`, delta=1 | success→37, failure→39 DB 확인 경로 |
+| 37 | `UpdateAttribute` + Output Port | Primary, 1 | `gate.source=partition-success` | success→39 |
+| 38 | `Wait` | Primary, 1 | run signal key/counter, target=`${load.partition.count}`, run expiration | success/expired→39, wait→자기 queue, failure→39 |
+| 39 | `ExecuteSQLRecord` | Primary, 1 | PostgreSQL partition 상태/count 집계 SQL, JSON writer | success→40, failure→재시도/PG-90 |
+| 40 | `EvaluateJsonPath` | Primary, 1 | total/success/failed/pending/extracted count 추출 | matched→41, failure/unmatched→PG-90 |
+| 41 | `RouteOnAttribute` | Primary, 1 | 전체 완료식과 source count 비교 | complete→42, any failed→43, pending→44 |
+| 42 | `PutSQL` | Primary, 1 | status `EXTRACTING→EXTRACTED_VALIDATED` CAS, 완료 count 저장 | success→PG-40, retry/failure→PG-90 |
+| 43 | `PutSQL` | Primary, 1 | status `EXTRACTING→FAILED_EXTRACT`, 오류 요약/완료시각 저장 | success→PG-90 알림, failure→관리 DB 장애 알림 |
+| 44 | `RetryFlowFile` | Primary, 1 | run gate polling count와 deadline 적용 | retry→39, exceeded/failure→43 |
 
 30 `Wait` 설정:
 
@@ -957,6 +1010,8 @@ Partition failure 공통 경로는 partition과 run을 실패 상태로 갱신�
 
 ## 10. PG-40 Staging Validation
 
+### 10.1 Processor 흐름
+
 ```mermaid
 flowchart TD
     I[Input: extracted-valid] --> A[40_Create_SUCCESS_Marker<br/>ReplaceText + PutHDFS]
@@ -970,6 +1025,20 @@ flowchart TD
     R -->|mismatch| F
     S --> O[Output: staging-valid]
 ```
+
+### 10.2 주요 Processor 설정
+
+| ID | Processor | Scheduling | 주요 Properties | Relationship |
+|---|---|---|---|---|
+| 40A | `ReplaceText` | Primary, 1 | Replacement Strategy=Entire text, Replacement Value=빈 값 | success→40B, failure→PG-90 |
+| 40B | `UpdateAttribute` | Primary, 1 | `filename=_SUCCESS`, Directory=`${load.hdfs.path}` | success→40C |
+| 40C | `PutHDFS` | Primary, 1 | Hadoop config만 설정, Kerberos service 미설정, Write and rename, conflict=replace | success→41, failure→PG-90/제한 재시도 |
+| 41 | `ReplaceText` | Primary, 1 | 승인된 external table DDL로 전체 content 치환 | success→42, failure→PG-90 |
+| 42 | `PutHive3QL` 또는 `PutClouderaHiveQL` | Primary, 1 | `CS_HIVE3_DBCP`, Query Timeout, DDL 1건 | success→43, failure→PG-90 |
+| 43 | `SelectHive3QL` 또는 `ExecuteSQLRecord` | Primary, 1 | stage count/NULL/중복/min/max/업무 합계 SQL, JSON writer | success→44, failure→PG-90 |
+| 44 | `EvaluateJsonPath` | Primary, 1 | stage metrics를 `validation.stage.*` attribute로 추출 | matched→45, failure/unmatched→PG-90 |
+| 45 | `RouteOnAttribute` | Primary, 1 | source/extracted/staging count 및 DQ 지표 비교 | match→46, mismatch→PG-90 |
+| 46 | `PutSQL` | Primary, 1 | validation UPSERT/INSERT 후 `EXTRACTED_VALIDATED→STAGING_VALIDATED` CAS, Fragmented=false | success→PG-50, retry/failure→PG-90 |
 
 40은 기존 control FlowFile의 content를 `ReplaceText`로 비우고 `filename=_SUCCESS`를 설정한 뒤 run root에 `Write and rename`으로 기록한다. FlowFile attribute는 유지되므로 PutHDFS 성공 관계에서 바로 41로 진행한다. 이 파일은 global manifest 검증 후에만 존재한다.
 
@@ -1005,6 +1074,8 @@ SELECT COUNT(*) AS STAGE_COUNT,
 
 ## 11. PG-50 Publish
 
+### 11.1 Processor 흐름
+
 ```mermaid
 flowchart TD
     I[Input: staging-valid] --> T[50_Create_Publish_Token]
@@ -1018,6 +1089,18 @@ flowchart TD
     P -->|failure| F[PG-90 FAILED_PUBLISH]
     S --> O[Output: published]
 ```
+
+### 11.2 주요 Processor 설정
+
+| ID | Processor | Scheduling | 주요 Properties | Relationship |
+|---|---|---|---|---|
+| 50 | `UpdateAttribute` | Primary, 1 | `publish.token=${UUID()}`, publish 요청시각 | success→51 |
+| 51 | `ExecuteSQLRecord` | Primary, 1 | `CS_DBCP_META`, `claim_publish` 함수, JSON array writer, Max Rows=0 | success→52, failure→PG-90 |
+| 52 | `EvaluateJsonPath` | Primary, 1 | `publish.claimed=$[0].claimed` | matched→53, failure/unmatched→PG-90 |
+| 53 | `RouteOnAttribute` | Primary, 1 | `${publish.claimed:equals('true')}` | true→54, false→중복 publish 종료 |
+| 54 | `ReplaceText` | Primary, 1 | 승인된 target/partition/column로 `INSERT OVERWRITE` SQL 생성 | success→55, failure→PG-90 |
+| 55 | `PutHive3QL` 또는 `PutClouderaHiveQL` | Primary, 1 | `CS_HIVE3_DBCP`, Query Timeout, Concurrent=1, 환경 지원 시 Rollback On Failure=true | success→56, failure/timeout→PG-90 또는 PUBLISH_UNKNOWN |
+| 56 | `PutSQL` | Primary, 1 | publish token 조건으로 `PUBLISHING→PUBLISHED`, published_at 저장 | success→PG-60, retry/failure→PG-90 |
 
 50에서 `publish.token=${UUID()}`를 만들고 51에서 4.1의 PostgreSQL 함수를 호출한다.
 
@@ -1041,21 +1124,13 @@ SELECT #{HIVE.INSERT.COLUMNS}
 
 전체 테이블이 아니라 업무일자 파티션만 교체해야 한다면 `TARGET.PARTITION.CLAUSE`를 반드시 설정한다. SQL에는 FlowFile에서 받은 임의 identifier를 사용하지 않는다.
 
-55 설정:
-
-| Property | 값 |
-|---|---|
-| Hive Database Connection Pooling Service | `CS_HIVE3_DBCP` |
-| Query Timeout | 업무 SLA보다 크고 무한대는 피함 |
-| Rollback On Failure | Processor 제공 시 true |
-| Concurrent Tasks | 1 |
-| Execution | Primary Node |
-
 Hive 응답을 받지 못해 성공 여부가 불명확한 timeout은 자동 재실행하지 않고 `PUBLISH_UNKNOWN`으로 기록한다. Recovery Monitor가 Hive query history와 target 지표를 확인한 후 운영 정책에 따라 확정한다.
 
 ---
 
 ## 12. PG-60 Target Validation
+
+### 12.1 Processor 흐름
 
 ```mermaid
 flowchart TD
@@ -1069,6 +1144,17 @@ flowchart TD
     C -->|mismatch| F[PG-90 FAILED_TARGET_VALIDATION]
     Q -->|failure| F
 ```
+
+### 12.2 주요 Processor 설정
+
+| ID | Processor | Scheduling | 주요 Properties | Relationship |
+|---|---|---|---|---|
+| 60 | `SelectHive3QL` 또는 `ExecuteSQLRecord` | Primary, 1 | target 업무 범위 count/NULL/중복/min/max/업무 합계 SQL, JSON writer | success→61, failure→PG-90 |
+| 61 | `EvaluateJsonPath` | Primary, 1 | target metrics를 `validation.target.*` attribute로 추출 | matched→62, failure/unmatched→PG-90 |
+| 62 | `RouteOnAttribute` | Primary, 1 | source/extracted/stage/target count와 DQ 지표 비교 | match→63, mismatch→PG-90 |
+| 63 | `PutSQL` | Primary, 1 | `nifi_ops.load_validation`에 TARGET 지표 저장, Fragmented=false | success→64, retry/failure→PG-90 |
+| 64 | `PutSQL` | Primary, 1 | `PUBLISHED→SUCCESS` CAS, target_count/completed_at 저장 | success→65, retry/failure→PG-90 |
+| 65 | `UpdateAttribute` + PG-90 port | Primary, 1 | `event.name=RUN_SUCCESS`, `event.level=INFO`, 최종 count/duration 설정 | success→완료 Output Port |
 
 62 조건:
 
@@ -1084,6 +1170,8 @@ AND target business aggregates = stage/source aggregates
 
 ## 13. PG-70 Recovery Monitor
 
+### 13.1 Processor 흐름
+
 ```mermaid
 flowchart TD
     A[70_Generate_Recovery_Tick<br/>GenerateFlowFile Primary] --> B[71_Query_Stale_Runs<br/>ExecuteSQLRecord]
@@ -1096,6 +1184,21 @@ flowchart TD
     D -->|PUBLISHING| I[78_Mark_PUBLISH_UNKNOWN_And_Alert]
     D -->|SCN expired| J[79_FAIL_SNAPSHOT_EXPIRED]
 ```
+
+### 13.2 주요 Processor 설정
+
+| ID | Processor | Scheduling | 주요 Properties | Relationship |
+|---|---|---|---|---|
+| 70 | `GenerateFlowFile` | Primary, 1, 5분 | Custom Text=`{}`, recovery tick 속성 설정 | success→71 |
+| 71 | `ExecuteSQLRecord` | Primary, 1 | `CS_DBCP_META`, 활성 상태와 heartbeat 임계시간으로 stale run 조회, JSON writer | success→72, failure→PG-90 |
+| 72 | `SplitRecord` | Primary, 1 | JSON reader/writer, Records Per Split=1 | splits→73, original→terminate, failure→PG-90 |
+| 73 | `RouteOnAttribute` | Primary, 1 | run status별 recovery 경로 분기 | EXTRACTING→74, validated→77, PUBLISHING→78, SCN expired→79 |
+| 74 | `ExecuteSQLRecord` | Primary, 1 | stale `RUNNING/RETRY` partition과 claim token 조회 | success→SplitRecord/75, failure→PG-90 |
+| 75 | `PutSQL` | Primary, 1 | 기존 claim token과 heartbeat 조건의 CAS로 status=`RETRY`, claim 초기화 | success→76, retry/failure→PG-90 |
+| 76 | `UpdateAttribute` + Output Port | Primary, 1 | 기존 run_id/snapshot_scn/partition bounds 유지, recovery event 설정 | success→PG-20 Round Robin 입력 |
+| 77 | `UpdateAttribute` + Output Port | Primary, 1 | run-control 재생성, 저장된 expected partition count 사용 | success→PG-30 run gate |
+| 78 | `PutSQL` + PG-90 port | Primary, 1 | `PUBLISHING→PUBLISH_UNKNOWN`, 자동 재실행 금지, ERROR 알림 | success→운영 확인 queue |
+| 79 | `PutSQL` + PG-90 port | Primary, 1 | `FAILED_SNAPSHOT_EXPIRED`, error/completed_at 저장 | success→실패 알림 |
 
 - Primary Node, 5분 주기, Concurrent Tasks=1
 - `heartbeat_at < now - #{RECOVERY.STALE.MINUTES}`인 활성 run만 조회
@@ -1124,7 +1227,19 @@ flowchart LR
 
 업무 상태를 바꾸는 `nifi_ops.load_run/load_partition/load_file/load_validation` 기록은 각 주 흐름에서 동기적으로 처리한다. PG-90 이벤트는 관측용이며, 이벤트 DB 장애가 데이터 FlowFile을 무한 정지시키지 않도록 로컬 보호 DLQ 또는 운영 Kafka로 보낸다.
 
-### 14.2 PostgreSQL 이벤트 기록
+### 14.2 주요 Processor 설정
+
+| ID | Processor | Scheduling | 주요 Properties | Relationship |
+|---|---|---|---|---|
+| 90 | `UpdateAttribute` | All Nodes, 2~4 | event_id/time/level/name, run/partition/chunk, 오류 및 처리량 속성 정규화 | success→91 |
+| 91 | `AttributesToJSON` | All Nodes, 2~4 | Destination=flowfile-content, 지정 attribute 목록만 포함, pretty print=false | success→92, failure→94 |
+| 92 | `PutSQL` | All Nodes, 2~4 | `CS_DBCP_META`, event INSERT prepared SQL, Batch=1, Fragmented=false | success→93, retry/failure→94 |
+| 93 | `LogMessage` | All Nodes, 2~4 | Prefix=`SQOOP_REPLACEMENT`, Level=`${event.level}`, 구조화 JSON message | success→95 |
+| 94 | `PutFile` 또는 운영 Kafka Publisher | All Nodes, 1~2 | 복구 가능한 DLQ 경로 또는 topic, 결정적 event filename/key | success→오류 카운터, failure→Bulletin/운영 알림 |
+| 95 | `RouteOnAttribute` | All Nodes, 2~4 | ERROR, PUBLISH_UNKNOWN, 최종 실패 등 알림 대상 분기 | alert→96, unmatched→terminate |
+| 96 | `PutEmail` 또는 조직 알림 Processor | All Nodes, 1 | 제목에 job/run/status, 본문에 비밀값 없는 요약 | success→terminate, failure→DLQ/Bulletin |
+
+### 14.3 PostgreSQL 이벤트 기록
 
 테이블은 4.1의 `nifi_ops.load_event` DDL을 사용한다. `90_Prepare_Event_Attributes`는 아래 PostgreSQL 컬럼명과 동일한 attribute를 만들고, `91_AttributesToJSON`은 해당 attribute 목록을 FlowFile content로 직렬화한다. `92_PutSQL`은 `CS_DBCP_META`, Batch Size=1, Support Fragmented Transactions=false로 설정한다.
 
@@ -1199,7 +1314,7 @@ INSERT INTO nifi_ops.load_event (
 
 이벤트 INSERT 실패는 main flow 상태를 되돌리지 않고 JSON content를 DLQ에 저장하되, Run/Partition/File/Validation 상태 기록 실패는 해당 단계 자체를 실패시킨다.
 
-### 14.3 필수 이벤트
+### 14.4 필수 이벤트
 
 | Level | Event | 기록 시점 |
 |---|---|---|
@@ -1219,7 +1334,7 @@ INSERT INTO nifi_ops.load_event (
 | ERROR | `RUN_FAILED` | 최종 실패 확정 |
 | WARN | `RECOVERY_REISSUED` | stale partition 재발행 |
 
-### 14.4 `LogMessage` 형식
+### 14.5 `LogMessage` 형식
 
 ```text
 Log Prefix  = SQOOP_REPLACEMENT
@@ -1235,7 +1350,7 @@ Log Message = {"event":"${event.name}","run_id":"${load.run.id}",
 
 `error.message`는 줄바꿈 제거, 길이 제한 및 비밀값 마스킹 후 기록한다. SQL 본문 전체, JDBC URL의 credential, 원천 행 데이터는 로그에 기록하지 않는다.
 
-### 14.5 오류 공통 경로
+### 14.6 오류 공통 경로
 
 각 Processor의 failure 관계에는 먼저 전용 `UpdateAttribute`를 둔다.
 

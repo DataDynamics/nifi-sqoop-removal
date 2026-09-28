@@ -1,0 +1,3 @@
+# Sqoop Removal for NiFi
+
+

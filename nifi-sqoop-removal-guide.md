@@ -24,16 +24,80 @@ Attribute     : load.* / partition.* / error.* / event.*
 
 ### AS-IS와 TO-BE
 
-```text
-AS-IS
-Oracle → Kylo ImportSqoop → Sqoop Mapper → HDFS
-       → Hive External 임시 테이블 → INSERT OVERWRITE → 건수 검증
+#### AS-IS 처리 구조
 
-TO-BE
-Oracle → NiFi Partition Manifest → ExecuteSQLRecord 병렬 Worker → HDFS
-       → 영속 완료 판정 → Hive External Staging 검증
-       → 단일 INSERT OVERWRITE → Target 사후 검증
+```mermaid
+flowchart LR
+    A1[(Oracle 원천)] --> A2[NiFi 1.x<br/>Kylo ImportSqoop]
+    A2 --> A3{Sqoop Job<br/>YARN MapReduce}
+    A3 --> A31[Mapper 0]
+    A3 --> A32[Mapper 1]
+    A3 --> A33[Mapper N]
+    A31 --> A4[(HDFS 공용<br/>적재 경로)]
+    A32 --> A4
+    A33 --> A4
+    A4 --> A5[Hive External<br/>임시 테이블]
+    A5 --> A6[INSERT OVERWRITE]
+    A6 --> A7[(Hive 원본 테이블)]
+    A7 --> A8[Oracle 원천 건수와<br/>적재 건수 비교]
+
+    classDef source fill:#e8f1ff,stroke:#2563eb,color:#111827;
+    classDef storage fill:#ecfdf5,stroke:#059669,color:#111827;
+    classDef control fill:#fff7ed,stroke:#ea580c,color:#111827;
+    class A1 source;
+    class A4,A7 storage;
+    class A2,A3,A5,A6,A8 control;
 ```
+
+#### TO-BE 처리 구조
+
+```mermaid
+flowchart TB
+    B1[(Oracle 원천<br/>고정 Snapshot SCN)] --> B2[PG-10 Coordinator<br/>범위 Manifest 생성]
+    B2 --> B3{PG-20<br/>병렬 Worker}
+
+    subgraph WORKERS["NiFi Cluster 병렬 추출"]
+        direction LR
+        B31[ExecuteSQLRecord<br/>Partition 0]
+        B32[ExecuteSQLRecord<br/>Partition 1]
+        B33[ExecuteSQLRecord<br/>Partition N]
+    end
+
+    B3 --> B31
+    B3 --> B32
+    B3 --> B33
+    B31 --> B4[(run_id별 HDFS<br/>격리 Staging)]
+    B32 --> B4
+    B33 --> B4
+    B4 --> B5[PG-30 영속 완료 판정<br/>File·Partition·Run Gate]
+    B5 --> B6[Hive External Staging<br/>Count·Schema·DQ 검증]
+    B6 --> B7{모든 검증<br/>PASS?}
+    B7 -->|예| B8[Publish Token CAS<br/>단일 INSERT OVERWRITE]
+    B8 --> B9[(Hive 원본 테이블)]
+    B9 --> B10[Target 사후 검증]
+    B10 --> B11[Run SUCCESS]
+    B7 -->|아니요| BX[전체 Run 실패<br/>게시 차단]
+
+    BM[(PostgreSQL<br/>Run·Partition·File·Validation·Event)]
+    B2 -. 상태·Manifest .-> BM
+    B5 -. 완료 판정 .-> BM
+    B6 -. 검증 결과 .-> BM
+    B8 -. 게시 소유권 .-> BM
+    B10 -. 최종 결과 .-> BM
+
+    classDef source fill:#e8f1ff,stroke:#2563eb,color:#111827;
+    classDef storage fill:#ecfdf5,stroke:#059669,color:#111827;
+    classDef control fill:#fff7ed,stroke:#ea580c,color:#111827;
+    classDef success fill:#f0fdf4,stroke:#16a34a,color:#166534;
+    classDef failure fill:#fef2f2,stroke:#dc2626,color:#991b1b;
+    class B1 source;
+    class B4,B9,BM storage;
+    class B2,B3,B5,B6,B7,B8,B10 control;
+    class B11 success;
+    class BX failure;
+```
+
+AS-IS에서는 Sqoop/YARN이 Mapper 실행과 전체 Job 실패를 담당한다. TO-BE에서는 NiFi가 병렬 Worker를 실행하고 PostgreSQL Manifest가 완료 판정의 원장이 되며, staging 검증을 통과한 단 하나의 게시 FlowFile만 최종 테이블을 변경한다.
 
 Sqoop Mapper가 제공하던 분할 조회와 전체 Job 실패 의미를 NiFi Processor의 단순 병렬 실행만으로 대체해서는 안 된다. TO-BE는 데이터 처리 영역과 제어 영역을 분리한다.
 

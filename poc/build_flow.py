@@ -330,10 +330,10 @@ p("P36", "36_Duplicate_First_Fragment", "DuplicateFlowFile", {"Number of Copies"
 route("P37", "37_Split_Control_Copy", {"control": "${copy.index:equals('1')}"}, 6, 8)
 ua("P38", "38_Set_Chunk_Attrs", {
     "chunk.index": "${fragment.index:padLeft(6,'0')}", "chunk.record.count": "${record.count}",
-    "filename": "part-${partition.id}-${fragment.index:padLeft(6,'0')}.parquet",
-    "load.hdfs.part.path": "${load.hdfs.path}/part=${partition.id}"}, 7, 6)
+    # Hive external table이 하위 디렉터리를 읽지 않을 수 있으므로 run root에 평탄하게 기록
+    "filename": "part-${partition.id}-${fragment.index:padLeft(6,'0')}.parquet"}, 7, 6)
 p("P39", "39_PutHDFS", "PutHDFS", {
-    "Hadoop Configuration Resources": "#{HADOOP.CONF.FILES}", "Directory": "${load.hdfs.part.path}",
+    "Hadoop Configuration Resources": "#{HADOOP.CONF.FILES}", "Directory": "${load.hdfs.path}",
     "Conflict Resolution Strategy": "replace", "writing-strategy": "writeAndRename",
     "Permissions umask": "#{HDFS.PERMISSIONS.UMASK}"}, 8, 6, tasks=4)
 retry("R39", "39R_Retry_HDFS", "hdfs.retry.count", "#{PARTITION.RETRY.MAX}", 8, 7)

@@ -117,8 +117,10 @@ partition_id  = split 범위 식별자
 ```
 
 ```text
-/data/nifi/stage/<job_key>/run_id=<run_id>/part=<partition_id>/part-xxxx.parquet
+/data/nifi/stage/<job_key>/run_id=<run_id>/part-<partition_id>-<chunk_index>.parquet
 ```
+
+파일은 run root 바로 아래에 평탄하게 둔다. 파일명에 `partition_id`와 `chunk_index`가 들어가므로 하위 디렉터리 없이도 고유하다. `part=<partition_id>/` 같은 하위 디렉터리를 두면 run root를 `LOCATION`으로 지정한 비파티션 external table이 Hive 설정(`hive.mapred.supports.subdirectories`, `mapreduce.input.fileinputformat.input.dir.recursive`)에 따라 하위 파일을 읽지 않아 0건이 될 수 있다. 또 `key=value` 형식은 Hive partition 디렉터리로 오인될 수 있다.
 
 실패한 run의 파일은 다른 실행 및 최종 테이블과 섞이지 않는다. 재실행은 이전 run을 수정하지 않고 새 `run_id`를 사용한다.
 
@@ -126,7 +128,16 @@ partition_id  = split 범위 식별자
 
 여러 JDBC Connection이 서로 다른 시점의 데이터를 읽지 않도록 시작 시점에 SCN을 한 번 고정한다. source metrics, partition 예상 건수와 실제 데이터 조회는 모두 동일한 `AS OF SCN`을 사용한다.
 
-Flashback Query를 사용할 수 없다면 Oracle snapshot table, 불변 업무 마감 조건 또는 원천 변경이 없는 배치 구간을 사용한다. 추출 전후 `COUNT(*)`가 같다는 사실만으로 동일 시점 데이터는 보장되지 않는다.
+Flashback Query를 사용할 수 없다면 Oracle snapshot table, 불변 업무 마감 조건 또는 원천 변경이 없는 배치 구간을 사용한다(PostgreSQL 등 Oracle 이외 원천은 아래 참조). 추출 전후 `COUNT(*)`가 같다는 사실만으로 동일 시점 데이터는 보장되지 않는다.
+
+#### Oracle 이외 원천 (PostgreSQL)
+
+PostgreSQL에는 `AS OF SCN`에 해당하는 과거 시점 조회가 없다. `pg_export_snapshot()`으로 내보낸 snapshot은 내보낸 트랜잭션이 열려 있는 동안에만 쓸 수 있는데, NiFi Connection Pool의 서로 다른 connection과 Processor 사이에서 그 트랜잭션을 유지할 수 없다. 따라서 다음 중 하나를 필수 전제로 둔다.
+
+- 불변 업무 마감 조건: 대상 `business_key` 범위의 행이 적재 시점에 더 이상 변경되지 않음을 업무적으로 보장
+- 원천 측 snapshot table: 마감 시점에 원천에서 별도 테이블로 복제한 뒤 그 테이블을 추출
+
+SQL에서는 `AS OF SCN` 절을 제거하고, 7.2의 12~14(SCN 조회·검증) 단계를 생략하거나 마감 확인 조회로 대체한다. PostgreSQL JDBC driver는 autocommit=false일 때만 Fetch Size(server-side cursor)를 적용한다. 그러므로 추출 `ExecuteSQLRecord`에 `Set Auto Commit=false`를 설정한다. 설정하지 않으면 파티션 결과 전체를 NiFi 메모리에 적재한다. 이 구성은 NiFi 2.4.0 + PostgreSQL 16 PoC에서 105,000건, 8파티션으로 검증했다.
 
 ### 범위 파티셔닝
 
@@ -257,7 +268,7 @@ Concurrent Tasks는 정수 스케줄링 설정이라 Parameter(`#{...}`)나 Expr
 | `PARTITION.RETRY.MAX` | `3` | N | 일시 오류 재시도 |
 | `PARTITION.WAIT.TIMEOUT` | `90 min` | N | 파티션 barrier timeout |
 | `RUN.WAIT.TIMEOUT` | `6 hours` | N | 전체 run timeout |
-| `RECOVERY.STALE.MINUTES` | `15` | N | stale 판정 |
+| `RECOVERY.STALE.MINUTES` | `90` | N | stale 판정. `EXTRACT.QUERY.TIMEOUT` + chunk 기록 여유보다 커야 함(13장) |
 | `ALLOW.EMPTY.SOURCE` | `false` | N | 0건 overwrite 방지 |
 | `FAILED.RETENTION.DAYS` | `14` | N | 실패 staging 보존 |
 | `SUCCESS.RETENTION.DAYS` | `3` | N | 성공 staging 보존 |
@@ -893,7 +904,7 @@ PG-20의 Connection은 PG-10에서 들어오는 입력에만 Round Robin Load Ba
 | 29 | `DuplicateFlowFile` | All Nodes, worker concurrency | Number of Copies=1; 원본과 복제본이 모두 `success`로 나가며 `copy.index` attribute가 붙음 | success→29A |
 | 29A | `RouteOnAttribute` | All Nodes, worker concurrency | `control=${copy.index:equals('1')}` | control→30, unmatched→31 |
 | 30 | `ReplaceText` + `UpdateAttribute` | All Nodes, worker concurrency | content=`{}`, partition control 속성과 `fragment.count` 유지 | success→PG-30 partition-control |
-| 31 | `UpdateAttribute` | All Nodes, worker concurrency | chunk index/count, 결정적 filename, HDFS part path 설정 | success→32 |
+| 31 | `UpdateAttribute` | All Nodes, worker concurrency | chunk index/count, 결정적 filename 설정 | success→32 |
 | 32 | `ValidateRecord` | All Nodes, worker concurrency | Reader=`CS_PARQUET_READER`, Writer=`CS_PARQUET_WRITER`, validation schema 고정 | valid→33, invalid/failure→PG-90 |
 | 33 | `PutHDFS` | All Nodes, HDFS 부하 기준 | Hadoop config만 설정, Kerberos service 미설정, umask, replication, replace, Write and rename | success→34, failure→35 |
 | 34 | `PutSQL` | All Nodes, worker concurrency | `CS_DBCP_META`, `load_file` UPSERT, Batch=1, Fragmented=false | success→36, retry/failure→PG-90 |
@@ -960,8 +971,9 @@ sql.args.3 = upper bound, NUMERIC(2)
 chunk.index        = ${fragment.index:padLeft(6,'0')}
 chunk.record.count = ${record.count}
 filename           = part-${partition.id}-${chunk.index}.parquet
-load.hdfs.part.path = ${load.hdfs.path}/part=${partition.id}
 ```
+
+하위 디렉터리를 만들지 않으므로 별도 part path attribute는 두지 않는다(1장 경로 원칙 참조).
 
 33 `PutHDFS`:
 
@@ -969,7 +981,7 @@ load.hdfs.part.path = ${load.hdfs.path}/part=${partition.id}
 |---|---|
 | Hadoop Configuration Resources | `#{HADOOP.CONF.FILES}` |
 | Kerberos User Service | 설정하지 않음 |
-| Directory | `${load.hdfs.part.path}` |
+| Directory | `${load.hdfs.path}` (run root, 하위 디렉터리 없음) |
 | Conflict Resolution Strategy | `replace` |
 | Writing Strategy | `Write and rename` |
 | Permissions umask | `#{HDFS.PERMISSIONS.UMASK}` |
@@ -979,6 +991,27 @@ load.hdfs.part.path = ${load.hdfs.path}/part=${partition.id}
 HDFS에는 Kerberos가 적용되지 않았으므로 `Kerberos User Service`, principal, keytab을 구성하지 않는다. NiFi 프로세스를 실행하는 OS 사용자가 HDFS client의 effective user가 되므로 staging root와 하위 경로에 필요한 POSIX 권한 또는 ACL을 사전에 부여한다. `core-site.xml`의 인증 방식과 `fs.defaultFS`가 실제 HDFS 환경을 가리키는지 확인한다. `replace`는 run 전용 경로와 결정적 파일명인 경우에만 허용한다.
 
 34는 `(run_id, partition_id, chunk_index)` unique key로 `nifi_ops.load_file`을 upsert한다. 저장 값은 `record.count`, `absolute.hdfs.path`, file size, fragment count, status=`WRITTEN`이다. 동일 chunk 재시도는 같은 행을 갱신한다.
+
+34는 같은 SQL 문장에서 partition과 run의 `heartbeat_at`도 갱신한다. 이 갱신이 없으면 heartbeat는 claim 시점에만 기록되어, 정상적으로 오래 실행되는 파티션도 Recovery Monitor가 stale로 판정한다.
+
+```sql
+WITH f AS (
+    INSERT INTO nifi_ops.load_file (...) VALUES (...)
+    ON CONFLICT (run_id, partition_id, chunk_index) DO UPDATE SET ...
+    RETURNING 1
+), p AS (
+    UPDATE nifi_ops.load_partition
+       SET heartbeat_at = clock_timestamp()
+     WHERE run_id = CAST(? AS uuid) AND partition_id = ?
+       AND claim_token = CAST(? AS uuid)
+    RETURNING 1
+)
+UPDATE nifi_ops.load_run
+   SET heartbeat_at = clock_timestamp()
+ WHERE run_id = CAST(? AS uuid);
+```
+
+`ExecuteSQLRecord`는 `Output Batch Size=0`이면 ResultSet을 끝까지 읽은 뒤 모든 chunk FlowFile을 한 번에 내보낸다. 따라서 파티션 쿼리가 실행되는 동안(최대 `EXTRACT.QUERY.TIMEOUT`)에는 heartbeat가 갱신되지 않는다. 13장의 stale 기준은 이 공백을 고려해 정한다.
 
 32 `ValidateRecord`는 Reader=`CS_PARQUET_READER`, validation schema=`CS_SCHEMA_REGISTRY`의 승인 버전, Writer=`CS_PARQUET_WRITER`로 설정한다. `invalid` 또는 `failure`가 한 건이라도 발생하면 해당 partition 전체를 실패시킨다. 대용량 재직렬화 비용이 허용되지 않으면 이 Processor를 제거할 수 있지만, 그 경우 동일 schema 검증을 staging Hive 조회에서 필수로 수행한다.
 
@@ -1006,7 +1039,7 @@ flowchart TD
     W -->|expired| Q
     Q --> E[32_Extract_File_Totals<br/>EvaluateJsonPath]
     E --> R{33_Is_Partition_Complete<br/>RouteOnAttribute}
-    R -->|complete and row count equal| S[34_Mark_Partition_SUCCESS<br/>PutSQL]
+    R -->|complete and row count equal| S[34_Mark_Partition_SUCCESS<br/>ExecuteSQLRecord CAS]
     R -->|still pending before deadline| D[35_Delay_And_Recheck<br/>RetryFlowFile]
     D --> Q
     R -->|mismatch or timeout| F[PG-90 Partition Failure]
@@ -1032,8 +1065,8 @@ flowchart TD
 | 30 | `Wait` | Primary, 1 | Cache=`CS_DMC_CLIENT`, partition signal key/counter, target=`${fragment.count}`, expiration 설정 | success/expired→31, wait→자기 입력 queue, failure→PG-90 |
 | 31 | `ExecuteSQLRecord` | Primary, 1 | `CS_DBCP_META`, `load_file`의 file/row/failed 합계 조회, JSON writer | success→32, failure→재시도/PG-90 |
 | 32 | `EvaluateJsonPath` | Primary, 1 | audit file count, row count, failed count와 run status 추출 | matched→33, failure/unmatched→PG-90 |
-| 33 | `RouteOnAttribute` | Primary, 1 | chunk 수, expected rows, deadline, run status 비교 | complete→34, pending→35, mismatch/timeout→PG-90 |
-| 34 | `PutSQL` | Primary, 1 | claim token 조건으로 partition SUCCESS 및 실제 count/file/byte 저장, Fragmented=false | success→36, retry/failure→PG-90 |
+| 33 | `RouteOnAttribute` | Primary, 1 | chunk 수, expected rows, deadline, run status 비교 | complete→34, pending→35, run_failed→종료, mismatch/timeout→PG-90 |
+| 34 | `ExecuteSQLRecord` + `EvaluateJsonPath` + `RouteOnAttribute` | Primary, 1 | claim token 조건으로 partition SUCCESS 및 실제 count/file/byte 저장, 갱신 건수 확인(17.1) | updated=1→36, updated=0→39 재확인, failure→PG-90 |
 | 35 | `RetryFlowFile` | Primary, 1 | partition gate polling count, deadline 전 penalty | retry→31, exceeded/failure→PG-90 |
 | 36 | `Notify` | Primary, 1 | key=`${load.run.id}`, counter=`partitions`, delta=1 | success→37, failure→39 DB 확인 경로 |
 | 37 | `UpdateAttribute` + Output Port | Primary, 1 | `gate.source=partition-success` | success→39 |
@@ -1041,7 +1074,7 @@ flowchart TD
 | 39 | `ExecuteSQLRecord` | Primary, 1 | PostgreSQL partition 상태/count 집계 SQL, JSON writer | success→40, failure→재시도/PG-90 |
 | 40 | `EvaluateJsonPath` | Primary, 1 | total/success/failed/pending/extracted count 추출 | matched→41, failure/unmatched→PG-90 |
 | 41 | `RouteOnAttribute` | Primary, 1 | 전체 완료식과 source count 비교 | complete→42, any failed→43, pending→44 |
-| 42 | `PutSQL` | Primary, 1 | status `EXTRACTING→EXTRACTED_VALIDATED` CAS, 완료 count 저장 | success→PG-40, retry/failure→PG-90 |
+| 42 | `ExecuteSQLRecord` + 결과 분기 | Primary, 1 | status `EXTRACTING→EXTRACTED_VALIDATED` CAS, 완료 count 저장, 갱신 건수 확인(17.1) | updated=1→PG-40, updated=0→중복 종료, failure→PG-90 |
 | 43 | `PutSQL` | Primary, 1 | status `EXTRACTING→FAILED_EXTRACT`, 오류 요약/완료시각 저장 | success→PG-90 알림, failure→관리 DB 장애 알림 |
 | 44 | `RetryFlowFile` | Primary, 1 | run gate polling count와 deadline 적용 | retry→39, exceeded/failure→43 |
 
@@ -1100,6 +1133,22 @@ SUM(actual_row_count) = source_count
 
 Partition failure 공통 경로는 partition과 run을 실패 상태로 갱신한 뒤 별도의 `run-gate-check` FlowFile을 39로 보낸다. 따라서 다른 파티션 신호를 모두 기다리지 않고 `failed_partition_count > 0`을 확인해 조기에 전체 실패시킬 수 있다.
 
+실패 경로는 Wait에 남아 있는 control FlowFile도 즉시 해제한다. 해제하지 않으면 실패한 파티션의 partition-control은 `PARTITION.WAIT.TIMEOUT`까지, run-control은 `RUN.WAIT.TIMEOUT`까지 queue에 남는다(PoC에서 관찰).
+
+```text
+# partition Wait(30) 해제
+Release Signal Identifier = ${load.run.id}:${partition.id}
+Signal Counter Name       = chunks
+Signal Counter Delta      = ${partition.chunk.count:replaceNull('1000000')}
+
+# run Wait(38) 해제
+Release Signal Identifier = ${load.run.id}
+Signal Counter Name       = partitions
+Signal Counter Delta      = ${load.partition.count}
+```
+
+해제된 FlowFile은 31/39에서 DB를 다시 조회한다. 33과 41에 `run.status`가 이미 `FAILED_*`인 경우의 경로(`run_failed`)를 별도로 두고, 이 경로는 DEBUG 로그만 남기고 종료한다. 이렇게 하면 같은 실패가 PG-90으로 중복 기록되지 않는다. NiFi 2.4.0 PoC에서 run Wait 해제 방식으로 파티션 실패 후 약 0.1초 만에 run 실패가 확정되는 것을 확인했다.
+
 ---
 
 ## 10. PG-40 Staging Validation
@@ -1132,7 +1181,7 @@ flowchart TD
 | 43 | `SelectHive3QL` 또는 `ExecuteSQLRecord` | Primary, 1 | stage count/NULL/중복/min/max/업무 합계 SQL, JSON writer | success→44, failure→PG-90 |
 | 44 | `EvaluateJsonPath` | Primary, 1 | stage metrics를 `validation.stage.*` attribute로 추출 | matched→45, failure/unmatched→PG-90 |
 | 45 | `RouteOnAttribute` | Primary, 1 | source/extracted/staging count 및 DQ 지표 비교 | match→46, mismatch→PG-90 |
-| 46 | `PutSQL` | Primary, 1 | validation UPSERT/INSERT 후 `EXTRACTED_VALIDATED→STAGING_VALIDATED` CAS, Fragmented=false | success→PG-50, retry/failure→PG-90 |
+| 46 | `PutSQL` + `ExecuteSQLRecord` CAS | Primary, 1 | validation UPSERT/INSERT(PutSQL, Fragmented=false) 후 `EXTRACTED_VALIDATED→STAGING_VALIDATED` CAS와 갱신 건수 확인(17.1) | updated=1→PG-50, updated=0→중복 종료, failure→PG-90 |
 
 40은 기존 control FlowFile의 content를 `ReplaceText`로 비우고 `filename=_SUCCESS`를 설정한 뒤 run root에 `Write and rename`으로 기록한다. FlowFile attribute는 유지되므로 PutHDFS 성공 관계에서 바로 41로 진행한다. 이 파일은 global manifest 검증 후에만 존재한다.
 
@@ -1199,8 +1248,9 @@ flowchart TD
 | 52 | `EvaluateJsonPath` | Primary, 1 | `publish.claimed=$[0].claimed` | matched→53, failure/unmatched→PG-90 |
 | 53 | `RouteOnAttribute` | Primary, 1 | `${publish.claimed:equals('true')}` | true→54, false→중복 publish 종료 |
 | 54 | `ReplaceText` | Primary, 1 | 승인된 target/partition/column로 `INSERT OVERWRITE` SQL 생성 | success→55, failure→PG-90 |
-| 55 | `PutHive3QL` 또는 `PutClouderaHiveQL` | Primary, 1 | `CS_HIVE3_DBCP`, Query Timeout, Concurrent=1, 환경 지원 시 Rollback On Failure=true | success→56, failure/timeout→PG-90 또는 PUBLISH_UNKNOWN |
-| 56 | `PutSQL` | Primary, 1 | publish token 조건으로 `PUBLISHING→PUBLISHED`, published_at 저장 | success→PG-60, retry/failure→PG-90 |
+| 55 | `PutHive3QL` 또는 `PutClouderaHiveQL` | Primary, 1 | `CS_HIVE3_DBCP`, Query Timeout, Concurrent=1, 환경 지원 시 Rollback On Failure=true | success→56, failure→55A |
+| 55A | `RouteOnAttribute` | Primary, 1 | 오류 attribute로 실행 전 실패 여부 판별(아래 기준) | pre_execution→PG-90 `FAILED_PUBLISH`, unmatched→PG-90 `PUBLISH_UNKNOWN` |
+| 56 | `ExecuteSQLRecord` + 결과 분기 | Primary, 1 | publish token 조건으로 `PUBLISHING→PUBLISHED`, published_at 저장, 갱신 건수 확인(17.1) | updated=1→PG-60, updated=0/failure→PG-90 |
 
 50에서 `publish.token=${UUID()}`를 만들고 51에서 4.1의 PostgreSQL 함수를 호출한다.
 
@@ -1225,6 +1275,14 @@ SELECT #{HIVE.INSERT.COLUMNS}
 전체 테이블이 아니라 업무일자 파티션만 교체해야 한다면 `TARGET.PARTITION.CLAUSE`를 반드시 설정한다. SQL에는 FlowFile에서 받은 임의 identifier를 사용하지 않는다.
 
 Hive 응답을 받지 못해 성공 여부가 불명확한 timeout은 자동 재실행하지 않고 `PUBLISH_UNKNOWN`으로 기록한다. Recovery Monitor가 Hive query history와 target 지표를 확인한 후 운영 정책에 따라 확정한다.
+
+Hive Processor의 `failure` relationship만으로는 "SQL이 실행되지 않은 실패"와 "실행 후 응답을 잃은 경우"를 구분할 수 없다. 따라서 55의 failure는 기본적으로 `PUBLISH_UNKNOWN`으로 보낸다. 55A는 실행 전에 실패했음이 확실한 경우에만 `FAILED_PUBLISH`로 분류한다.
+
+- SQL 구문/의미 오류: SQLState class `42`, Hive `ParseException`/`SemanticException`
+- 권한 오류: authorization 실패 메시지
+- 연결 획득 실패: 연결 수립 단계 오류로, 문장 제출 전임이 확실한 경우
+
+timeout, connection reset, 원인 불명 오류는 모두 `PUBLISH_UNKNOWN`이다. CFM Hive Processor가 failure FlowFile에 어떤 오류 attribute(SQLState, message)를 붙이는지는 구현 전에 확인한다. attribute가 없으면 55A를 두지 않고 모든 failure를 `PUBLISH_UNKNOWN`으로 처리한다.
 
 ---
 
@@ -1253,7 +1311,7 @@ flowchart TD
 | 61 | `EvaluateJsonPath` | Primary, 1 | target metrics를 `validation.target.*` attribute로 추출 | matched→62, failure/unmatched→PG-90 |
 | 62 | `RouteOnAttribute` | Primary, 1 | source/extracted/stage/target count와 DQ 지표 비교 | match→63, mismatch→PG-90 |
 | 63 | `PutSQL` | Primary, 1 | `nifi_ops.load_validation`에 TARGET 지표 저장, Fragmented=false | success→64, retry/failure→PG-90 |
-| 64 | `PutSQL` | Primary, 1 | `PUBLISHED→SUCCESS` CAS, target_count/completed_at 저장 | success→65, retry/failure→PG-90 |
+| 64 | `ExecuteSQLRecord` + 결과 분기 | Primary, 1 | `PUBLISHED→SUCCESS` CAS, target_count/completed_at 저장, 갱신 건수 확인(17.1) | updated=1→65, updated=0/failure→PG-90 |
 | 65 | `UpdateAttribute` + PG-90 port | Primary, 1 | `event.name=RUN_SUCCESS`, `event.level=INFO`, 최종 count/duration 설정 | success→완료 Output Port |
 
 62 조건:
@@ -1302,6 +1360,8 @@ flowchart TD
 
 - Primary Node, 5분 주기, Concurrent Tasks=1
 - `heartbeat_at < now - #{RECOVERY.STALE.MINUTES}`인 활성 run만 조회
+- `RECOVERY.STALE.MINUTES`는 `EXTRACT.QUERY.TIMEOUT` + 파티션당 chunk 기록·audit 소요시간 + 여유보다 크게 잡는다. heartbeat는 claim, chunk audit(8.5의 34), partition/run 상태 전이에서만 갱신되고, 파티션 쿼리 실행 중에는 갱신되지 않기 때문이다. 예시값 15분처럼 query timeout(60분)보다 짧으면 정상 실행 중인 파티션을 재발행해 중복 추출이 생긴다.
+- `RUNNING` 파티션은 `heartbeat_at`과 함께 `started_at + EXTRACT.QUERY.TIMEOUT` 경과 여부도 조건으로 사용한다. 쿼리가 timeout으로 끝났을 시점이 지나기 전에는 reset하지 않는다.
 - stale partition은 현재 claim token과 timestamp를 조건으로 CAS reset
 - 동일 `run_id + partition_id`와 같은 SCN으로만 재발행
 - Oracle UNDO에서 SCN을 읽을 수 없으면 전체 run 실패
@@ -1547,6 +1607,32 @@ stateDiagram-v2
 ```
 
 모든 상태 변경 SQL은 `WHERE run_id=? AND status=<expected>` 조건을 사용한다. publish token 소유권 검증, active run unique constraint, Primary Node scheduling을 함께 적용해 중복 게시를 방지한다.
+
+### 17.1 CAS 결과 확인
+
+`PutSQL`은 UPDATE 영향 행 수가 0이어도 `success`로 보낸다. CAS 조건이 맞지 않아 아무것도 갱신되지 않았는데 흐름은 다음 단계로 진행할 수 있다. 최종 판정은 DB 재조회로 보호되지만, 다음 상태 전이는 `PutSQL` 대신 `ExecuteSQLRecord`로 실행하고 갱신 건수를 받아 분기한다.
+
+| 단계 | 전이 |
+|---|---|
+| PG-30 34 | partition `RUNNING→SUCCESS` (claim token 조건) |
+| PG-30 42 | run `EXTRACTING→EXTRACTED_VALIDATED` |
+| PG-40 46 | run `EXTRACTED_VALIDATED→STAGING_VALIDATED` |
+| PG-50 56 | run `PUBLISHING→PUBLISHED` (publish token 조건) |
+| PG-60 64 | run `PUBLISHED→SUCCESS` |
+| PG-70 75 | partition claim reset |
+
+```sql
+WITH u AS (
+    UPDATE nifi_ops.load_run
+       SET status = 'EXTRACTED_VALIDATED', extract_completed_at = clock_timestamp(),
+           heartbeat_at = clock_timestamp(), version_no = version_no + 1
+     WHERE run_id = CAST(? AS uuid) AND status = 'EXTRACTING'
+    RETURNING 1
+)
+SELECT COUNT(*) AS updated FROM u;
+```
+
+`ExecuteSQLRecord`의 `Set Auto Commit=true`(기본값)를 유지하고, `EvaluateJsonPath`로 `$[0].updated`를 추출한 뒤 `RouteOnAttribute`에서 `1`이면 다음 단계로, `0`이면 상태를 다시 조회하는 경로나 중복 종료로 보낸다. 4.1의 `claim_partition`/`claim_publish`처럼 boolean 함수로 감싸도 된다. NiFi 2.4.0 PoC에서 `ExecuteSQLRecord`로 호출한 데이터 변경 함수(`claim_partition`)가 commit되어 상태가 남는 것을 확인했다.
 
 ---
 

@@ -55,4 +55,14 @@ python3 poc/build_flow.py http://10.0.1.50:10001/nifi-api poc/config.example.jso
 
 ## 5. 가이드 반영 현황 (2026-10-01)
 
-2장의 #1~#10과 3장 7번은 `nifi-sqoop-removal-guide.md` 본문에 반영했다. 반영 위치: 2장, 3.1, 4장, 5장, 7.1~7.4, 8.1~8.4, 10.2, 15.1. 3장의 1~6번(heartbeat, Hive 하위 디렉터리, PutSQL CAS 결과, 실패 후 남는 control FlowFile, PUBLISH_UNKNOWN 판별, PostgreSQL 원천)은 아직 반영하지 않았다.
+| 항목 | 반영 위치 |
+|---|---|
+| 2장 #1~#10, 3장 7번 | 2장, 3.1, 4장, 5장, 7.1~7.4, 8.1~8.4, 10.2, 15.1 (커밋 `28d7e7e`) |
+| 3장 1. heartbeat | 3.1 `RECOVERY.STALE.MINUTES`(15→90), 8.5 file audit SQL에 heartbeat 갱신, 13.2 stale 기준 |
+| 3장 2. Hive 하위 디렉터리 | 1장 경로 원칙, 8.5 PutHDFS Directory, README 경로. PoC 빌더도 평탄 레이아웃으로 변경 후 재실행 검증(21파일, 105,000건 일치) |
+| 3장 3. PutSQL CAS 결과 | 17.1 신설, 9.2 #34·#42, 10.2 #46, 11.2 #56, 12.2 #64 |
+| 3장 4. 실패 후 남은 control FlowFile | 9.2 #33 `run_failed` 경로, 9장 Wait 해제 Notify |
+| 3장 5. PUBLISH_UNKNOWN 판별 | 11.2 #55A, 판별 기준 |
+| 3장 6. PostgreSQL 원천 | 1장 "Oracle 이외 원천 (PostgreSQL)" |
+
+PoC Flow(`poc/build_flow.py`)에는 3장 3~5번(ExecuteSQLRecord CAS, partition Wait 해제, PUBLISH 판별)을 아직 적용하지 않았다.

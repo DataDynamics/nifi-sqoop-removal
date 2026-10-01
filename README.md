@@ -34,7 +34,7 @@ TO-BE에서는 Sqoop Mapper가 담당하던 분할 조회, 병렬 실행, 실패
 각 실행에 불변의 `run_id`를 발급한다. 모든 FlowFile, 관리 테이블, 로그와 HDFS 경로에서 동일한 값을 사용한다.
 
 ```text
-/data/nifi/stage/<job_key>/run_id=<run_id>/part=<partition_id>/part-xxxx.parquet
+/data/nifi/stage/<job_key>/run_id=<run_id>/part-<partition_id>-<chunk_index>.parquet
 ```
 
 실패한 실행의 파일이 다음 실행이나 최종 테이블에 섞이지 않으며, 재실행은 기존 실행을 수정하지 않고 새 `run_id`로 시작한다.

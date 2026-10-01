@@ -118,3 +118,46 @@ python3 poc/build_flow.py http://<nifi-host>:<port>/nifi-api my-config.json
 python3 poc/teardown_flow.py http://<nifi-host>:<port>/nifi-api
 ```
 
+
+## 7. V3: 자식 PG + Port 구조와 Processor 축소 (2026-10-01)
+
+`poc/build_flow_v3.py`로 V2와 같은 API 계약을 유지하면서 Flow를 책임별 자식 PG로 나누고, Processor 수를 85개에서 41개로 줄였다.
+
+| PG | 역할 | Processor | Port |
+|---|---|---:|---|
+| PG-00 Trigger | 스케줄 트리거, 업무일자 형식 검증 | 3 | out: start-run, errors |
+| PG-10 Run Coordinator | run 생성, 원천 지표·manifest 계산(SQL 1문장), manifest 등록 | 8 | in: start-run / out: partitions, errors |
+| PG-20 Extract Worker | claim, 파티션 추출, PutHDFS, chunk 보고 | 9 | in: partitions / out: errors |
+| PG-05 Control Receiver | API worker의 validate/reissue 수신 | 6 | out: validate, reissue, errors |
+| PG-40 Staging Validation | `/validation/start`, `_SUCCESS` (Hive 단계 자리) | 7 | in: validate / out: errors |
+| PG-90 Error and Event | 오류 정규화, run/partition 실패 보고 API, load_event 기록 | 8 | in: errors |
+
+PG 간 연결은 상위 PG(`SQOOP_REPLACEMENT_POC_V3`)에 둔다. `partitions`(PG-10→PG-20)와 `reissue`(PG-05→PG-20)는 Round Robin load balance를 쓴다. Controller Service는 상위 PG에 두고 자식 PG가 공유한다. 자식 PG는 Parameter Context를 상속하지 않으므로 각각 지정한다.
+
+### 7.1 줄인 방법
+
+| 방법 | 절감 |
+|---|---:|
+| `RetryFlowFile` 대신 Processor relationship 재시도(`retryCount`, `retriedRelationships`, PENALIZE_FLOWFILE) | 9 |
+| 실패 지점별 `UpdateAttribute` 제거: 단계 진입 시 기존 `UpdateAttribute`에서 `load.stage` 지정, 모든 실패를 `errors` 포트로 보내 PG-90이 `invokehttp.*`, `executesql.error.message`, `load.stage`로 코드·메시지 생성 | 약 19 |
+| 요청 본문을 `UpdateAttribute` + `AttributesToJSON` 대신 `ReplaceText` 하나로 생성(문자열은 `escapeJson`) | 약 7 |
+| 원천 지표와 manifest를 SQL 한 문장으로 계산하고 사전 검사를 API manifest 불변식 검사에 맡김 | 3 |
+| API가 기록하는 상태 이벤트(RUN_STARTED, EXTRACT_VALIDATED 등)를 NiFi에서 다시 기록하지 않음(V2 중복 기록 제거) | 약 5 |
+| chunk 보고 응답 분기 제거(파티션 판정·이벤트는 API가 기록) | 2 |
+
+대가: 파티션 쿼리의 일시 오류와 영구 오류를 구분하지 않고 내장 재시도 3회 후 실패 보고한다. 영구 오류는 재시도 3회만큼 늦게 실패한다.
+
+### 7.2 시험 결과 (NiFi 2.4.0, Load Control API 별도 인스턴스와 DB `nifiops_v3`)
+
+| 시나리오 | 결과 |
+|---|---|
+| 정상 실행 | run `STAGE_VALIDATING`, 8/8 SUCCESS, 105,000건, 검증 dispatch `ACKED`(202). Parquet 21개(run root 평탄), `_SUCCESS` 0바이트. 원천과 count·distinct·min/max·`SUM(amount)`·NULL 수 일치. NiFi 측 이벤트 중복 없음 |
+| 동일 업무일자 중복 실행 | PG-90이 409 + `RUN_CREATE` 단계를 `DUPLICATE_ACTIVE_RUN`(WARN)으로 분류, API 응답 본문을 message로 기록 |
+| 파티션 0004 HDFS 쓰기 실패 주입 | PutHDFS 내장 재시도 후 `errors` → PG-90이 파티션 실패 API 호출 → 0004 FAILED, run `FAILED_EXTRACT`, 검증 dispatch 0건, `_SUCCESS` 미생성 |
+
+### 7.3 이번에 확인한 사항
+
+| # | 내용 |
+|---|---|
+| 15 | `InvokeHTTP`에 `Response Body Attribute Name`을 설정하면 4xx/5xx 응답 본문도 그 attribute(`api.response`)에 들어가고 `invokehttp.response.body`는 비어 있다. 오류 메시지는 두 값을 모두 확인한다 |
+| 16 | PutHDFS 실패는 오류 attribute가 없어 PG-90이 `NON_RETRYABLE`로 분류한다. 내장 재시도를 이미 소진한 뒤이므로 동작에는 영향이 없지만, 운영 분류가 필요하면 PG-20에서 `load.stage`를 더 세분한다 |

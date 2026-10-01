@@ -22,6 +22,9 @@ NiFi는 데이터 처리만 하고, 상태 기록과 완료 판정은 Load Contr
 가이드 초안 구조(PG-30 Wait/Notify, PutSQL로 원장 직접 기록)는 git 이력(커밋 28d7e7e~ec5f074)의 이전 버전에 있다.
 
 사용법: build_flow.py <nifi-api-url> <config.json>
+
+config.json의 선택 키 `names`로 기존 Flow와 나란히 만들 수 있다(기본값은 아래 상수).
+  "names": {"process_group": "...", "common_context": "...", "job_context": "..."}
 """
 import json
 import sys
@@ -30,7 +33,10 @@ import urllib.request
 
 API = sys.argv[1].rstrip("/")
 CFG = json.load(open(sys.argv[2]))
-PG_NAME = "SQOOP_REPLACEMENT_POC"
+NAMES = CFG.get("names", {})
+PG_NAME = NAMES.get("process_group", "SQOOP_REPLACEMENT_POC")
+PC_COMMON = NAMES.get("common_context", "PC_SQOOP_REPLACEMENT_COMMON")
+PC_JOB = NAMES.get("job_context", "PC_JOB_PG_INSP_DTL_DAILY")
 
 
 def call(method, path, body=None):
@@ -80,10 +86,10 @@ for pg in call("GET", f"/flow/process-groups/{root}")["processGroupFlow"]["flow"
     if pg["component"]["name"] == PG_NAME:
         raise SystemExit(f"{PG_NAME} already exists ({pg['id']}); delete it first")
 
-drop_param_ctx("PC_JOB_PG_INSP_DTL_DAILY")
-drop_param_ctx("PC_SQOOP_REPLACEMENT_COMMON")
-common = param_ctx("PC_SQOOP_REPLACEMENT_COMMON", CFG["common_params"])
-job = param_ctx("PC_JOB_PG_INSP_DTL_DAILY", CFG["job_params"], inherited=common)
+drop_param_ctx(PC_JOB)
+drop_param_ctx(PC_COMMON)
+common = param_ctx(PC_COMMON, CFG["common_params"])
+job = param_ctx(PC_JOB, CFG["job_params"], inherited=common)
 
 pg = call("POST", f"/process-groups/{root}/process-groups",
           {"revision": REV, "component": {"name": PG_NAME, "position": {"x": 0, "y": 0}}})
@@ -513,7 +519,7 @@ p("EV", "95_Insert_Load_Event", "PutSQL", {
         "    error_class, error_code, message)\n"
         "VALUES (gen_random_uuid(), '${event.level}', '${event.name}',\n"
         "    CAST(NULLIF('${load.run.id}', '') AS uuid), '${load.job.key}', '${load.business.key}',\n"
-        "    NULLIF('${partition.id}', ''), CAST(NULLIF('${chunk.index}', '') AS integer), 'SQOOP_REPLACEMENT_POC',\n"
+        "    NULLIF('${partition.id}', ''), CAST(NULLIF('${chunk.index}', '') AS integer), '" + PG_NAME + "',\n"
         "    NULLIF('${error.processor}', ''), '${hostname(true)}', CAST(NULLIF('${partition.retry.count}', '') AS integer),\n"
         "    CAST(NULLIF('${event.row.count}', '') AS bigint), NULLIF('${error.class}', ''), NULLIF('${error.code}', ''),\n"
         "    NULLIF('${error.message.safe}', ''))"}, 2, 16)

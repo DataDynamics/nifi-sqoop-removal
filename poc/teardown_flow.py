@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """build_flow.py가 만든 SQOOP_REPLACEMENT_POC Process Group과 Parameter Context를 지운다.
 
-사용법: teardown_flow.py <nifi-api-url>
+사용법: teardown_flow.py <nifi-api-url> [config.json]
+config.json에 `names`가 있으면 그 이름의 PG와 Parameter Context를 지운다(build_flow.py와 같은 규칙).
 """
 import json
 import sys
@@ -10,7 +11,10 @@ import urllib.error
 import urllib.request
 
 API = sys.argv[1].rstrip("/")
-PG_NAME = "SQOOP_REPLACEMENT_POC"
+NAMES = json.load(open(sys.argv[2])).get("names", {}) if len(sys.argv) > 2 else {}
+PG_NAME = NAMES.get("process_group", "SQOOP_REPLACEMENT_POC")
+PC_COMMON = NAMES.get("common_context", "PC_SQOOP_REPLACEMENT_COMMON")
+PC_JOB = NAMES.get("job_context", "PC_JOB_PG_INSP_DTL_DAILY")
 CID = "poc-builder"
 
 
@@ -59,7 +63,7 @@ for pg in call("GET", f"/flow/process-groups/{root}")["processGroupFlow"]["flow"
     print("deleted", pid)
 # Job context가 common을 상속하므로 Job부터 지운다.
 contexts = {pc["component"]["name"]: pc["id"] for pc in call("GET", "/flow/parameter-contexts")["parameterContexts"]}
-for name in ("PC_JOB_PG_INSP_DTL_DAILY", "PC_SQOOP_REPLACEMENT_COMMON"):
+for name in (PC_JOB, PC_COMMON):
     if name in contexts:
         cur = call("GET", f"/parameter-contexts/{contexts[name]}")
         call("DELETE", f"/parameter-contexts/{contexts[name]}?version={cur['revision']['version']}&clientId={CID}")

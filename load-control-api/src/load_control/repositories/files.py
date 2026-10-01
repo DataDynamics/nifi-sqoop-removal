@@ -60,7 +60,16 @@ async def aggregate(conn: AsyncConnection, run_id: UUID, partition_id: str) -> F
                COALESCE(SUM(byte_count), 0)   AS bytes,
                COUNT(DISTINCT fragment_count) AS counts
           FROM nifi_ops.load_file
-         WHERE run_id = :run_id AND partition_id = :partition_id
+         WHERE run_id = :run_id AND partition_id = :partition_id AND status = 'WRITTEN'
     """), {"run_id": run_id, "partition_id": partition_id})).mappings().one()
     return FileAggregate(files=int(m["files"]), lo=m["lo"], hi=m["hi"], rows=int(m["rows"]),
                          bytes=int(m["bytes"]), counts=int(m["counts"]))
+
+
+async def invalidate(conn: AsyncConnection, run_id: UUID, partition_id: str) -> int:
+    """재발행 전에 이전 시도의 chunk 기록을 집계에서 뺀다. 같은 chunk를 다시 보고하면 WRITTEN으로 돌아온다."""
+    result = await conn.execute(text("""
+        UPDATE nifi_ops.load_file SET status = 'FAILED', updated_at = clock_timestamp()
+         WHERE run_id = :run_id AND partition_id = :partition_id AND status = 'WRITTEN'
+    """), {"run_id": run_id, "partition_id": partition_id})
+    return result.rowcount

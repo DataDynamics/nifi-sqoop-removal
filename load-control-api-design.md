@@ -448,13 +448,20 @@ API의 worker 프로세스(9.2)가 `sweeper_interval`마다 실행한다. 여러
 
 | 대상 | 조건 | 동작 |
 |---|---|---|
-| 파티션 `RUNNING` | `heartbeat_at < now - LCA_RECOVERY_STALE` AND `started_at + LCA_EXTRACT_QUERY_TIMEOUT < now` | 정책 `LCA_RECOVERY_MODE`에 따름: `FAIL`이면 run `TIMED_OUT`, `REISSUE`이면 claim 초기화 후 `RETRY`와 `REISSUE_PARTITION` dispatch |
+| 파티션 `RUNNING` | `heartbeat_at < now - LCA_RECOVERY_STALE` | 정책 `LCA_RECOVERY_MODE`에 따름: `FAIL`이면 해당 run의 미완료 파티션과 run을 `TIMED_OUT`. `REISSUE`이면 claim 초기화 후 `RETRY`, 이전 chunk 기록 무효화, `REISSUE_PARTITION` dispatch. `attempt_count >= LCA_RECOVERY_MAX_ATTEMPTS`이면 `FAIL`과 같게 처리 |
 | run `CREATED`, `EXTRACTING` | `started_at + LCA_RUN_TIMEOUT < now` | `TIMED_OUT`, 알림 |
-| dispatch `SENT` | `sent_at + LCA_DISPATCH_ACK_TIMEOUT < now` AND run이 아직 `EXTRACTED_VALIDATED` | `PENDING`으로 되돌려 재전송 |
-| run `STAGE_VALIDATING`, `PUBLISHED` | `heartbeat_at < now - LCA_VALIDATION_STALE` | ERROR 알림. 자동 전이하지 않음 |
+| dispatch `SENT` | `sent_at + LCA_DISPATCH_ACK_TIMEOUT < now` AND (검증 호출이면 run이 아직 `EXTRACTED_VALIDATED`, 재발행이면 파티션이 아직 `RETRY`) | `PENDING`으로 되돌려 재전송 |
+| run `STAGE_VALIDATING`, `PUBLISHED` | `heartbeat_at < now - LCA_VALIDATION_STALE` | `RUN_STALE_ALERT` ERROR 이벤트(같은 run에는 stale 기간마다 1회). 자동 전이하지 않음 |
 | run `PUBLISHING` | `publish_started_at + LCA_PUBLISH_STALE < now` | `PUBLISH_UNKNOWN`, ERROR 알림. 자동 재실행 금지 |
 
-stale 기준은 가이드 13장과 같다. heartbeat는 claim과 chunk 보고 때만 갱신되고 Oracle 쿼리가 실행되는 동안에는 갱신되지 않으므로, `LCA_RECOVERY_STALE`은 NiFi `EXTRACT.QUERY.TIMEOUT`(= `LCA_EXTRACT_QUERY_TIMEOUT`)보다 커야 한다.
+stale 기준은 가이드 13장과 같다. heartbeat는 claim과 chunk 보고 때만 갱신되고 Oracle 쿼리가 실행되는 동안에는 갱신되지 않으므로, `LCA_RECOVERY_STALE`은 NiFi `EXTRACT.QUERY.TIMEOUT`(= `LCA_EXTRACT_QUERY_TIMEOUT`)보다 커야 한다. 설정이 이 조건을 어기면 API와 worker가 시작하지 않는다. 그래서 파티션 조건은 heartbeat 하나로 충분하다. 재발행 후 `started_at`은 첫 시작 시각으로 남으므로 조건에 쓰지 않는다.
+
+구현에서 정한 세부 규칙은 다음과 같다.
+
+- 대상 run은 `FOR UPDATE SKIP LOCKED`로 가져온다. 지금 chunk 보고나 claim을 처리 중인 run은 다음 tick으로 미룬다.
+- 재발행 전에 해당 파티션의 `load_file` 행을 `status='FAILED'`로 바꾼다. 파티션 판정은 `WRITTEN` 행만 집계하므로 이전 시도의 일부 chunk가 새 판정에 섞이지 않는다. 새 Worker가 같은 chunk를 보고하면 같은 행이 `WRITTEN`으로 갱신된다. API 계정에 DELETE 권한이 없으므로 삭제하지 않는다.
+- 재발행 dispatch에는 별도 ACK 엔드포인트가 없다. `RETRY` 파티션이 claim되면 그 파티션의 `REISSUE_PARTITION` dispatch를 `ACKED`로 바꾼다.
+- 늦게 살아난 이전 Worker의 chunk 보고는 claim token이 초기화되어 409 `CLAIM_MISMATCH`, 실패 보고는 409 `PARTITION_STATUS_MISMATCH`를 받는다.
 
 1단계 운영은 `LCA_RECOVERY_MODE=FAIL`을 권장한다. stale 파티션이 생기면 run 전체를 실패시키고 새 `run_id`로 재실행한다. 동일 SCN 재발행(`REISSUE`)은 NiFi 쪽 수신 지점(가이드 13장)과 Oracle UNDO 보존 시간 확인이 끝난 뒤 켠다.
 
@@ -517,7 +524,7 @@ dispatcher와 sweeper를 HTTP 프로세스와 분리하는 이유는 다음과 �
 
 ### 9.3 프로젝트 구조
 
-구현은 저장소의 [`load-control-api/`](./load-control-api/)에 있다(12장 1~2단계 구현 완료).
+구현은 저장소의 [`load-control-api/`](./load-control-api/)에 있다. 12장의 API 쪽 작업(1, 2, 4, 5, 6, 8단계의 API 부분)은 구현을 마쳤다.
 
 ```text
 load-control-api/
@@ -540,18 +547,19 @@ load-control-api/
 │   ├── schemas/           # Pydantic 요청·응답 모델
 │   │   ├── runs.py  partitions.py  validation.py  publish.py
 │   ├── repositories/      # SQL만 둔다(상태 판단 없음)
-│   │   ├── runs.py  partitions.py  files.py  validations.py  dispatch.py  events.py
+│   │   ├── runs.py  partitions.py  files.py  validations.py  dispatch.py  events.py  sweeper.py
 │   ├── services/          # 트랜잭션 단위 업무 규칙
-│   │   ├── runs.py  manifest.py  completion.py  validation.py  publish.py
+│   │   ├── runs.py  manifest.py  completion.py  validation.py  publish.py  ops.py
 │   ├── routers/
-│   │   ├── deps.py  runs.py  partitions.py  validation.py  publish.py  ops.py  health.py
+│   │   ├── deps.py  runs.py  partitions.py  validation.py(검증·게시)  ops.py  health.py
 │   └── worker/
 │       ├── __main__.py    # dispatcher + sweeper 실행
 │       ├── dispatcher.py
 │       └── sweeper.py
 └── tests/
     ├── conftest.py        # testcontainers PostgreSQL, alembic upgrade
-    ├── test_partitions.py test_concurrency.py test_dispatch.py test_sweeper.py ...
+    ├── test_partitions.py test_concurrency.py test_dispatcher.py test_sweeper.py
+    ├── test_validation_start.py test_publish_flow.py test_ops.py ...
 ```
 
 계층 규칙은 다음과 같다.
@@ -588,6 +596,7 @@ class Settings(BaseSettings):
     extract_query_timeout: timedelta = timedelta(minutes=60)
     recovery_stale: timedelta = timedelta(minutes=90)
     recovery_mode: Literal["FAIL", "REISSUE"] = "FAIL"
+    recovery_max_attempts: int = 3   # REISSUE 모드에서 초과 시 run TIMED_OUT
     validation_stale: timedelta = timedelta(hours=2)
     publish_stale: timedelta = timedelta(hours=2)
 
@@ -975,8 +984,8 @@ API 전체 중단 중 시작된 run은 성공으로 판정되지 않고 TIMED_OU
 1. **프로젝트 골격** (구현 완료): 9.3 구조, 설정, Alembic baseline(가이드 4.1 DDL), 인증, 오류 처리, health, 테스트 환경(testcontainers).
 2. **API 1차** (구현 완료): `/runs`, `/manifest`, `/claim`, `/chunks`, `/fail`, `GET /runs/{id}`, 판정 트랜잭션. 11.1의 동시성 테스트를 먼저 통과시킨다.
 3. **PG-10, PG-20 전환**: PoC 환경(NiFi 2.4.0 + PostgreSQL)에서 PoC와 같은 시나리오(105,000건, 8파티션, 0건 파티션, 배수 경계, 중복 실행, HDFS 실패 주입)를 다시 실행한다. 이 단계에서는 PG-30을 남겨 두고 API 판정 결과와 PG-30 판정 결과를 비교할 수 있다.
-4. **outbox와 검증 수신**: `load_dispatch`, dispatcher, `/validation/start`, PG-40 입구. 이후 PG-30과 DMC Controller Service를 삭제한다.
-5. **PG-50, PG-60 연동**: publish claim·result, validations, success.
-6. **Sweeper**: `LCA_RECOVERY_MODE=FAIL`로 시작. 노드 종료, API 재기동, NiFi 재기동, 보고 유실을 주입해 검증한다.
+4. **outbox와 검증 수신** (API 구현 완료, NiFi 남음): `load_dispatch`, dispatcher, `/validation/start`, PG-05·PG-40 입구. 이후 PG-30과 DMC Controller Service를 삭제한다.
+5. **PG-50, PG-60 연동** (API 구현 완료, NiFi 남음): publish claim·result, validations, stage-validated, success, 운영자 엔드포인트.
+6. **Sweeper** (API 구현 완료): `LCA_RECOVERY_MODE=FAIL`로 시작. 노드 종료, API 재기동, NiFi 재기동, 보고 유실을 주입해 검증한다.
 7. **권한 회수**: NiFi 계정의 업무 테이블 쓰기 권한 회수(6장, 가이드 4.1).
-8. **재발행(선택)**: `REISSUE_PARTITION`과 PG-05 `/reissue/{jobKey}` 수신 경로.
+8. **재발행(선택)** (API 구현 완료, NiFi 남음): `REISSUE_PARTITION`과 PG-05 `/reissue/{jobKey}` 수신 경로.

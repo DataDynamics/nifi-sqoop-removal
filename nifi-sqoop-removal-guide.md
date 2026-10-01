@@ -1434,13 +1434,13 @@ API는 64에서 저장된 TARGET 지표가 모두 PASS이고 `status='PUBLISHED'
 
 | 대상 | 조건 | 동작 |
 |---|---|---|
-| 파티션 `RUNNING` | `heartbeat_at < now - LCA_RECOVERY_STALE` AND `started_at + LCA_EXTRACT_QUERY_TIMEOUT < now` | `LCA_RECOVERY_MODE=FAIL`: run `TIMED_OUT`. `REISSUE`: claim 초기화 후 `RETRY`, `REISSUE_PARTITION` dispatch |
+| 파티션 `RUNNING` | `heartbeat_at < now - LCA_RECOVERY_STALE` | `LCA_RECOVERY_MODE=FAIL`: run `TIMED_OUT`. `REISSUE`: claim 초기화 후 `RETRY`, 이전 chunk 기록 무효화, `REISSUE_PARTITION` dispatch. 시도 횟수가 `LCA_RECOVERY_MAX_ATTEMPTS`에 도달하면 run `TIMED_OUT` |
 | run `CREATED`, `EXTRACTING` | `started_at + LCA_RUN_TIMEOUT < now` | `TIMED_OUT`, 알림 |
 | dispatch `SENT` | ACK timeout 경과, run이 아직 `EXTRACTED_VALIDATED` | `PENDING`으로 되돌려 재전송 |
 | run `STAGE_VALIDATING`, `PUBLISHED` | heartbeat가 `LCA_VALIDATION_STALE`보다 오래됨 | ERROR 알림. 자동 전이하지 않음 |
 | run `PUBLISHING` | `publish_started_at + LCA_PUBLISH_STALE < now` | `PUBLISH_UNKNOWN`, ERROR 알림. 자동 재실행 금지 |
 
-- `LCA_RECOVERY_STALE`은 `EXTRACT.QUERY.TIMEOUT` + 파티션당 chunk 기록·보고 소요시간 + 여유보다 크게 잡는다. heartbeat는 claim과 chunk 보고에서만 갱신되고 파티션 쿼리 실행 중에는 갱신되지 않는다(8.5). 이 값이 query timeout(60분)보다 짧으면 정상 실행 중인 파티션을 stale로 판정한다.
+- `LCA_RECOVERY_STALE`은 `EXTRACT.QUERY.TIMEOUT` + 파티션당 chunk 기록·보고 소요시간 + 여유보다 크게 잡는다. heartbeat는 claim과 chunk 보고에서만 갱신되고 파티션 쿼리 실행 중에는 갱신되지 않는다(8.5). 이 값이 query timeout(60분)보다 짧으면 정상 실행 중인 파티션을 stale로 판정하므로, API는 `LCA_RECOVERY_STALE <= LCA_EXTRACT_QUERY_TIMEOUT`이면 시작하지 않는다.
 - 1단계 운영은 `LCA_RECOVERY_MODE=FAIL`이다. stale 파티션이 생기면 run 전체를 실패시키고 새 `run_id`로 재실행한다.
 - `ORA-01555`는 Worker가 `fail`로 보고하며, API가 run을 `FAILED_SNAPSHOT_EXPIRED`로 바꾼다. 같은 run의 일부 파티션만 새 SCN으로 읽지 않는다.
 
@@ -1461,7 +1461,7 @@ API는 64에서 저장된 TARGET 지표가 모두 PASS이고 `status='PUBLISHED'
 | 71 | `RouteOnAttribute` | All Nodes, 1 | SCN·경계·건수 숫자 정규식 검증 | valid→72, unmatched→PG-90 ERROR |
 | 72 | `UpdateAttribute` + Output Port | All Nodes, 1 | `event.name=RECOVERY_REISSUED`, `event.level=WARN` | success→PG-20 입력(Round Robin) |
 
-재발행된 FlowFile은 PG-20의 20에서 새 claim token으로 claim한다. API는 `RETRY` 상태 파티션만 claim을 허용하므로 이전 Worker가 늦게 살아나도 이전 token의 chunk 보고는 409 `CLAIM_MISMATCH`로 거부된다. 같은 `run_id + partition_id`와 같은 SCN, 같은 결정적 파일명을 쓰므로 PutHDFS `replace`로 이전 파일을 덮어쓴다. 재발행은 Oracle UNDO 보존 시간이 run 최대 시간보다 길다는 것을 확인한 뒤 켠다.
+재발행된 FlowFile은 PG-20의 20에서 새 claim token으로 claim한다. 이 claim이 재발행 수신 확인(ACK)이 되며, ACK 없이 `LCA_DISPATCH_ACK_TIMEOUT`이 지나면 API가 재발행 요청을 다시 보낸다. API는 `RETRY` 상태 파티션만 claim을 허용하므로 이전 Worker가 늦게 살아나도 이전 token의 chunk 보고는 409 `CLAIM_MISMATCH`로 거부된다. API는 재발행 전에 이전 시도의 chunk 기록을 집계에서 빼므로, 새 Worker의 보고만으로 파티션을 판정한다. 같은 `run_id + partition_id`와 같은 SCN, 같은 결정적 파일명을 쓰므로 PutHDFS `replace`로 이전 파일을 덮어쓴다. 재발행은 Oracle UNDO 보존 시간이 run 최대 시간보다 길다는 것을 확인한 뒤 켠다.
 
 ---
 

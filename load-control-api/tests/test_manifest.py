@@ -1,4 +1,8 @@
+import uuid
+from typing import Any
+
 import httpx
+import pytest
 
 from tests.conftest import Db
 from tests.helpers import create_run, manifest_body
@@ -104,3 +108,42 @@ async def test_empty_source_allowed_completes_immediately(client: httpx.AsyncCli
     assert r.json()["dispatchPartitions"] == []
     assert await db.scalar("SELECT COUNT(*) FROM nifi_ops.load_dispatch WHERE run_id = CAST(:id AS uuid)",
                            id=run.run_id) == 1
+
+
+def _with(body: dict[str, object], index: int, **patch: object) -> dict[str, object]:
+    body["partitions"][index].update(patch)  # type: ignore[index]
+    return body
+
+
+@pytest.mark.parametrize(("make", "reason"), [
+    (lambda: _with(manifest_body([10, 20]), 1, partitionId="0000"), "DUPLICATE_PARTITION_ID"),
+    (lambda: _with(manifest_body([10, 20]), 0, lowerBound="5000"), "INVALID_BOUNDS"),
+    (lambda: _with(manifest_body([10, 20]), 0, upperBound=None), "INVALID_BOUNDS"),
+    (lambda: manifest_body([10, 20], sourceMinSplit="0"), "MIN_SPLIT_MISMATCH"),
+    (lambda: manifest_body([10, 20], sourceMaxSplit="9999"), "MAX_SPLIT_MISMATCH"),
+    (lambda: manifest_body([10, 20], null_count=5, sourceNullSplitCount=4, sourceCount=34),
+     "NULL_COUNT_MISMATCH"),
+    (lambda: manifest_body([10, 20], sourceNullSplitCount=3, sourceCount=33),
+     "NULL_ROWS_WITHOUT_NULL_PARTITION"),
+    (lambda: _with(manifest_body([10, 20], null_count=5), 2, lowerBound="1"), "INVALID_NULL_PARTITION"),
+])
+async def test_invalid_manifest_variants(client: httpx.AsyncClient, db: Db, make: Any, reason: str) -> None:
+    await _assert_invalid(client, db, make(), reason)
+
+
+async def test_multiple_null_partitions(client: httpx.AsyncClient, db: Db) -> None:
+    body = manifest_body([10, 20], null_count=5)
+    body["partitions"].append(dict(body["partitions"][-1], partitionId="NULL"))  # type: ignore[attr-defined]
+    await _assert_invalid(client, db, body, "MULTIPLE_NULL_PARTITIONS")
+
+
+async def test_different_manifest_after_registration_conflicts(client: httpx.AsyncClient) -> None:
+    run = await create_run(client)
+    await client.post(f"/v1/runs/{run.run_id}/manifest", json=manifest_body([10, 20]))
+    r = await client.post(f"/v1/runs/{run.run_id}/manifest", json=manifest_body([10, 20, 30]))
+    assert r.status_code == 409 and r.json()["code"] == "RUN_STATUS_MISMATCH"
+
+
+async def test_manifest_unknown_run(client: httpx.AsyncClient) -> None:
+    r = await client.post(f"/v1/runs/{uuid.uuid4()}/manifest", json=manifest_body([10]))
+    assert r.status_code == 404

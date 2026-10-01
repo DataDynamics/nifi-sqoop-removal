@@ -15,6 +15,7 @@ from load_control.config import Settings, get_settings
 from load_control.db import make_engine
 from load_control.logging import configure_logging
 from load_control.worker.dispatcher import Dispatcher, make_client
+from load_control.worker.sweeper import run_sweeper
 
 log = structlog.get_logger("load_control.worker")
 
@@ -23,7 +24,10 @@ async def run_worker(settings: Settings, stop: asyncio.Event) -> None:
     engine = make_engine(settings)
     client = make_client(settings)
     try:
-        tasks = [asyncio.create_task(Dispatcher(settings, engine, client).run(stop), name="dispatcher")]
+        tasks = [
+            asyncio.create_task(Dispatcher(settings, engine, client).run(stop), name="dispatcher"),
+            asyncio.create_task(run_sweeper(engine, settings, stop), name="sweeper"),
+        ]
         log.info("worker_started", tasks=[t.get_name() for t in tasks])
         await asyncio.gather(*tasks)
     finally:

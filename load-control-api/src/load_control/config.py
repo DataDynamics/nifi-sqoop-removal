@@ -2,7 +2,7 @@ from datetime import timedelta
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import AnyHttpUrl, SecretStr
+from pydantic import AnyHttpUrl, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -30,6 +30,7 @@ class Settings(BaseSettings):
     extract_query_timeout: timedelta = timedelta(minutes=60)
     recovery_stale: timedelta = timedelta(minutes=90)
     recovery_mode: Literal["FAIL", "REISSUE"] = "FAIL"
+    recovery_max_attempts: int = 3  # REISSUE 모드에서 이 횟수를 넘으면 run TIMED_OUT
     validation_stale: timedelta = timedelta(hours=2)
     publish_stale: timedelta = timedelta(hours=2)
 
@@ -46,6 +47,14 @@ class Settings(BaseSettings):
 
     log_level: str = "INFO"
     log_json: bool = True
+
+
+    @model_validator(mode="after")
+    def _check_timeouts(self) -> "Settings":
+        # heartbeat는 쿼리 실행 중 갱신되지 않으므로 stale 기준은 query timeout보다 커야 한다(가이드 13.1).
+        if self.recovery_stale <= self.extract_query_timeout:
+            raise ValueError("LCA_RECOVERY_STALE must be greater than LCA_EXTRACT_QUERY_TIMEOUT")
+        return self
 
 
 @lru_cache

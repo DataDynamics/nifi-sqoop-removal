@@ -4,17 +4,15 @@ Sqoop 대체 적재(NiFi)의 상태 원장 기록과 완료 판정을 담당하�
 
 ## 구현 범위
 
-API 설계 12장 전환 순서 중 1~2단계를 구현했다.
+API 설계 12장 전환 순서 중 API 쪽 작업을 모두 구현했다. NiFi Flow 전환(3단계)과 권한 회수(7단계)는 NiFi·DBA 작업이다.
 
-| 단계 | 내용 | 상태 |
-|---|---|---|
-| 1. 프로젝트 골격 | 설정, Alembic baseline(가이드 4.1 DDL), 인증, 오류 처리, health, 메트릭, 테스트 환경 | 완료 |
-| 2. API 1차 | `POST /v1/runs`, `/manifest`, `/fail`, `/partitions/{pid}/claim`, `/chunks`, `/fail`, `GET /v1/runs/{id}`, 판정 트랜잭션, outbox 예약 | 완료 |
-| 4. outbox 전달 | worker 프로세스 dispatcher, `/validation/start` | 미구현 |
-| 5. 검증·게시 | `/validations`, `/stage-validated`, `/publish/*`, `/success` | 미구현 |
-| 6. sweeper | stale·timeout 정리 | 미구현 |
-
-chunk 판정에서 run 완료가 확정되면 `load_dispatch`에 `VALIDATE_RUN` 행을 넣고 `pg_notify('load_dispatch')`까지 실행한다. 이 행을 NiFi로 전달하는 dispatcher는 4단계에서 구현한다.
+| 구분 | 엔드포인트·기능 |
+|---|---|
+| 추출 | `POST /v1/runs`, `/manifest`, `/fail`, `/partitions/{pid}/claim`, `/chunks`, `/partitions/{pid}/fail` |
+| 검증·게시 | `POST /validation/start`, `/validations`, `/stage-validated`, `/publish/claim`, `/publish/result`, `/success` |
+| 조회 | `GET /v1/runs`, `GET /v1/runs/{id}` (role `nifi`, `operator`) |
+| 운영자 | `POST /dispatches/{id}/resend`, `/publish-unknown/resolve` (role `operator`만) |
+| worker | outbox dispatcher(LISTEN/NOTIFY, lease, backoff, DEAD), sweeper(stale 파티션, run timeout, ACK timeout 재전송, 검증 정체 경보, 게시 결과 불명) |
 
 ## 구조
 
@@ -30,8 +28,9 @@ src/load_control/
 ├── domain.py         # RunStatus, PartitionStatus, 허용 실패 전이
 ├── schemas/          # Pydantic 요청·응답 모델 (camelCase JSON)
 ├── repositories/     # SQL만 (판단 없음)
-├── services/         # 트랜잭션 단위 업무 규칙 (manifest 불변식, claim, chunk 판정)
-└── routers/          # 인증, 입력 검증, 트랜잭션 시작
+├── services/         # 트랜잭션 단위 업무 규칙 (manifest 불변식, claim, chunk 판정, 검증, 게시)
+├── routers/          # 인증, 입력 검증, 트랜잭션 시작
+└── worker/           # python -m load_control.worker: dispatcher + sweeper
 alembic/versions/0001_nifi_ops_baseline.py   # 가이드 4.1 DDL
 tests/                                       # 실제 PostgreSQL 대상 통합·동시성 테스트
 ```
@@ -69,11 +68,19 @@ export LCA_MIGRATION_DATABASE_URL=postgresql+asyncpg://<ddl-user>@<host>:5432/<d
 
 # 운영 (Dockerfile 기본 명령과 같음)
 gunicorn 'load_control.main:create_app()' -k uvicorn.workers.UvicornWorker -w 4 -b 0.0.0.0:8080
+
+# worker (dispatcher + sweeper). 같은 이미지에서 명령만 바꿔 2개 띄운다.
+python -m load_control.worker
 ```
+
+worker는 `LCA_NIFI_RECEIVER_URL`(NiFi LB의 PG-05 주소)이 없으면 시작하지 않는다. `LCA_LISTEN_DSN`이 없으면 NOTIFY 없이 `LCA_DISPATCH_POLL_INTERVAL`마다 폴링만 한다. SIGTERM을 받으면 진행 중인 작업을 끝내고 종료한다. 여러 개를 띄워도 lease와 advisory lock 때문에 같은 dispatch를 두 번 보내거나 같은 정리를 두 번 하지 않는다.
+
+`LCA_RECOVERY_STALE`은 `LCA_EXTRACT_QUERY_TIMEOUT`보다 커야 하며, 그렇지 않으면 API와 worker 모두 시작하지 않는다.
 
 - `GET /healthz`: 프로세스 생존(DB 미확인)
 - `GET /readyz`: DB `SELECT 1`
-- `GET /metrics`: Prometheus. Gunicorn 멀티 프로세스에서 프로세스 합계가 필요하면 `PROMETHEUS_MULTIPROC_DIR`을 설정하고 multiprocess collector로 바꾼다.
+- `GET /metrics`: Prometheus(API). worker는 `LCA_WORKER_METRICS_PORT`(기본 9100)에서 dispatch backlog, 활성 run 수, sweeper 처리 건수를 노출한다.
+- API `GET /metrics`: Gunicorn 멀티 프로세스에서 프로세스 합계가 필요하면 `PROMETHEUS_MULTIPROC_DIR`을 설정하고 multiprocess collector로 바꾼다.
 - OpenAPI 문서: `/docs`, `/openapi.json`
 
 ## 테스트
@@ -89,6 +96,16 @@ LCA_TEST_DATABASE_URL=postgresql+asyncpg://postgres@127.0.0.1:5432/lca_test .ven
 
 .venv/bin/ruff check .
 .venv/bin/mypy src
+
+# 커버리지(greenlet 추적 설정은 pyproject.toml에 있음)
+.venv/bin/pytest --cov
 ```
+
+주요 동시성 테스트:
+
+- `test_concurrency.py`: 마지막 파티션 동시 완료 시 검증 예약 1회, 동시 claim 1명
+- `test_dispatcher.py`: 동시 dispatcher가 같은 행을 한 번만 전송, ACK가 `mark_sent`보다 먼저 와도 `ACKED` 유지, lease 만료 후 재전송, LISTEN 재연결
+- `test_validation_start.py`, `test_publish_flow.py`: 동시 검증 시작·동시 publish claim에서 승자 1명
+- `test_sweeper.py`: 여러 sweeper가 동시에 돌아도 같은 run을 한 번만 정리
 
 `tests/test_concurrency.py`는 마지막 파티션들의 chunk를 `asyncio.gather`로 동시에 보고해 검증 호출 예약이 정확히 1회인지 확인한다. run 행 잠금과 run 행 UPDATE를 모두 제거하면 "아무도 run을 완료하지 못하는" 경합이 재현되어 이 테스트가 실패한다.

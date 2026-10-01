@@ -1,13 +1,18 @@
+"""manifest 등록과 불변식 검증(가이드 7.4, API 설계 3.4)."""
+
 from dataclasses import dataclass, field
 from decimal import Decimal
 from uuid import UUID
 
+import structlog
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from load_control.domain import RunStatus
 from load_control.errors import Conflict, NotFound
 from load_control.repositories import dispatch, events, partitions, runs, validations
 from load_control.schemas.runs import ManifestPartition, ManifestRequest, ManifestResponse
+
+log = structlog.get_logger(__name__)
 
 
 @dataclass
@@ -82,6 +87,11 @@ def _dispatchable(rows: list[partitions.PartitionRow]) -> list[ManifestPartition
 
 
 async def register_manifest(conn: AsyncConnection, run_id: UUID, req: ManifestRequest) -> ManifestOutcome:
+    """SCN·source 지표 저장, 불변식 검증, 파티션 일괄 등록, CREATED → EXTRACTING을 한 트랜잭션으로.
+
+    0건 파티션은 바로 SUCCESS로 넣고 Worker 대상(dispatchPartitions)에서 뺀다. 모든 파티션이
+    0건이면(allowEmptySource) 이 자리에서 run 완료까지 판정하고 검증 호출을 예약한다.
+    """
     run = await runs.lock(conn, run_id)
     if run is None:
         raise NotFound("RUN_NOT_FOUND")
@@ -93,7 +103,9 @@ async def register_manifest(conn: AsyncConnection, run_id: UUID, req: ManifestRe
                 == sorted(p.partition_id for p in req.partitions)
                 and run.source_count == req.source_count)
         if not same:
+            log.warning("manifest_conflict", runId=str(run_id), runStatus=run.status)
             raise Conflict("RUN_STATUS_MISMATCH", runStatus=run.status)
+        log.info("manifest_replayed", runId=str(run_id), runStatus=run.status)
         return ManifestOutcome(response=ManifestResponse(
             run_id=str(run_id), status=RunStatus(run.status),
             dispatch_partitions=_dispatchable(existing),
@@ -108,6 +120,8 @@ async def register_manifest(conn: AsyncConnection, run_id: UUID, req: ManifestRe
                         stage="MANIFEST", code="MANIFEST_INVALID", message=message)
         await events.record(conn, "MANIFEST_INVALID", run, level="ERROR",
                             error_code="MANIFEST_INVALID", message=message)
+        log.error("manifest_invalid", runId=str(run_id), jobKey=run.job_key,
+                  businessKey=run.business_key, violations=violations)
         return ManifestOutcome(violations=violations)
 
     await partitions.insert_many(conn, [{
@@ -129,6 +143,8 @@ async def register_manifest(conn: AsyncConnection, run_id: UUID, req: ManifestRe
     await events.record(conn, "MANIFEST_CREATED", run, row_count=req.source_count,
                         details={"partitions": len(req.partitions), "empty": empty,
                                  "snapshotScn": req.snapshot_scn})
+    log.info("manifest_registered", runId=str(run_id), partitions=len(req.partitions),
+             emptyPartitions=empty, sourceCount=req.source_count, snapshotScn=req.snapshot_scn)
 
     scheduled = False
     status = RunStatus.EXTRACTING
@@ -136,6 +152,7 @@ async def register_manifest(conn: AsyncConnection, run_id: UUID, req: ManifestRe
         await dispatch.enqueue_validation(conn, run_id)
         await events.record(conn, "EXTRACT_VALIDATED", run, row_count=0)
         scheduled, status = True, RunStatus.EXTRACTED_VALIDATED
+        log.info("extract_validated", runId=str(run_id), extractedCount=0, reason="all partitions empty")
 
     return ManifestOutcome(response=ManifestResponse(
         run_id=str(run_id), status=status,

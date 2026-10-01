@@ -1,3 +1,5 @@
+"""load_file(chunk 보고 원장) SQL."""
+
 from dataclasses import dataclass
 from uuid import UUID
 
@@ -7,6 +9,8 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 
 @dataclass(frozen=True, slots=True)
 class FileAggregate:
+    """파티션 하나의 chunk 집계 결과."""
+
     files: int
     lo: int | None
     hi: int | None
@@ -52,6 +56,7 @@ async def upsert(conn: AsyncConnection, run_id: UUID, partition_id: str, *, chun
 
 
 async def aggregate(conn: AsyncConnection, run_id: UUID, partition_id: str) -> FileAggregate:
+    """파티션의 WRITTEN chunk를 집계한다(API 설계 3.3의 4단계)."""
     m = (await conn.execute(text("""
         SELECT COUNT(*)                       AS files,
                MIN(chunk_index)               AS lo,

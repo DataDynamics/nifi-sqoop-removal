@@ -19,6 +19,7 @@ API 설계 12장 전환 순서 중 API 쪽 작업을 모두 구현했다. NiFi F
 ```text
 src/load_control/
 ├── main.py           # create_app() factory, 예외 처리기, router 등록
+├── server.py         # API 진입점(python -m load_control.server)
 ├── config.py         # Settings (config.yaml 로드)
 ├── db.py             # engine, in_tx (deadlock 재시도), SQLSTATE 헬퍼
 ├── security.py       # Bearer 토큰 role 인증 (digest 비교)
@@ -43,6 +44,16 @@ tests/                                       # 실제 PostgreSQL 대상 통합·
 - 우선순위: 환경변수 > `config.yaml` > 기본값. 비밀값은 `LCA_DATABASE__URL`처럼 환경변수로 덮어쓸 수 있다(섹션 구분자 `__`).
 - 모르는 키(오타)나 잘못된 값이 있으면 시작하지 않는다.
 - 기간 값은 ISO 8601(`PT90M`) 또는 초 단위 숫자.
+
+| 섹션 | 내용 |
+|---|---|
+| `server` | API bind address(`host`), `port`, 프로세스 수(`workers`), 프록시 헤더, graceful shutdown, 선택적 TLS/mTLS |
+| `database` | DB URL(런타임, migration, LISTEN), pool |
+| `auth` | role별 토큰 digest |
+| `nifi` | worker가 NiFi PG-05를 호출할 주소와 mTLS |
+| `recovery`, `dispatch` | sweeper·outbox 기준 |
+| `worker` | worker `/metrics` bind address와 port |
+| `logging` | 수준, 형식(json/console), 표준출력, 회전 파일, access 로그 on/off, logger별 수준 |
 
 ## 개발 환경
 
@@ -72,15 +83,17 @@ cp config.example.yaml config.yaml   # 값 채우기 (config.yaml은 git에 올�
 ## 실행
 
 ```bash
-# 개발
-.venv/bin/uvicorn --factory load_control.main:create_app --reload --port 8080
+# API: config.yaml의 server 섹션(host, port, workers, TLS 등)으로 uvicorn 실행. Dockerfile 기본 명령과 같다
+python -m load_control.server --config config.yaml      # 또는 설치 후 load-control-api
 
-# 운영 (Dockerfile 기본 명령과 같음)
-gunicorn 'load_control.main:create_app()' -k uvicorn.workers.UvicornWorker -w 4 -b 0.0.0.0:8080
+# worker (dispatcher + sweeper). 같은 이미지에서 명령만 바꿔 2개 띄운다
+python -m load_control.worker --config config.yaml      # 또는 load-control-worker
 
-# worker (dispatcher + sweeper). 같은 이미지에서 명령만 바꿔 2개 띄운다.
-python -m load_control.worker
+# 개발 중 자동 재시작
+LCA_CONFIG=config.yaml .venv/bin/uvicorn --factory load_control.main:create_app --reload --port 8080
 ```
+
+`--config`를 주지 않으면 `LCA_CONFIG`, 그것도 없으면 현재 디렉터리의 `config.yaml`을 읽는다.
 
 worker는 `nifi.receiver_url`(NiFi LB의 PG-05 주소)이 없으면 시작하지 않는다. `database.listen_dsn`이 없으면 NOTIFY 없이 `dispatch.poll_interval`마다 폴링만 한다. SIGTERM을 받으면 진행 중인 작업을 끝내고 종료한다. 여러 개를 띄워도 lease와 advisory lock 때문에 같은 dispatch를 두 번 보내거나 같은 정리를 두 번 하지 않는다.
 
@@ -88,8 +101,8 @@ worker는 `nifi.receiver_url`(NiFi LB의 PG-05 주소)이 없으면 시작하지
 
 - `GET /healthz`: 프로세스 생존(DB 미확인)
 - `GET /readyz`: DB `SELECT 1`
-- `GET /metrics`: Prometheus(API). worker는 `worker.metrics_port`(기본 9100)에서 dispatch backlog, 활성 run 수, sweeper 처리 건수를 노출한다.
-- API `GET /metrics`: Gunicorn 멀티 프로세스에서 프로세스 합계가 필요하면 `PROMETHEUS_MULTIPROC_DIR`을 설정하고 multiprocess collector로 바꾼다.
+- `GET /metrics`: Prometheus(API). `server.workers`가 1보다 크면 요청을 받은 프로세스의 값만 나온다. 합계가 필요하면 `PROMETHEUS_MULTIPROC_DIR`을 설정하고 multiprocess collector로 바꾼다.
+- worker `/metrics`: `worker.metrics_host`:`worker.metrics_port`(기본 0.0.0.0:9100). dispatch backlog, 활성 run 수, sweeper 처리 건수.
 - OpenAPI 문서: `/docs`, `/openapi.json`
 
 ## 테스트

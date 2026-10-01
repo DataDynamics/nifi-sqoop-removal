@@ -1,3 +1,5 @@
+"""load_run SQL. 모든 상태 전이는 WHERE status = 기대 상태 조건(CAS)으로 실행한다(가이드 17장)."""
+
 import json
 from dataclasses import dataclass
 from datetime import datetime
@@ -11,6 +13,8 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 
 @dataclass(frozen=True, slots=True)
 class RunRow:
+    """load_run 한 행(서비스 계층에 필요한 컬럼만)."""
+
     run_id: UUID
     job_key: str
     business_key: str
@@ -48,6 +52,7 @@ def _row(m: Any) -> RunRow:
 
 async def insert(conn: AsyncConnection, *, run_id: UUID, job_key: str, business_key: str,
                  hdfs_run_path: str, stage_table_name: str, parameters: dict[str, Any]) -> None:
+    """CREATED run을 만든다. 같은 업무키의 활성 run이 있으면 uq_load_run_active 위반."""
     await conn.execute(text("""
         INSERT INTO nifi_ops.load_run (
             run_id, job_key, business_key, status, hdfs_run_path, stage_table_name, parameters)
@@ -59,6 +64,7 @@ async def insert(conn: AsyncConnection, *, run_id: UUID, job_key: str, business_
 
 
 async def get(conn: AsyncConnection, run_id: UUID) -> RunRow | None:
+    """run 한 행(잠그지 않음)."""
     m = (await conn.execute(text(f"SELECT {_COLUMNS} FROM nifi_ops.load_run WHERE run_id = :run_id"),
                             {"run_id": run_id})).mappings().first()
     return _row(m) if m else None
@@ -73,6 +79,7 @@ async def lock(conn: AsyncConnection, run_id: UUID) -> RunRow | None:
 
 
 async def touch(conn: AsyncConnection, run_id: UUID) -> None:
+    """run heartbeat 갱신."""
     await conn.execute(text(
         "UPDATE nifi_ops.load_run SET heartbeat_at = clock_timestamp() WHERE run_id = :run_id"),
         {"run_id": run_id})
@@ -82,6 +89,7 @@ async def start_extracting(conn: AsyncConnection, run_id: UUID, *, snapshot_scn:
                            source_count: int, source_null_split_count: int,
                            source_min_split: Decimal | None, source_max_split: Decimal | None,
                            expected_partition_count: int, empty_partition_count: int) -> bool:
+    """manifest 등록과 함께 CREATED → EXTRACTING. SCN과 source 지표를 저장한다."""
     result = await conn.execute(text("""
         UPDATE nifi_ops.load_run
            SET status = 'EXTRACTING',
@@ -130,6 +138,7 @@ async def try_complete_extract(conn: AsyncConnection, run_id: UUID) -> bool:
 
 
 async def increment_success(conn: AsyncConnection, run_id: UUID) -> None:
+    """성공 파티션 수 +1(진행률 표시용, 최종 판정은 try_complete_extract가 다시 센다)."""
     await conn.execute(text("""
         UPDATE nifi_ops.load_run
            SET success_partition_count = success_partition_count + 1
@@ -138,6 +147,7 @@ async def increment_success(conn: AsyncConnection, run_id: UUID) -> None:
 
 
 async def increment_failed(conn: AsyncConnection, run_id: UUID) -> None:
+    """실패 파티션 수 +1."""
     await conn.execute(text("""
         UPDATE nifi_ops.load_run
            SET failed_partition_count = failed_partition_count + 1
@@ -147,6 +157,7 @@ async def increment_failed(conn: AsyncConnection, run_id: UUID) -> None:
 
 async def fail(conn: AsyncConnection, run_id: UUID, *, expected: str, to: str, stage: str,
                code: str, message: str | None) -> bool:
+    """expected 상태일 때만 실패 상태로 바꾸고 오류 정보를 남긴다."""
     result = await conn.execute(text("""
         UPDATE nifi_ops.load_run
            SET status = :to,
@@ -193,6 +204,7 @@ async def cas_status(conn: AsyncConnection, run_id: UUID, *, expected: str, to: 
 
 
 async def get_publish_token(conn: AsyncConnection, run_id: UUID) -> UUID | None:
+    """현재 publish token."""
     row = (await conn.execute(text("SELECT publish_token FROM nifi_ops.load_run WHERE run_id = :run_id"),
                               {"run_id": run_id})).first()
     return row[0] if row else None
@@ -200,6 +212,7 @@ async def get_publish_token(conn: AsyncConnection, run_id: UUID) -> UUID | None:
 
 async def list_runs(conn: AsyncConnection, *, job_key: str | None, business_key: str | None,
                     status: str | None, limit: int) -> list[RunRow]:
+    """조건에 맞는 run 목록(최근 시작 순)."""
     rows = (await conn.execute(text(f"""
         SELECT {_COLUMNS} FROM nifi_ops.load_run
          WHERE (CAST(:job_key AS varchar) IS NULL OR job_key = :job_key)

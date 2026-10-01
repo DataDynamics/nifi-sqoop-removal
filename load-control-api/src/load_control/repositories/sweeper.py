@@ -13,12 +13,14 @@ LOCK_KEY = "load_control_sweeper"
 
 
 async def try_lock(conn: AsyncConnection) -> bool:
+    """트랜잭션 범위 advisory lock. 다른 sweeper가 실행 중이면 False."""
     row = (await conn.execute(text("SELECT pg_try_advisory_xact_lock(hashtext(:key))"),
                               {"key": LOCK_KEY})).first()
     return bool(row and row[0])
 
 
 async def runs_with_stale_partitions(conn: AsyncConnection, stale: timedelta) -> list[UUID]:
+    """heartbeat가 끊긴 RUNNING 파티션이 있는 EXTRACTING run(잠금, 처리 중인 run은 건너뜀)."""
     rows = (await conn.execute(text("""
         SELECT r.run_id FROM nifi_ops.load_run r
          WHERE r.status = 'EXTRACTING'
@@ -32,6 +34,7 @@ async def runs_with_stale_partitions(conn: AsyncConnection, stale: timedelta) ->
 
 
 async def stale_partitions(conn: AsyncConnection, run_id: UUID, stale: timedelta) -> list[tuple[str, int]]:
+    """run의 stale 파티션과 지금까지의 시도 횟수."""
     rows = (await conn.execute(text("""
         SELECT partition_id, attempt_count FROM nifi_ops.load_partition
          WHERE run_id = :run_id AND status = 'RUNNING'
@@ -43,6 +46,7 @@ async def stale_partitions(conn: AsyncConnection, run_id: UUID, stale: timedelta
 
 
 async def reset_for_reissue(conn: AsyncConnection, run_id: UUID, partition_id: str) -> bool:
+    """RUNNING → RETRY, claim 초기화. 이전 Worker의 보고는 CLAIM_MISMATCH가 된다."""
     result = await conn.execute(text("""
         UPDATE nifi_ops.load_partition
            SET status = 'RETRY', claim_token = NULL, worker_node = NULL,
@@ -55,6 +59,7 @@ async def reset_for_reissue(conn: AsyncConnection, run_id: UUID, partition_id: s
 
 
 async def time_out_partitions(conn: AsyncConnection, run_id: UUID, code: str) -> int:
+    """run의 미완료 파티션을 모두 TIMED_OUT으로 바꾼다."""
     result = await conn.execute(text("""
         UPDATE nifi_ops.load_partition
            SET status = 'TIMED_OUT', error_code = :code, completed_at = clock_timestamp()
@@ -64,6 +69,7 @@ async def time_out_partitions(conn: AsyncConnection, run_id: UUID, code: str) ->
 
 
 async def runs_past_deadline(conn: AsyncConnection, run_timeout: timedelta) -> list[UUID]:
+    """recovery.run_timeout을 넘긴 CREATED/EXTRACTING run."""
     rows = (await conn.execute(text("""
         SELECT run_id FROM nifi_ops.load_run
          WHERE status IN ('CREATED', 'EXTRACTING')
@@ -114,6 +120,7 @@ async def alert_stale_runs(conn: AsyncConnection, stale: timedelta) -> int:
 
 
 async def stale_publishing_runs(conn: AsyncConnection, stale: timedelta) -> list[UUID]:
+    """recovery.publish_stale 동안 게시 결과가 오지 않은 run."""
     rows = (await conn.execute(text("""
         SELECT run_id FROM nifi_ops.load_run
          WHERE status = 'PUBLISHING'
@@ -124,6 +131,7 @@ async def stale_publishing_runs(conn: AsyncConnection, stale: timedelta) -> list
 
 
 async def active_run_counts(conn: AsyncConnection) -> dict[str, int]:
+    """상태별 활성 run 수(메트릭용)."""
     rows = (await conn.execute(text("""
         SELECT status, COUNT(*) FROM nifi_ops.load_run
          WHERE status IN ('CREATED', 'EXTRACTING', 'EXTRACTED_VALIDATED', 'STAGE_VALIDATING',

@@ -1,3 +1,5 @@
+"""run·manifest 엔드포인트 모델."""
+
 from datetime import datetime
 from typing import Any
 
@@ -18,6 +20,8 @@ from load_control.schemas.common import (
 
 
 class RunCreateRequest(ApiModel):
+    """run 생성 요청(PG-10)."""
+
     job_key: JobKey
     business_key: BusinessKey
     hdfs_root: HdfsPath
@@ -27,6 +31,8 @@ class RunCreateRequest(ApiModel):
 
 
 class RunCreateResponse(ApiModel):
+    """생성된 run과 NiFi가 쓸 HDFS 경로·stage table."""
+
     run_id: str
     status: RunStatus
     hdfs_run_path: str
@@ -34,6 +40,8 @@ class RunCreateResponse(ApiModel):
 
 
 class ManifestPartition(ApiModel):
+    """파티션 하나의 범위와 예상 건수. 경계값은 정밀도를 위해 문자열."""
+
     partition_id: PartitionId
     lower_bound: DecimalStr | None = None
     upper_bound: DecimalStr | None = None
@@ -43,6 +51,8 @@ class ManifestPartition(ApiModel):
 
 
 class ManifestRequest(ApiModel):
+    """manifest 등록 요청(가이드 7.2의 Jolt spec 결과)."""
+
     snapshot_scn: DecimalStr | None = None  # PostgreSQL 원천(불변 마감 조건)이면 null
     source_count: int = Field(ge=0)
     source_null_split_count: int = Field(default=0, ge=0)
@@ -55,6 +65,8 @@ class ManifestRequest(ApiModel):
 
 
 class ManifestResponse(ApiModel):
+    """Worker로 보낼 파티션 목록(0건 파티션 제외)."""
+
     run_id: str
     status: RunStatus
     dispatch_partitions: list[ManifestPartition]
@@ -63,6 +75,8 @@ class ManifestResponse(ApiModel):
 
 
 class RunFailRequest(ApiModel):
+    """파티션 외 단계 실패 보고."""
+
     expected_status: RunStatus
     fail_status: RunStatus
     error_stage: ShortText
@@ -71,12 +85,16 @@ class RunFailRequest(ApiModel):
 
 
 class RunFailResponse(ApiModel):
+    """실패 처리 결과."""
+
     run_id: str
     run_status: RunStatus
     changed: bool
 
 
 class PartitionSummary(ApiModel):
+    """조회용 파티션 요약."""
+
     partition_id: str
     status: PartitionStatus
     expected_row_count: int
@@ -88,6 +106,8 @@ class PartitionSummary(ApiModel):
 
 
 class DispatchSummary(ApiModel):
+    """조회용 dispatch 요약."""
+
     dispatch_id: str
     dispatch_type: str
     partition_id: str | None
@@ -98,6 +118,8 @@ class DispatchSummary(ApiModel):
 
 
 class RunDetail(ApiModel):
+    """run 상세 조회 결과."""
+
     run_id: str
     job_key: str
     business_key: str
@@ -123,6 +145,8 @@ class RunDetail(ApiModel):
 
 
 class RunListItem(ApiModel):
+    """run 목록 항목."""
+
     run_id: str
     job_key: str
     business_key: str

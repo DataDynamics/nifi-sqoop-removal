@@ -1,3 +1,5 @@
+"""outbox(load_dispatch) SQL. 상태: PENDING → SENT → ACKED, 실패 누적 시 DEAD(API 설계 4.2)."""
+
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -12,6 +14,8 @@ CHANNEL = "load_dispatch"
 
 @dataclass(frozen=True, slots=True)
 class DispatchRow:
+    """조회 API에 보여 줄 dispatch 요약."""
+
     dispatch_id: UUID
     dispatch_type: str
     partition_id: str | None
@@ -23,6 +27,8 @@ class DispatchRow:
 
 @dataclass(frozen=True, slots=True)
 class LeasedDispatch:
+    """lease로 선점한, 지금 보낼 dispatch."""
+
     dispatch_id: UUID
     run_id: UUID
     dispatch_type: str
@@ -53,6 +59,7 @@ async def enqueue_validation(conn: AsyncConnection, run_id: UUID) -> bool:
 
 
 async def enqueue_reissue(conn: AsyncConnection, run_id: UUID, partition_id: str) -> UUID:
+    """stale 파티션 재발행 요청을 outbox에 넣는다(sweeper REISSUE 모드)."""
     dispatch_id = uuid.uuid4()
     await conn.execute(text("""
         INSERT INTO nifi_ops.load_dispatch (dispatch_id, run_id, dispatch_type, partition_id)
@@ -63,6 +70,7 @@ async def enqueue_reissue(conn: AsyncConnection, run_id: UUID, partition_id: str
 
 
 async def list_for_run(conn: AsyncConnection, run_id: UUID) -> list[DispatchRow]:
+    """run의 dispatch 목록(조회 API용)."""
     rows = (await conn.execute(text("""
         SELECT dispatch_id, dispatch_type, partition_id, status, attempt_count, sent_at, acked_at
           FROM nifi_ops.load_dispatch WHERE run_id = :run_id ORDER BY created_at
@@ -71,6 +79,7 @@ async def list_for_run(conn: AsyncConnection, run_id: UUID) -> list[DispatchRow]
 
 
 async def get_for_update(conn: AsyncConnection, dispatch_id: UUID) -> tuple[UUID, str, str] | None:
+    """dispatch 행을 잠그고 (run_id, type, status)를 돌려준다."""
     row = (await conn.execute(text("""
         SELECT run_id, dispatch_type, status FROM nifi_ops.load_dispatch
          WHERE dispatch_id = :dispatch_id FOR UPDATE
@@ -99,6 +108,7 @@ async def lease_due(conn: AsyncConnection, *, batch: int, lease: timedelta) -> l
 
 
 async def mark_sent(conn: AsyncConnection, dispatch_id: UUID, http_status: int) -> bool:
+    """NiFi가 2xx로 받았음을 기록한다. PENDING일 때만 바꾼다."""
     # PENDING일 때만 바꾼다. NiFi가 202 직후 /validation/start를 먼저 호출해 이미 ACKED일 수 있다.
     result = await conn.execute(text("""
         UPDATE nifi_ops.load_dispatch
@@ -112,6 +122,7 @@ async def mark_sent(conn: AsyncConnection, dispatch_id: UUID, http_status: int) 
 
 async def schedule_retry(conn: AsyncConnection, dispatch_id: UUID, *, http_status: int | None,
                          error: str, delay: timedelta) -> None:
+    """전송 실패: delay 뒤에 다시 보내도록 next_attempt_at을 미룬다."""
     await conn.execute(text("""
         UPDATE nifi_ops.load_dispatch
            SET next_attempt_at = clock_timestamp() + CAST(:delay AS interval),
@@ -123,6 +134,7 @@ async def schedule_retry(conn: AsyncConnection, dispatch_id: UUID, *, http_statu
 
 async def mark_dead(conn: AsyncConnection, dispatch_id: UUID, *, http_status: int | None,
                     error: str) -> bool:
+    """더 보내지 않는다. 운영자가 resend로 되살릴 수 있다."""
     result = await conn.execute(text("""
         UPDATE nifi_ops.load_dispatch
            SET status = 'DEAD', last_http_status = :http_status, last_error = :error
@@ -133,6 +145,7 @@ async def mark_dead(conn: AsyncConnection, dispatch_id: UUID, *, http_status: in
 
 
 async def ack(conn: AsyncConnection, dispatch_id: UUID) -> bool:
+    """검증 flow가 /validation/start로 실제 시작을 알렸다."""
     result = await conn.execute(text("""
         UPDATE nifi_ops.load_dispatch
            SET status = 'ACKED', acked_at = clock_timestamp()
@@ -153,6 +166,7 @@ async def ack_reissue(conn: AsyncConnection, run_id: UUID, partition_id: str) ->
 
 
 async def resend(conn: AsyncConnection, run_id: UUID, dispatch_id: UUID) -> bool:
+    """운영자 재전송: DEAD 또는 SENT를 PENDING으로 되돌리고 시도 횟수를 초기화한다."""
     result = await conn.execute(text("""
         UPDATE nifi_ops.load_dispatch
            SET status = 'PENDING', attempt_count = 0, next_attempt_at = clock_timestamp(),
@@ -191,6 +205,7 @@ async def build_body(conn: AsyncConnection, d: LeasedDispatch) -> dict[str, Any]
 
 
 async def backlog(conn: AsyncConnection) -> dict[str, int]:
+    """상태별 미완료 dispatch 수(메트릭용)."""
     rows = (await conn.execute(text("""
         SELECT status, COUNT(*) FROM nifi_ops.load_dispatch
          WHERE status IN ('PENDING', 'SENT', 'DEAD') GROUP BY status

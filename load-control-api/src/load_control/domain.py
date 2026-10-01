@@ -1,7 +1,11 @@
+"""상태 값과 허용 전이(가이드 4.1 CHECK 제약, 17장 상태도)."""
+
 from enum import StrEnum
 
 
 class RunStatus(StrEnum):
+    """load_run.status. 가이드 17장 상태도의 값과 같다."""
+
     CREATED = "CREATED"
     EXTRACTING = "EXTRACTING"
     EXTRACTED_VALIDATED = "EXTRACTED_VALIDATED"
@@ -21,6 +25,8 @@ class RunStatus(StrEnum):
 
 
 class PartitionStatus(StrEnum):
+    """load_partition.status."""
+
     PENDING = "PENDING"
     RUNNING = "RUNNING"
     RETRY = "RETRY"
@@ -38,4 +44,5 @@ ALLOWED_RUN_FAILURES: frozenset[tuple[RunStatus, RunStatus]] = frozenset({
     (RunStatus.PUBLISHED, RunStatus.FAILED_TARGET_VALIDATION),
 })
 
+# 이 오류로 파티션이 실패하면 run을 FAILED_SNAPSHOT_EXPIRED로 바꾼다(같은 SCN으로 다시 읽을 수 없음).
 SNAPSHOT_ERROR_CODES = frozenset({"ORA-01555", "ORA-08180"})

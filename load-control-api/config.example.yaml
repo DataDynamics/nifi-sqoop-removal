@@ -4,6 +4,22 @@
 #   모르는 키가 있으면 시작하지 않는다.
 #   기간 값은 ISO 8601(PT90M, PT6H) 또는 초 단위 숫자로 쓴다.
 
+server:                   # API HTTP 서버(python -m load_control.server)
+  host: 0.0.0.0           # bind address. 같은 호스트의 프록시 뒤에만 둔다면 127.0.0.1
+  port: 8080
+  workers: 4              # 프로세스 수(보통 CPU 코어 수). 1보다 크면 /metrics는 프로세스별 값
+  root_path: ""           # 리버스 프록시가 경로 접두사를 붙일 때(예: /load-control)
+  proxy_headers: true     # X-Forwarded-For/Proto 신뢰 여부
+  forwarded_allow_ips: "127.0.0.1"   # 위 헤더를 신뢰할 프록시 IP(쉼표 구분, "*" 가능)
+  timeout_keep_alive: 5   # 초
+  timeout_graceful_shutdown: 30      # SIGTERM 후 진행 중 요청을 기다리는 초
+  limit_concurrency: null # 프로세스당 동시 연결 상한(초과 시 503). null이면 제한 없음
+  # 앱에서 TLS를 직접 종료할 때만 설정한다. 보통은 LB/ingress에서 mTLS를 종료한다.
+  ssl_certfile: null
+  ssl_keyfile: null
+  ssl_ca_certs: null      # 클라이언트 인증서 검증용 CA
+  ssl_client_cert_required: false    # true면 mTLS
+
 database:
   url: postgresql+asyncpg://load_control_api:CHANGE_ME@meta:5432/nifiops   # API 런타임 계정(DDL 권한 없음)
   migration_url: postgresql+asyncpg://nifi_ops_migrator:CHANGE_ME@meta:5432/nifiops  # alembic 전용. 없으면 url
@@ -47,9 +63,24 @@ dispatch:                 # outbox 전달(API 설계 4장)
   poll_interval: PT5S
   batch: 20
 
-worker:
-  metrics_port: 9100      # null이면 끔
+worker:                   # python -m load_control.worker
+  metrics_host: 0.0.0.0   # /metrics bind address
+  metrics_port: 9100      # null이면 /metrics를 열지 않는다
 
 logging:
-  level: INFO             # DEBUG, INFO, WARNING, ERROR
-  format: json            # json 또는 console
+  level: INFO             # root 수준: DEBUG, INFO, WARNING, ERROR, CRITICAL
+  format: json            # 표준출력 형식: json(운영) 또는 console(개발)
+  stdout: true            # 표준출력으로 낼지(컨테이너 로그 수집용)
+  access_log: true        # API 요청마다 access 로그를 남길지(/healthz, /readyz, /metrics 제외)
+  file:                   # 파일로도 낼 때. 파일은 항상 json. 필요 없으면 file: null
+    path: /var/log/load-control/load-control.log
+    max_bytes: 104857600  # 100MB마다 회전
+    backup_count: 10
+  loggers:                # logger별 수준(root보다 우선)
+    sqlalchemy.engine: WARNING   # SQL을 보려면 INFO
+    asyncpg: WARNING
+    httpx: WARNING        # worker의 NiFi 호출. 요청마다 보려면 INFO
+    httpcore: WARNING
+    uvicorn.error: INFO
+    alembic: INFO
+    load_control: INFO    # 이 서비스 전체. 판정 과정을 자세히 보려면 DEBUG

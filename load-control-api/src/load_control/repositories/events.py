@@ -1,3 +1,5 @@
+"""load_event 기록. NiFi PG-90도 같은 테이블에 쓰지만 이 모듈은 API의 상태 전이 이벤트만 남긴다."""
+
 import json
 import uuid
 from typing import Any

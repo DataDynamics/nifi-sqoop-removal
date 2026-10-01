@@ -495,7 +495,7 @@ NiFi 쪽 공통 규칙은 다음과 같다.
 | 영역 | 선택 | 비고 |
 |---|---|---|
 | 런타임 | Python 3.12 | |
-| Web | FastAPI, Uvicorn(`uvicorn[standard]`), Gunicorn | Gunicorn + `UvicornWorker`로 멀티 프로세스 |
+| Web | FastAPI, Uvicorn(`uvicorn[standard]`) | `python -m load_control.server`가 `config.yaml`의 `server` 섹션으로 uvicorn을 실행. `server.workers`로 멀티 프로세스 |
 | 모델·설정 | Pydantic v2, `pydantic-settings[yaml]` | 요청 검증, `config.yaml` 설정 |
 | DB | SQLAlchemy 2.0 async Core + `asyncpg` | ORM 대신 `text()` SQL로 CAS·잠금을 명시적으로 작성 |
 | Migration | Alembic(async 템플릿) | 가이드 4.1 DDL을 baseline으로 관리 |
@@ -513,12 +513,12 @@ ORM을 쓰지 않는 이유: 이 API의 핵심은 `SELECT ... FOR UPDATE`, 조�
 
 | 프로세스 | 진입점 | 역할 | 인스턴스 |
 |---|---|---|---|
-| `api` | `gunicorn 'load_control.main:create_app()' -k uvicorn.workers.UvicornWorker -w 4` | HTTP 엔드포인트(5장) | 2개 이상, LB 뒤 |
-| `worker` | `python -m load_control.worker` | dispatcher(4장), sweeper(7장) | 2개(활성-활성) |
+| `api` | `python -m load_control.server --config config.yaml` | HTTP 엔드포인트(5장). bind address·port·workers는 `server` 섹션 | 2개 이상, LB 뒤 |
+| `worker` | `python -m load_control.worker --config config.yaml` | dispatcher(4장), sweeper(7장) | 2개(활성-활성) |
 
 dispatcher와 sweeper를 HTTP 프로세스와 분리하는 이유는 다음과 같다.
 
-- Gunicorn worker마다 백그라운드 작업이 뜨면 인스턴스 수 × worker 수만큼 폴링이 늘어난다.
+- API 프로세스(`server.workers`)마다 백그라운드 작업이 뜨면 인스턴스 수 × 프로세스 수만큼 폴링이 늘어난다.
 - API는 요청량에 맞춰, worker는 dispatch량에 맞춰 따로 늘리고 줄일 수 있다.
 - worker가 둘 이상 떠도 lease(4.3)와 advisory lock(7장)이 중복 처리를 막으므로 이중화에 별도 리더 선출이 필요 없다.
 
@@ -538,6 +538,7 @@ load-control-api/
 │       └── 0002_...py
 ├── src/load_control/
 │   ├── main.py            # create_app() factory, lifespan, router 등록, 예외 처리기
+│   ├── server.py          # API 진입점: config.yaml의 server 섹션으로 uvicorn 실행
 │   ├── domain.py          # RunStatus, PartitionStatus, 허용 실패 전이
 │   ├── metrics.py         # Prometheus 메트릭
 │   ├── config.py          # Settings (config.yaml 로드)
@@ -891,15 +892,37 @@ sweeper는 tick마다 한 트랜잭션에서 `pg_try_advisory_xact_lock(hashtext
 |---|---|
 | 패키징 | 컨테이너 이미지 하나, 실행 명령으로 `api`/`worker` 구분 |
 | Health | `GET /healthz`(프로세스 생존, DB 미확인), `GET /readyz`(`SELECT 1`) |
-| Gunicorn | `-w`는 CPU 코어 수 기준, `--timeout 60`, `--graceful-timeout 30` |
-| DB 연결 수 | `api 인스턴스 × gunicorn worker × (pool_size + max_overflow) + worker 인스턴스 × pool + listener` ≤ 관리 DB 승인 연결 수 |
+| API 프로세스 | `server.workers`는 CPU 코어 수 기준, `server.timeout_graceful_shutdown`(기본 30초) 동안 진행 중 요청을 마친다 |
+| bind | `server.host`/`server.port`(기본 0.0.0.0:8080), worker `/metrics`는 `worker.metrics_host`/`worker.metrics_port`(기본 0.0.0.0:9100) |
+| DB 연결 수 | `api 인스턴스 × server.workers × (pool_size + max_overflow) + worker 인스턴스 × pool + listener` ≤ 관리 DB 승인 연결 수 |
 | 종료 | SIGTERM 시 진행 중 요청을 끝내고 종료. 중간에 끊겨도 트랜잭션 rollback과 NiFi 재시도로 복구 |
 | 설정 주입 | `config.yaml`을 `/etc/load-control/config.yaml`로 마운트(`LCA_CONFIG`). 비밀값은 조직 표준 secret 저장소에서 `LCA_DATABASE__URL` 같은 환경변수로 덮어쓴다 |
 
 ### 9.11 로그와 메트릭
 
-- request id middleware: NiFi `InvokeHTTP` 동적 속성으로 `X-Request-Id: ${UUID()}`를 보내고, 없으면 API가 생성한다. 응답 헤더와 모든 로그에 남긴다.
-- `structlog` JSON 로그 필드: 10.3의 필드에 `requestId`, `role`, `httpStatus`를 더한다.
+로그는 `config.yaml`의 `logging` 섹션으로 설정한다.
+
+```yaml
+logging:
+  level: INFO              # root 수준
+  format: json             # 표준출력 형식: json | console
+  stdout: true
+  access_log: true         # API 요청 로그(/healthz, /readyz, /metrics 제외)
+  file:                    # 선택. 파일은 항상 json, 크기 기준 회전
+    path: /var/log/load-control/load-control.log
+    max_bytes: 104857600
+    backup_count: 10
+  loggers:                 # logger별 수준
+    sqlalchemy.engine: WARNING   # SQL을 보려면 INFO
+    load_control: INFO           # 판정 과정을 자세히 보려면 DEBUG
+```
+
+- structlog 이벤트와 stdlib 로그(uvicorn, SQLAlchemy, alembic, asyncpg)가 같은 handler와 형식으로 나온다. uvicorn 자체 access 로그는 끄고, 미들웨어가 구조화 access 로그를 남긴다.
+- request id: NiFi `InvokeHTTP` 동적 속성으로 `X-Request-Id: ${UUID()}`를 보내고, 없으면 API가 생성한다. 응답 헤더와 그 요청 중에 남는 모든 로그에 `requestId`로 붙는다.
+- access 로그 수준: 2xx·3xx는 INFO, 4xx는 WARNING, 5xx는 ERROR. 필드는 `method`, `endpoint`(경로 템플릿), `httpStatus`, `durationMs`, `runId`, `partitionId`, `role`, `client`, `requestId`.
+- 업무 로그(`load_control.services.*`): 상태 전이(`run_created`, `manifest_registered`, `partition_claimed`, `partition_success`, `extract_validated`, `validation_started`, `stage_validated`, `publish_claimed`, `publish_result`, `run_success`)는 INFO, 정상 경합(`partition_claim_refused`, `validation_start_duplicate`)도 INFO, 소유권 충돌·거부(`chunk_claim_mismatch`, `chunk_conflict_after_success` 등)는 WARNING, 실패(`run_failed`, `partition_failed`, `partition_row_mismatch`, `manifest_invalid`)는 ERROR, 멱등 재요청과 진행 중 chunk(`chunk_recorded`)는 DEBUG다.
+- 비밀값: DB URL은 호스트·포트·DB 이름만 남기고, 토큰은 digest 앞 8자리만 남긴다.
+- `load_event` 테이블(가이드 14.4)은 업무 이벤트의 영속 기록이고, 애플리케이션 로그는 운영 진단용이다. 둘 다 `runId`로 대조한다.
 - Prometheus 메트릭(`GET /metrics`):
 
 | 메트릭 | 종류 | 라벨 |

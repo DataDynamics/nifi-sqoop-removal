@@ -1,3 +1,5 @@
+"""load_validation(stage별 검증 지표) SQL."""
+
 import json
 from typing import Any
 from uuid import UUID
@@ -33,6 +35,7 @@ async def upsert_many(conn: AsyncConnection, run_id: UUID, stage: str, query_ver
 
 
 async def list_by_stage(conn: AsyncConnection, run_id: UUID, stage: str) -> list[dict[str, Any]]:
+    """run의 stage 지표 목록."""
     rows = (await conn.execute(text("""
         SELECT metric_name, expected_value, actual_value, result, query_version
           FROM nifi_ops.load_validation

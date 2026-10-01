@@ -1781,7 +1781,7 @@ PUBLISH_UNKNOWN은 사람 또는 별도 reconciliation 없이 자동 재실행�
 | CFM | Cloudera Flow Management | NiFi 2.6.0을 포함하는 목표 플랫폼 버전은 CFM 4.12.0이다. |
 | NiFi | Apache NiFi 데이터 흐름 자동화 플랫폼 | Sqoop을 대신하여 Oracle 병렬 조회, HDFS 기록, Hive 검증과 게시를 실행한다. 완료 판정은 하지 않는다. |
 | Load Control API | 적재 상태 원장과 완료 판정을 담당하는 FastAPI 서비스 | 유일한 원장 writer. chunk 보고마다 완료를 판정하고 검증 flow를 호출한다. |
-| FastAPI | Python 비동기 웹 프레임워크 | Load Control API 구현 프레임워크. Uvicorn/Gunicorn으로 실행한다. |
+| FastAPI | Python 비동기 웹 프레임워크 | Load Control API 구현 프레임워크. `python -m load_control.server`가 uvicorn으로 실행한다. |
 | Kylo | NiFi 기반 데이터 레이크 관리 플랫폼 | AS-IS에서 Kylo의 `ImportSqoop` Processor를 사용한다. |
 | Sqoop | RDBMS와 Hadoop 간 대량 데이터 전송 도구 | TO-BE에서 제거하며 Mapper의 병렬 실행과 Job 완료 의미를 NiFi로 재구현한다. |
 | Processor | NiFi Flow의 단일 처리 컴포넌트 | `ExecuteSQLRecord`, `PutHDFS`, `InvokeHTTP`, `HandleHttpRequest` 등이 해당한다. |

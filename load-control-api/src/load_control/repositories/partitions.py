@@ -1,3 +1,5 @@
+"""load_partition(파티션 manifest) SQL."""
+
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
@@ -9,6 +11,8 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 
 @dataclass(frozen=True, slots=True)
 class PartitionRow:
+    """load_partition 한 행."""
+
     run_id: UUID
     partition_id: str
     lower_bound: Decimal | None
@@ -48,6 +52,7 @@ async def insert_many(conn: AsyncConnection, rows: list[dict[str, Any]]) -> None
 
 
 async def list_for_run(conn: AsyncConnection, run_id: UUID) -> list[PartitionRow]:
+    """run의 파티션 전체(partition_id 순)."""
     rows = (await conn.execute(
         text(f"SELECT {_COLUMNS} FROM nifi_ops.load_partition WHERE run_id = :run_id "
              "ORDER BY partition_id"), {"run_id": run_id})).mappings().all()
@@ -55,6 +60,7 @@ async def list_for_run(conn: AsyncConnection, run_id: UUID) -> list[PartitionRow
 
 
 async def lock(conn: AsyncConnection, run_id: UUID, partition_id: str) -> PartitionRow | None:
+    """파티션 행을 잠근다. 반드시 run 행을 먼저 잠근 뒤 호출한다(잠금 순서)."""
     m = (await conn.execute(text(f"""
         SELECT {_COLUMNS} FROM nifi_ops.load_partition
          WHERE run_id = :run_id AND partition_id = :partition_id
@@ -87,6 +93,7 @@ async def claim(conn: AsyncConnection, run_id: UUID, partition_id: str, *, claim
 
 
 async def touch(conn: AsyncConnection, run_id: UUID, partition_id: str) -> None:
+    """heartbeat 갱신. sweeper의 stale 판정 기준이다."""
     await conn.execute(text("""
         UPDATE nifi_ops.load_partition SET heartbeat_at = clock_timestamp()
          WHERE run_id = :run_id AND partition_id = :partition_id
@@ -95,6 +102,7 @@ async def touch(conn: AsyncConnection, run_id: UUID, partition_id: str) -> None:
 
 async def mark_success(conn: AsyncConnection, run_id: UUID, partition_id: str, *, claim_token: UUID,
                        rows: int, files: int, bytes_: int) -> bool:
+    """RUNNING → SUCCESS. claim token이 맞을 때만 바꾼다."""
     result = await conn.execute(text("""
         UPDATE nifi_ops.load_partition
            SET status = 'SUCCESS',
@@ -114,6 +122,7 @@ async def mark_success(conn: AsyncConnection, run_id: UUID, partition_id: str, *
 
 async def mark_failed(conn: AsyncConnection, run_id: UUID, partition_id: str, *, code: str,
                       message: str | None) -> bool:
+    """미완료 파티션을 FAILED로 바꾼다."""
     result = await conn.execute(text("""
         UPDATE nifi_ops.load_partition
            SET status = 'FAILED',
@@ -130,6 +139,7 @@ async def mark_failed(conn: AsyncConnection, run_id: UUID, partition_id: str, *,
 
 
 async def count_by_status(conn: AsyncConnection, run_id: UUID) -> dict[str, int]:
+    """상태별 파티션 수."""
     rows = (await conn.execute(text("""
         SELECT status, COUNT(*) FROM nifi_ops.load_partition WHERE run_id = :run_id GROUP BY status
     """), {"run_id": run_id})).all()

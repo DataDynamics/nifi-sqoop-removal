@@ -25,6 +25,7 @@ def backoff(settings: Settings, attempt: int) -> timedelta:
 
 
 def make_client(settings: Settings) -> httpx.AsyncClient:
+    """NiFi 호출용 HTTP 클라이언트. 설정이 있으면 mTLS를 쓴다."""
     cert = ((settings.nifi.client_cert, settings.nifi.client_key)
             if settings.nifi.client_cert and settings.nifi.client_key else None)
     verify: bool | str = settings.nifi.ca_bundle or True
@@ -32,6 +33,7 @@ def make_client(settings: Settings) -> httpx.AsyncClient:
 
 
 def target_url(settings: Settings, d: LeasedDispatch) -> str:
+    """dispatch 종류에 따른 PG-05 수신 URL: /validate/{jobKey} 또는 /reissue/{jobKey}."""
     if settings.nifi.receiver_url is None:
         raise RuntimeError("LCA_NIFI_RECEIVER_URL이 설정되지 않았습니다")
     action = "validate" if d.dispatch_type == "VALIDATE_RUN" else "reissue"
@@ -49,6 +51,8 @@ async def wait_first(*events: asyncio.Event) -> None:
 
 
 class Dispatcher:
+    """outbox 전달 루프. 프로세스당 하나 만든다."""
+
     def __init__(self, settings: Settings, engine: AsyncEngine, client: httpx.AsyncClient) -> None:
         self.settings = settings
         self.engine = engine
@@ -67,6 +71,7 @@ class Dispatcher:
             sent += len(batch)
 
     async def send_one(self, d: LeasedDispatch) -> None:
+        """dispatch 하나를 보내고 결과(SENT, 재시도, DEAD)를 기록한다."""
         s = self.settings
         try:
             body = await in_tx(self.engine, lambda conn: dispatch.build_body(conn, d))

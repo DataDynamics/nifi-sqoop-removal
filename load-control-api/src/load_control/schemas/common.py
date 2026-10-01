@@ -1,3 +1,5 @@
+"""공통 타입과 기반 모델."""
+
 from typing import Annotated
 
 from pydantic import BaseModel, ConfigDict, StringConstraints
@@ -32,6 +34,8 @@ class ApiModel(BaseModel):
 
 
 class ErrorResponse(ApiModel):
+    """오류 응답 형식."""
+
     code: str
     message: str
     request_id: str | None = None

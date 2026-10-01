@@ -98,6 +98,7 @@ async def sweep_once(engine: AsyncEngine, settings: Settings) -> dict[str, int] 
 
 
 async def refresh_gauges(engine: AsyncEngine) -> None:
+    """dispatch backlog와 활성 run 수 메트릭을 갱신한다."""
     async with engine.connect() as conn:
         for status, count in (await dispatch.backlog(conn)).items():
             metrics.DISPATCH_BACKLOG.labels(status).set(count)
@@ -107,6 +108,7 @@ async def refresh_gauges(engine: AsyncEngine) -> None:
 
 
 async def run_sweeper(engine: AsyncEngine, settings: Settings, stop: asyncio.Event) -> None:
+    """recovery.sweeper_interval마다 sweep_once를 실행한다. 오류가 나도 루프는 계속된다."""
     interval = settings.recovery.sweeper_interval.total_seconds()
     while not stop.is_set():
         try:

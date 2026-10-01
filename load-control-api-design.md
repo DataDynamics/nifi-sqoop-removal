@@ -1008,7 +1008,7 @@ API 전체 중단 중 시작된 run은 성공으로 판정되지 않고 TIMED_OU
 
 1. **프로젝트 골격** (구현 완료): 9.3 구조, 설정, Alembic baseline(가이드 4.1 DDL), 인증, 오류 처리, health, 테스트 환경(testcontainers).
 2. **API 1차** (구현 완료): `/runs`, `/manifest`, `/claim`, `/chunks`, `/fail`, `GET /runs/{id}`, 판정 트랜잭션. 11.1의 동시성 테스트를 먼저 통과시킨다.
-3. **PG-10, PG-20 전환** (PoC 완료, `poc/REVIEW.md` 6장): PoC 환경(NiFi 2.4.0 + PostgreSQL)에서 PoC와 같은 시나리오(105,000건, 8파티션, 0건 파티션, 배수 경계, 중복 실행, HDFS 실패 주입)를 다시 실행한다. 이 단계에서는 PG-30을 남겨 두고 API 판정 결과와 PG-30 판정 결과를 비교할 수 있다.
+3. **PG-10, PG-20 전환** (PoC V3 완료, `poc/REVIEW.md` 6장): PoC 환경(NiFi 2.4.0 + PostgreSQL)에서 V1 PoC와 같은 시나리오(105,000건, 8파티션, 0건 파티션, 배수 경계, 중복 실행, HDFS 실패 주입)를 다시 실행한다. 이 단계에서는 PG-30을 남겨 두고 API 판정 결과와 PG-30 판정 결과를 비교할 수 있다.
 4. **outbox와 검증 수신** (API 구현 완료, NiFi 남음): `load_dispatch`, dispatcher, `/validation/start`, PG-05·PG-40 입구. 이후 PG-30과 DMC Controller Service를 삭제한다.
 5. **PG-50, PG-60 연동** (API 구현 완료, NiFi 남음): publish claim·result, validations, stage-validated, success, 운영자 엔드포인트.
 6. **Sweeper** (API 구현 완료): `recovery.mode=FAIL`로 시작. 노드 종료, API 재기동, NiFi 재기동, 보고 유실을 주입해 검증한다.

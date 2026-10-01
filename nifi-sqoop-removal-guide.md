@@ -253,7 +253,7 @@ flowchart LR
 
 ### 2.1 구현 규칙
 
-모든 PG에 다음 규칙을 적용한다. NiFi 2.4.0 PoC에서 이 규칙으로 같은 범위(PG-00, 10, 20, 05, 40 입구, 90)의 Processor를 85개에서 41개로 줄였다.
+모든 PG에 다음 규칙을 적용한다. NiFi 2.4.0 PoC V3(`poc/build_flow_v3.py`)는 이 규칙으로 PG-00, 10, 20, 05, 40 입구, 90을 Processor 41개로 구현했다(`poc/REVIEW.md` 6장).
 
 1. **재시도**: Processor relationship 재시도(Retry Count, Retried Relationships, Backoff Policy=Penalize FlowFile, Max Backoff Period)를 쓴다. `RetryFlowFile`은 두지 않는다. 재시도를 다 쓴 FlowFile은 해당 relationship 연결로 간다(16장).
 2. **오류 경로**: 실패 지점마다 오류용 `UpdateAttribute`를 두지 않는다. 단계 입구에 이미 있는 `UpdateAttribute`가 `load.stage`를 지정하고, 모든 실패 relationship은 PG의 `errors` Output Port로 보낸다. PG-90이 `load.stage`와 Processor가 남긴 attribute로 오류 코드와 메시지를 만들고, 필요한 실패 보고 API를 호출한다(14장).
@@ -1637,7 +1637,7 @@ INSERT INTO nifi_ops.load_event (
 | WARN | `RECOVERY_REISSUED` | stale partition 재발행 | API |
 | ERROR | `<STAGE>_FAILED` | NiFi Processor 실패. `error_code`에 `HTTP_<code>`, `API_UNREACHABLE`, `ORA-nnnnn`, `<STAGE>_FAILED` 등 | NiFi PG-90 |
 
-NiFi는 상태 전이 이벤트를 다시 기록하지 않는다. NiFi 2.4.0 PoC V2에서 `EXTRACT_VALIDATED`, `STAGE_VALIDATION_STARTED`가 API와 NiFi 양쪽에 중복 기록된 것을 확인하고 V3에서 제거했다. 같은 실패가 API의 `PARTITION_FAILED`/`RUN_FAILED`와 NiFi의 `<STAGE>_FAILED`로 함께 남는 것은 의도한 것이다. 전자는 상태, 후자는 Processor 오류 상세다.
+NiFi는 상태 전이 이벤트를 다시 기록하지 않는다. NiFi에서도 기록하면 `EXTRACT_VALIDATED`, `STAGE_VALIDATION_STARTED` 같은 이벤트가 API와 NiFi 양쪽에 중복으로 남는다. 같은 실패가 API의 `PARTITION_FAILED`/`RUN_FAILED`와 NiFi의 `<STAGE>_FAILED`로 함께 남는 것은 의도한 것이다. 전자는 상태, 후자는 Processor 오류 상세다.
 
 ### 14.5 `LogMessage` 형식
 

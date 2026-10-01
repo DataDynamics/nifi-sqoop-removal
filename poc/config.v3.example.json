@@ -1,4 +1,9 @@
 {
+ "names": {
+  "process_group": "SQOOP_REPLACEMENT_POC_V3",
+  "common_context": "PC_SQOOP_REPLACEMENT_COMMON_V3",
+  "job_context": "PC_JOB_PG_INSP_DTL_DAILY_V3"
+ },
  "common_params": {
   "CONTROL.API.URL": "http://127.0.0.1:8080/v1",
   "CONTROL.API.AUTHORIZATION": "Bearer <nifi-token>",

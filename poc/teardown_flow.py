@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""build_flow.py가 만든 SQOOP_REPLACEMENT_POC Process Group과 Parameter Context를 지운다.
+"""build_flow_v1.py 또는 build_flow_v3.py가 만든 Process Group과 Parameter Context를 지운다.
 
 사용법: teardown_flow.py <nifi-api-url> [config.json]
-config.json에 `names`가 있으면 그 이름의 PG와 Parameter Context를 지운다(build_flow.py와 같은 규칙).
+config.json을 주지 않으면 V1 기본 이름(SQOOP_REPLACEMENT_POC)을 지운다. V3는 build_flow_v3.py에 쓴 config를 준다.
+config.json에 `names`가 있으면 그 이름의 PG와 Parameter Context를 지운다.
 """
 import json
 import sys

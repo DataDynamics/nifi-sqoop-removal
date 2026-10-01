@@ -215,7 +215,7 @@ error_class, error_code, message
 4. [Load Control API 구현](./load-control-api/README.md)
    - FastAPI 프로젝트(API 설계 12장 1~2단계): 실행, migration, 테스트 방법
 5. [가이드 검토 및 NiFi 2.4.0 PoC 결과](./poc/REVIEW.md)
-   - 이전 구조(PG-30 Wait/Notify) PoC, API 연동 구조 PoC(정상, 0건 파티션, 중복 실행, HDFS 실패, API 중단, sweeper 재발행), V3(자식 PG + Port, Processor 85→41개) 결과
+   - V1(API 없음, NiFi가 원장 직접 기록, PG-30 Wait/Notify)과 V3(Load Control API 연동, 자식 PG + Port, Processor 41개) PoC 결과. 빌더는 `poc/build_flow_v1.py`, `poc/build_flow_v3.py`
 
 ## 구현 전 확인 항목
 

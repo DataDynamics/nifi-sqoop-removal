@@ -1,12 +1,19 @@
 # nifi-sqoop-removal-guide.md 검토 및 NiFi 2.4.0 PoC 결과
 
-> 1~5장은 Load Control API 도입 이전 구조(PG-30 Wait/Notify, NiFi `PutSQL`로 원장 직접 기록)로 수행한 PoC 기록이다. 현재 구조(Load Control API 연동)로 다시 수행한 결과는 6장에 있다. `poc/build_flow.py`는 현재 구조로 바뀌었고, 이전 빌더는 git 이력(커밋 `ec5f074` 이전)에 있다.
+> PoC는 두 버전이다.
+>
+> | 버전 | 구조 | 빌더 | 장 |
+> |---|---|---|---|
+> | V1 | Load Control API 없음. NiFi가 `PutSQL`로 원장을 직접 기록하고 PG-30 Wait/Notify로 완료 판정. 하나의 PG에 평면 배치 | `poc/build_flow_v1.py` | 1~5장 |
+> | V3 | Load Control API 연동. 원장 기록과 완료 판정은 API, NiFi는 데이터 처리. Job PG 아래 자식 PG와 Port로 구성 | `poc/build_flow_v3.py` | 6장 |
+>
+> 현재 가이드는 V3 구조를 따른다.
 
 - 검토일: 2026-10-01
 - 실행 환경: Apache NiFi 2.4.0 (단일 노드, `http://10.0.1.50:10001`), PostgreSQL 16
 - 대체 사항: 원천 Oracle → PostgreSQL `srcdb.app.insp_dtl`, HDFS → PutHDFS + `fs.defaultFS=file:///`
 - 추가 설치: `extensions/`에 `nifi-parquet-nar`, `nifi-hadoop-nar`, `nifi-hadoop-libraries-nar` 2.4.0, `jdbc/`에 PostgreSQL·ojdbc 드라이버
-- PoC Flow 생성기: `poc/build_flow.py` (Process Group `SQOOP_REPLACEMENT_POC`, Processor 75개)
+- PoC Flow 생성기: `poc/build_flow_v1.py` (Process Group `SQOOP_REPLACEMENT_POC`, Processor 75개, 설정 `poc/config.v1.example.json`)
 - 구현 범위: PG-00 Trigger → PG-10 Coordinator → PG-20 Worker → PG-30 Partition/Run Gate → `EXTRACTED_VALIDATED` + `_SUCCESS`, PG-90 실패/이벤트
 - 미구현: PG-40 이후(Hive staging, `INSERT OVERWRITE`, Target 검증), PG-70 Recovery. 이 환경에는 Hive가 없고 Apache NiFi 2.x에는 Hive Processor도 없다.
 
@@ -47,11 +54,11 @@
 6. **PostgreSQL을 원천으로 쓰는 경우**: `AS OF SCN`에 대응하는 기능이 없다. 불변 업무 마감 조건이 필수다. 또한 pgjdbc는 autocommit=false일 때만 fetch size(cursor)를 적용하므로 `esql-auto-commit=false`가 필요하다. 이 설정이 없으면 파티션 전체를 메모리에 적재한다.
 7. **확인한 정상 동작**: PutSQL 2.4는 실패 시 `error.sql.state`/`error.code`/`error.message`를 붙인다. 따라서 7.2의 "unique violation(23505)과 연결 장애 구분"은 구현 가능하다. 다만 가이드 14.6의 공통 UpdateAttribute가 같은 이름(`error.code`, `error.message`)을 덮어쓰지 않도록 주의해야 한다.
 
-## 4. 재현 방법
+## 4. 재현 방법 (V1)
 
 ```bash
 # NiFi 2.4.0 기동 후
-python3 poc/build_flow.py http://10.0.1.50:10001/nifi-api poc/config.example.json   # 암호와 경로를 채운 사본 사용
+python3 poc/build_flow_v1.py http://10.0.1.50:10001/nifi-api my-config.json   # config.v1.example.json 사본에 암호와 경로를 채운다
 # Trigger(00_Generate_Trigger)는 정지 상태로 두고 Run Once로 실행
 ```
 
@@ -67,61 +74,16 @@ python3 poc/build_flow.py http://10.0.1.50:10001/nifi-api poc/config.example.jso
 | 3장 5. PUBLISH_UNKNOWN 판별 | 11.2 #55A, 판별 기준 |
 | 3장 6. PostgreSQL 원천 | 1장 "Oracle 이외 원천 (PostgreSQL)" |
 
-3장 3~5번(PutSQL CAS 결과, Wait 해제, PUBLISH 판별)은 API 연동 구조에서 문제 자체가 없어졌거나 API가 처리한다(6장).
+3장 3~5번(PutSQL CAS 결과, Wait 해제, PUBLISH 판별)은 V3(API 연동 구조)에서 문제 자체가 없어졌거나 API가 처리한다(6장). 이후 가이드는 V3 구조로 다시 정리했다(커밋 `36815fe`).
 
-## 6. API 연동 구조 PoC (2026-10-01)
+## 6. V3: Load Control API 연동, 자식 PG + Port 구조 (2026-10-01)
 
-`poc/build_flow.py`를 Load Control API 연동 구조(가이드 7~10장)로 바꾸고 같은 데이터로 다시 실행했다.
+`poc/build_flow_v3.py`로 Load Control API와 연동하는 Flow를 만들고, 책임별 자식 PG와 Input/Output Port로 나눴다. V1(75개, PG-30까지)보다 범위가 넓으면서(PG-05 수신, PG-40 입구 포함) Processor는 41개다. 모든 Processor에 한글 COMMENT로 역할을 적었다.
 
-- 실행 환경: Apache NiFi 2.4.0(단일 노드, HTTP `127.0.0.1:18888`), PostgreSQL 16, Load Control API(`load-control-api`, api 1 프로세스 + worker 1 프로세스, `config.yaml`)
-- 추가 설치: 1장과 같음(`nifi-parquet-nar`, `nifi-hadoop-nar`, `nifi-hadoop-libraries-nar` 2.4.0, PostgreSQL JDBC 42.7.3)
-- 데이터: `srcdb.app.insp_dtl` 업무일자 `2026-09-28` 105,000건(seq 1~120000 중 30001~45000 공백), 다른 일자 500건
-- Flow: Processor 85개, Connection 135개. PG-00 → PG-10 → PG-20 → (API 판정·outbox) → PG-05 → PG-40 입구(`/validation/start`, `_SUCCESS`). Hive가 없으므로 `STAGE_VALIDATING`까지
+- 실행 환경: Apache NiFi 2.4.0(단일 노드, `http://10.0.1.50:10001`), PostgreSQL 16, Load Control API(`load-control-api`, api 1 프로세스 + worker 1 프로세스, 관리 DB `nifiops_v3`)
+- 추가 설치: 1장과 같음
+- 데이터: 1장과 같음(`srcdb.app.insp_dtl` 업무일자 `2026-09-28` 105,000건, seq 30001~45000 공백)
 - NiFi↔API는 평문 HTTP로 연결했다. 운영에서는 SSL Context Service(mTLS)를 붙인다.
-
-### 6.1 시험 결과
-
-| 시나리오 | 결과 |
-|---|---|
-| 정상 실행(105,000건, 8파티션, 5,000행/파일) | run `STAGE_VALIDATING`, 8/8 SUCCESS, Parquet 21개, `_SUCCESS` 생성, 검증 dispatch `ACKED`. Parquet를 직접 읽어 count·distinct·min/max·`SUM(amount)`(65,611,875.00)·NULL 수가 원천과 일치, DECIMAL(18,2)/DATE 타입 유지 |
-| 0건 파티션(seq 30001~45000) | API가 manifest 등록 시 SUCCESS 처리, Worker로 보내지 않음 |
-| 파티션 건수가 파일 행 수의 배수(15,000/5,000) | 파티션당 3파일, 빈 FlowFile 없음 |
-| 동일 업무일자 중복 실행 | API 409 → `DUPLICATE_ACTIVE_RUN` WARN 이벤트, 기존 run 상태 변화 없음 |
-| 파티션 0004 HDFS 쓰기 실패 주입(재시도 3회 소진) | 0004만 FAILED, run `FAILED_EXTRACT`, 검증 dispatch 0건, `_SUCCESS` 미생성. 나머지 chunk의 늦은 실패 보고는 멱등 처리 |
-| API 중단 중 실행 시작(약 10초 후 재기동) | `InvokeHTTP` Failure(Connection refused) → `RetryFlowFile` 재시도 → API 재기동 후 run 생성부터 `STAGE_VALIDATING`까지 자동 진행 |
-| 파티션 0004 chunk 보고 차단 후 sweeper REISSUE 모드 | 0004가 RUNNING으로 정체 → sweeper가 RETRY로 초기화·이전 chunk 기록 무효화·`REISSUE_PARTITION` dispatch → PG-05 `/reissue` 수신 → 재 claim(attempt 2, dispatch `ACKED`) → 파티션 SUCCESS → run 완료(105,000건, WRITTEN 21파일) |
-
-이전 구조(1장)와 비교하면 PG-30(Wait/Notify)과 DMC Controller Service가 없어졌고, 원장 쓰기 `PutSQL`이 모두 `InvokeHTTP`로 바뀌었다. 재발행 경로는 이전 PoC에서 구현하지 못했던 부분이다.
-
-### 6.2 이번 PoC에서 찾은 결함
-
-| # | 위치 | 문제 | 조치 |
-|---|---|---|---|
-| 11 | 가이드 8.2 #20 | 같은 `UpdateAttribute` 안에서 `partition.claim.token=${UUID()}`를 만들고 `claimToken=${partition.claim.token}`으로 참조했다. `UpdateAttribute`는 모든 속성을 들어온 attribute 기준으로 평가하므로 `claimToken`이 빈 값이 되어 claim 7건이 모두 422(UUID 형식 오류)를 받았다 | token 생성과 복사를 두 `UpdateAttribute`로 분리(가이드 8.2, 빌더 30/30B) |
-| 12 | 가이드 9.2, 3.1 | `Authorization` 동적 속성을 `Bearer #{CONTROL.API.TOKEN}`으로 쓰면 NiFi가 400으로 거부한다. Sensitive 속성은 Parameter 참조 외의 텍스트를 가질 수 없다 | Parameter를 `CONTROL.API.AUTHORIZATION`(값 `Bearer <token>`)으로 바꾸고 속성 값은 `#{CONTROL.API.AUTHORIZATION}`만 둔다 |
-| 13 | 빌더 14번 | `RouteOnAttribute` EL의 닫는 괄호 위치 오류로 "Found multiple Expressions" 검증 실패 | 수정. 빌드 후 모든 Processor의 `validationStatus`를 확인한다 |
-| 14 | 빌더 오류 경로 | 오류 경로가 `event.name`을 지정하지 않아 앞 단계의 `RUN_CREATED`가 오류 이벤트 이름으로 남았다 | 오류 경로마다 `event.name`, `event.level`을 지정 |
-
-### 6.3 재현 방법
-
-```bash
-# 1. 관리 DB migration과 API·worker 실행(load-control-api/README.md)
-LCA_CONFIG=config.yaml alembic upgrade head
-python -m load_control.server --config config.yaml
-python -m load_control.worker --config config.yaml     # nifi.receiver_url = http://<nifi-host>:<CONTROL.LISTEN.PORT>
-
-# 2. NiFi Flow 생성(config.example.json 사본에 API URL, 인증 헤더, DB, 경로를 채운다)
-python3 poc/build_flow.py http://<nifi-host>:<port>/nifi-api my-config.json
-# 00_Generate_Trigger를 제외한 Processor를 시작하고, Trigger는 Run Once로 실행한다
-
-# 3. 다시 만들 때
-python3 poc/teardown_flow.py http://<nifi-host>:<port>/nifi-api
-```
-
-
-## 7. V3: 자식 PG + Port 구조와 Processor 축소 (2026-10-01)
-
-`poc/build_flow_v3.py`로 V2와 같은 API 계약을 유지하면서 Flow를 책임별 자식 PG로 나누고, Processor 수를 85개에서 41개로 줄였다.
 
 | PG | 역할 | Processor | Port |
 |---|---|---:|---|
@@ -132,32 +94,54 @@ python3 poc/teardown_flow.py http://<nifi-host>:<port>/nifi-api
 | PG-40 Staging Validation | `/validation/start`, `_SUCCESS` (Hive 단계 자리) | 7 | in: validate / out: errors |
 | PG-90 Error and Event | 오류 정규화, run/partition 실패 보고 API, load_event 기록 | 8 | in: errors |
 
-PG 간 연결은 상위 PG(`SQOOP_REPLACEMENT_POC_V3`)에 둔다. `partitions`(PG-10→PG-20)와 `reissue`(PG-05→PG-20)는 Round Robin load balance를 쓴다. Controller Service는 상위 PG에 두고 자식 PG가 공유한다. 자식 PG는 Parameter Context를 상속하지 않으므로 각각 지정한다.
+PG 간 연결은 상위 PG(`SQOOP_REPLACEMENT_POC_V3`)에 둔다. `partitions`(PG-10→PG-20)와 `reissue`(PG-05→PG-20)는 Round Robin load balance를 쓴다. Controller Service는 상위 PG에 두고 자식 PG가 공유한다. 자식 PG는 Parameter Context를 상속하지 않으므로 각각 지정한다. PoC는 Job이 하나라 PG-05를 상위 PG 안에 두었다(가이드는 root에 둔다).
 
-### 7.1 줄인 방법
+### 6.1 Processor를 적게 쓰는 규칙
 
-| 방법 | 절감 |
-|---|---:|
-| `RetryFlowFile` 대신 Processor relationship 재시도(`retryCount`, `retriedRelationships`, PENALIZE_FLOWFILE) | 9 |
-| 실패 지점별 `UpdateAttribute` 제거: 단계 진입 시 기존 `UpdateAttribute`에서 `load.stage` 지정, 모든 실패를 `errors` 포트로 보내 PG-90이 `invokehttp.*`, `executesql.error.message`, `load.stage`로 코드·메시지 생성 | 약 19 |
-| 요청 본문을 `UpdateAttribute` + `AttributesToJSON` 대신 `ReplaceText` 하나로 생성(문자열은 `escapeJson`) | 약 7 |
-| 원천 지표와 manifest를 SQL 한 문장으로 계산하고 사전 검사를 API manifest 불변식 검사에 맡김 | 3 |
-| API가 기록하는 상태 이벤트(RUN_STARTED, EXTRACT_VALIDATED 등)를 NiFi에서 다시 기록하지 않음(V2 중복 기록 제거) | 약 5 |
-| chunk 보고 응답 분기 제거(파티션 판정·이벤트는 API가 기록) | 2 |
+| 규칙 | 효과 |
+|---|---|
+| `RetryFlowFile` 대신 Processor relationship 재시도(`retryCount`, `retriedRelationships`, PENALIZE_FLOWFILE) | 재시도 loop용 Processor와 Connection이 없다 |
+| 실패 지점별 `UpdateAttribute`를 두지 않음. 단계 입구의 기존 `UpdateAttribute`에서 `load.stage`를 지정하고 모든 실패를 `errors` 포트로 보내면, PG-90이 `invokehttp.*`, `executesql.error.message`, `load.stage`로 코드·메시지를 만든다 | 오류 처리가 PG-90 한 곳에 모인다 |
+| 요청 본문을 `ReplaceText` 하나로 생성(EL JSON, 문자열은 `escapeJson`) | API 호출 하나가 본문 + `InvokeHTTP` 두 Processor로 끝난다 |
+| 원천 지표와 manifest를 SQL 한 문장으로 계산하고 사전 검사를 API manifest 불변식 검사에 맡김 | 지표와 파티션 건수가 같은 statement snapshot 값이 된다 |
+| 상태 이벤트(RUN_STARTED, EXTRACT_VALIDATED 등)는 API만 기록 | NiFi는 오류·경고만 기록하고 이벤트가 중복되지 않는다 |
+| chunk 보고 응답을 분기하지 않음(판정·이벤트는 API) | Worker 끝이 `InvokeHTTP` 하나다 |
 
-대가: 파티션 쿼리의 일시 오류와 영구 오류를 구분하지 않고 내장 재시도 3회 후 실패 보고한다. 영구 오류는 재시도 3회만큼 늦게 실패한다.
+대가: PoC는 파티션 쿼리에 내장 재시도 3회를 걸어 일시 오류와 영구 오류를 구분하지 않는다. 가이드는 Oracle에서 같은 SCN으로 긴 쿼리를 반복하지 않도록 파티션 쿼리를 재시도하지 않게 정했다(가이드 16장).
 
-### 7.2 시험 결과 (NiFi 2.4.0, Load Control API 별도 인스턴스와 DB `nifiops_v3`)
+### 6.2 시험 결과
 
 | 시나리오 | 결과 |
 |---|---|
-| 정상 실행 | run `STAGE_VALIDATING`, 8/8 SUCCESS, 105,000건, 검증 dispatch `ACKED`(202). Parquet 21개(run root 평탄), `_SUCCESS` 0바이트. 원천과 count·distinct·min/max·`SUM(amount)`·NULL 수 일치. NiFi 측 이벤트 중복 없음 |
-| 동일 업무일자 중복 실행 | PG-90이 409 + `RUN_CREATE` 단계를 `DUPLICATE_ACTIVE_RUN`(WARN)으로 분류, API 응답 본문을 message로 기록 |
+| 정상 실행 | run `STAGE_VALIDATING`, 8/8 SUCCESS, 105,000건, 검증 dispatch `ACKED`(202). Parquet 21개(run root 평탄), `_SUCCESS` 0바이트. 원천과 count·distinct·min/max·`SUM(amount)`·NULL 수 일치. 이벤트 중복 없음 |
+| 0건 파티션(seq 30001~45000) | API가 manifest 등록 시 SUCCESS 처리, Worker로 보내지 않음 |
+| 파티션 건수가 파일 행 수의 배수(15,000/5,000) | 파티션당 3파일, 빈 FlowFile 없음 |
+| 동일 업무일자 중복 실행 | PG-90이 409 + `RUN_CREATE` 단계를 `DUPLICATE_ACTIVE_RUN`(WARN)으로 분류, API 응답 본문을 message로 기록. 기존 run 상태 변화 없음 |
 | 파티션 0004 HDFS 쓰기 실패 주입 | PutHDFS 내장 재시도 후 `errors` → PG-90이 파티션 실패 API 호출 → 0004 FAILED, run `FAILED_EXTRACT`, 검증 dispatch 0건, `_SUCCESS` 미생성 |
 
-### 7.3 이번에 확인한 사항
+API 중단 중 실행과 sweeper `REISSUE` 모드(파티션 재발행)는 V3로 아직 시험하지 않았다.
+
+### 6.3 확인한 사항
 
 | # | 내용 |
 |---|---|
-| 15 | `InvokeHTTP`에 `Response Body Attribute Name`을 설정하면 4xx/5xx 응답 본문도 그 attribute(`api.response`)에 들어가고 `invokehttp.response.body`는 비어 있다. 오류 메시지는 두 값을 모두 확인한다 |
-| 16 | PutHDFS 실패는 오류 attribute가 없어 PG-90이 `NON_RETRYABLE`로 분류한다. 내장 재시도를 이미 소진한 뒤이므로 동작에는 영향이 없지만, 운영 분류가 필요하면 PG-20에서 `load.stage`를 더 세분한다 |
+| 11 | `UpdateAttribute`는 모든 속성을 들어온 attribute 기준으로 평가한다. 같은 Processor 안에서 `partition.claim.token=${UUID()}`를 만들고 본문에서 참조하면 빈 값이 되어 claim이 422(UUID 형식 오류)를 받는다. V3는 token 생성(30)과 본문 생성(31)을 다른 Processor로 나눈다(가이드 8.2) |
+| 12 | `InvokeHTTP`의 `Authorization` 동적 속성을 `Bearer #{CONTROL.API.TOKEN}`으로 쓰면 NiFi가 400으로 거부한다. Sensitive 속성은 Parameter 참조 외의 텍스트를 가질 수 없으므로 Parameter `CONTROL.API.AUTHORIZATION`에 `Bearer <token>` 전체를 두고 속성 값은 `#{CONTROL.API.AUTHORIZATION}`만 둔다(가이드 9.2) |
+| 13 | `InvokeHTTP`에 `Response Body Attribute Name`을 설정하면 4xx/5xx 응답 본문도 그 attribute(`api.response`)에 들어가고 `invokehttp.response.body`는 비어 있다. 오류 메시지는 두 값을 모두 확인한다 |
+| 14 | PutHDFS 실패는 오류 attribute가 없어 PG-90이 `NON_RETRYABLE`로 분류한다. 내장 재시도를 이미 소진한 뒤이므로 동작에는 영향이 없지만, 운영 분류가 필요하면 PG-20에서 `load.stage`를 더 세분한다 |
+
+### 6.4 재현 방법 (V3)
+
+```bash
+# 1. 관리 DB migration과 API·worker 실행(load-control-api/README.md)
+LCA_CONFIG=config.yaml alembic upgrade head
+python -m load_control.server --config config.yaml
+python -m load_control.worker --config config.yaml     # nifi.receiver_url = http://<nifi-host>:<CONTROL.LISTEN.PORT>
+
+# 2. NiFi Flow 생성(config.v3.example.json 사본에 API URL, 인증 헤더, DB, 경로를 채운다)
+python3 poc/build_flow_v3.py http://<nifi-host>:<port>/nifi-api my-config.json
+# 상위 PG를 시작한다. Trigger(00_Generate_Trigger)는 DISABLED로 만들어지므로 enable 후 Run Once로 실행한다
+
+# 3. 다시 만들 때(같은 config를 주면 그 names의 PG와 Parameter Context를 지운다)
+python3 poc/teardown_flow.py http://<nifi-host>:<port>/nifi-api my-config.json
+```

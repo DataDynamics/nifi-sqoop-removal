@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """NiFi 2.4 REST API로 Sqoop 대체 PoC Flow V3를 만든다. Load Control API 연동 구조(가이드 7~10장).
 
-V2(build_flow.py)와 같은 API 계약을 쓰되, 하나의 PG에 평면으로 그리지 않고 책임별 자식 PG와
-Input/Output Port로 나눈다. Processor 수도 줄였다(V2 85개 → V3 약 40개).
+V1(build_flow_v1.py)은 Load Control API 없이 NiFi가 원장을 직접 기록하고 하나의 PG에 평면으로 그렸다.
+V3는 상태 기록과 완료 판정을 API에 맡기고, Flow를 책임별 자식 PG와 Input/Output Port로 나눈다(Processor 41개).
 
     ┌ PG-00 Trigger ┐ start-run ┌ PG-10 Run Coordinator ┐ partitions ┌ PG-20 Extract Worker ┐
     │ Generate      │──────────▶│ create run, manifest  │──(RR LB)──▶│ claim, extract, HDFS, │
@@ -14,7 +14,7 @@ Input/Output Port로 나눈다. Processor 수도 줄였다(V2 85개 → V3 약 4
                                          └──────────────────────────┘
     모든 PG ── errors ──▶ PG-90 Error and Event (실패 보고 API 호출, load_event 기록)
 
-V2 대비 줄인 방법
+Processor 수를 줄이는 방법
 - 재시도: RetryFlowFile 대신 Processor의 relationship 재시도(retryCount, retriedRelationships)
 - 오류: 실패 지점마다 두던 UpdateAttribute를 없앴다. 단계 진입 시 이미 있는 UpdateAttribute에서
   load.stage를 넣고, 모든 실패는 errors 포트로 보낸다. PG-90이 load.stage와 Processor가 남긴
@@ -23,10 +23,10 @@ V2 대비 줄인 방법
 - 원천 지표와 manifest를 SQL 한 문장으로 계산한다. 같은 statement snapshot이므로 지표와 파티션 건수가
   같은 시점 값이다. 사전 검사(0건, NULL split, 합계)는 API의 manifest 불변식 검사가 대신한다.
 - 상태 이벤트(RUN_STARTED, MANIFEST_CREATED, PARTITION_*, EXTRACT_VALIDATED, STAGE_VALIDATION_STARTED)는
-  API가 기록하므로 NiFi는 오류·경고만 기록한다(V2의 중복 기록 제거).
+  API가 기록하므로 NiFi는 오류·경고만 기록한다.
 
 사용법: build_flow_v3.py <nifi-api-url> <config.json>
-config.json 형식은 build_flow.py와 같다. `names.process_group` 기본값은 SQOOP_REPLACEMENT_POC_V3.
+config.json 형식은 config.v3.example.json. `names.process_group` 기본값은 SQOOP_REPLACEMENT_POC_V3.
 Trigger(00_Generate_Trigger)는 DISABLED로 만든다. 실행하려면 enable 후 Run Once 한다.
 """
 import json
@@ -130,6 +130,58 @@ JARR = cs("CS_JSON_WRITER_ARRAY", "JsonRecordSetWriter", {"output-grouping": "ou
 PARQ = cs("CS_PARQUET_WRITER", "ParquetRecordSetWriter", {"compression-type": "SNAPPY"})
 HTTPCTX = cs("CS_HTTP_CONTEXT_MAP", "StandardHttpContextMap", {"Request Expiration": "1 min"})
 
+
+# Processor COMMENT(한글). NiFi UI의 Processor 설정 > Comments에 표시된다.
+COMMENTS = {
+    # PG-00 Trigger
+    "P00": "적재 실행을 시작하는 트리거. 스케줄마다 빈 FlowFile 하나를 만든다. 배포 시 DISABLED로 두고 운영 전환 시 enable한다.",
+    "P01": "Job 키와 업무일자를 attribute로 넣고 현재 단계를 RUN_CREATE로 표시한다.",
+    "P02": "업무일자가 yyyy-MM-dd 형식인지 검사한다. 업무일자는 SQL에 들어가므로 SQL 주입을 막는 경계다. 형식이 틀리면 errors로 보낸다.",
+    # PG-10 Run Coordinator
+    "P11": "run 생성 요청 본문(JSON)을 만든다. jobKey, businessKey, HDFS root, stage table prefix, 0건 허용 여부를 넣는다.",
+    "P12": "Load Control API에 run을 생성한다(POST /runs). 같은 업무일자의 활성 run이 있으면 409로 거부된다. 5xx·연결 오류는 자체 재시도 후 errors로 보낸다.",
+    "P13": "run 생성 응답에서 runId, run 전용 HDFS 경로, stage table 이름을 꺼내고 현재 단계를 MANIFEST로 표시한다.",
+    "P14": "원천 건수·NULL 수·최솟값·최댓값·금액 합계와 파티션별 경계·예상 건수를 SQL 한 문장으로 계산한다. 한 문장이므로 지표와 파티션 건수가 같은 시점 값이다.",
+    "P15": "SQL 결과 배열을 manifest 등록 요청 형식으로 바꾼다. 0번 행에서 원천 지표를 꺼내고 파티션 목록을 partitions로 감싼다.",
+    "P16": "manifest를 API에 등록한다(POST /runs/{id}/manifest). API가 불변식(합계, 파티션 수, 0건 허용, NULL)을 검사하고 Worker로 보낼 파티션 목록을 돌려준다.",
+    "P17": "API가 돌려준 dispatchPartitions를 파티션 하나당 FlowFile 하나로 나눈다. 0건 파티션은 API가 이미 SUCCESS로 처리해 목록에 없다.",
+    "P18": "파티션 FlowFile의 JSON에서 파티션 ID, 하한, 상한, 상한 포함 여부, 예상 건수를 attribute로 꺼내 PG-20으로 보낸다.",
+    # PG-20 Extract Worker
+    "P30": "파티션 소유권 확인용 claim token(UUID)을 만들고 현재 단계를 EXTRACT로 표시한다. token은 재시도해도 바뀌지 않는다.",
+    "P31": "claim 요청 본문(claimToken, workerNode)을 만든다. token은 앞 Processor에서 만든 값을 쓴다.",
+    "P32": "API에 파티션 처리 소유권을 요청한다(POST .../claim). 다른 Worker가 이미 처리 중이거나 run이 끝났으면 claimed=false를 받는다.",
+    "P33": "claim에 성공했고 파티션 경계가 숫자인 경우만 추출로 보낸다. claimed=false는 정상 경합이므로 오류 없이 종료한다.",
+    "P34": "파티션 범위의 원천 데이터를 조회해 Parquet chunk FlowFile로 만든다. chunk마다 fragment.index/count가 붙는다. 실패하면 errors로 보내 파티션 실패를 보고한다.",
+    "P35": "chunk 파일 이름(part-<파티션>-<chunk>.parquet)을 정하고 현재 단계를 CHUNK_WRITE로 표시한다.",
+    "P36": "Parquet chunk를 run 전용 HDFS 경로에 쓴다(Write and rename). 실패하면 자체 재시도 후 errors로 보낸다.",
+    "P37": "HDFS 기록 후 content를 chunk 보고 JSON(claimToken, chunk 번호·개수, HDFS 경로, 건수, 크기)으로 바꾼다.",
+    "P38": "API에 chunk 기록을 보고한다(POST .../chunks). 파티션·run 완료 판정과 검증 호출 예약은 API가 하므로 응답을 더 보지 않고 끝낸다.",
+    # PG-05 Control Receiver
+    "R05": "Load Control API worker가 보내는 검증 시작(/validate/<Job>)·파티션 재발행(/reissue/<Job>) 요청을 받는다. 등록된 Job 경로만 허용한다.",
+    "R06": "요청이 POST이고 X-Run-Id, X-Dispatch-Id 헤더가 UUID 형식인지 검사한다.",
+    "R07": "형식이 잘못된 요청에 400으로 응답한다. API가 ACK timeout 뒤 다시 보낸다.",
+    "R08": "정상 요청에 바로 202로 응답한다. 검증은 오래 걸리므로 HTTP 연결을 붙잡지 않는다.",
+    "R09": "요청 본문에서 runId, dispatchId와 재발행에 필요한 파티션 정보를 attribute로 꺼낸다.",
+    "R10": "요청 경로로 검증(validate)과 재발행(reissue)을 나눈다. 재발행은 PG-20 Worker로 보낸다.",
+    # PG-40 Staging Validation
+    "V40": "현재 단계를 VALIDATION_START로 표시한다.",
+    "V41": "검증 시작 요청 본문(dispatchId, node)을 만든다.",
+    "V42": "API에 검증 시작을 알린다(POST /validation/start). 같은 run에 대해 한 번만 started=true를 받는다. 이 호출이 dispatch ACK가 된다.",
+    "V43": "started=true인 경우만 진행한다. 중복 검증 요청은 오류 없이 종료한다.",
+    "V44": "검증 시작 응답에서 HDFS 경로, stage table, 업무일자를 꺼내고 _SUCCESS 파일 이름을 정한다.",
+    "V45": "_SUCCESS marker를 빈 파일로 쓰기 위해 content를 비운다.",
+    "V46": "run 경로에 _SUCCESS marker를 쓴다. 이 파일은 API가 run 완료를 확정한 뒤에만 생긴다. 운영에서는 이후 Hive staging 검증으로 이어진다.",
+    # PG-90 Error and Event
+    "E90": "모든 PG의 오류를 정규화한다. load.stage와 Processor가 남긴 attribute(HTTP 상태, SQL 오류, 연결 예외)로 오류 단계·코드·분류·메시지를 만든다.",
+    "E91": "오류 단계에 따라 run 실패 보고, 파티션 실패 보고, 이벤트 기록만 중 하나로 나눈다.",
+    "E92": "run 실패 보고 본문(CREATED → FAILED_MANIFEST, 오류 단계·코드·메시지)을 만든다.",
+    "E93": "API에 run 실패를 보고한다(POST /runs/{id}/fail). 보고하지 않으면 활성 run lock이 남는다.",
+    "E94": "파티션 실패 보고 본문(claimToken, 오류 단계·분류·코드·메시지)을 만든다.",
+    "E95": "API에 파티션 실패를 보고한다(POST .../partitions/{pid}/fail). API가 파티션과 run을 실패 처리한다.",
+    "E96": "오류 이벤트를 관리 DB nifi_ops.load_event에 기록한다. 중복 실행은 WARN, 그 밖은 ERROR로 남긴다.",
+    "E97": "오류를 구조화 JSON으로 nifi-app.log에 남긴다(prefix SQOOP_REPLACEMENT).",
+}
+
 # ---------------------------------------------------------------- 구성요소 생성 helper
 procs = {}   # key -> (entity, group id)
 ports = {}   # (group id, name, "in"/"out") -> port id
@@ -141,7 +193,8 @@ def p(g, key, name, short, props=None, col=0, row=0, tasks=1, sched="0 sec", sen
     """retry=(relationships, count): Processor 내장 재시도. 소진되면 해당 relationship 연결로 간다."""
     b, t = bundle(short)
     config = {"properties": props or {}, "concurrentlySchedulableTaskCount": tasks,
-              "schedulingPeriod": sched, "penaltyDuration": "5 sec", "yieldDuration": "5 sec"}
+              "schedulingPeriod": sched, "penaltyDuration": "5 sec", "yieldDuration": "5 sec",
+              "comments": COMMENTS[key]}  # 설명이 없는 Processor는 KeyError로 빌드를 멈춘다
     if sensitive:
         config["sensitiveDynamicPropertyNames"] = list(sensitive)
     if retry:

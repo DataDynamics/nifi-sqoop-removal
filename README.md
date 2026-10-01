@@ -212,7 +212,9 @@ error_class, error_code, message
    - 아키텍처, 상태·검증 모델, PostgreSQL DDL, Processor별 연결, Property, Parameter Context, API 연동, SQL, Mermaid Flow, 로그 및 운영 설정
 3. [Load Control API 설계](./load-control-api-design.md)
    - 완료 판정 트랜잭션, outbox, API 명세, sweeper, FastAPI 구현(구조, 코드 예시, 배포, 테스트), 전환 순서
-4. [가이드 검토 및 NiFi 2.4.0 PoC 결과](./poc/REVIEW.md)
+4. [Load Control API 구현](./load-control-api/README.md)
+   - FastAPI 프로젝트(API 설계 12장 1~2단계): 실행, migration, 테스트 방법
+5. [가이드 검토 및 NiFi 2.4.0 PoC 결과](./poc/REVIEW.md)
    - API 도입 이전 구조(PG-30 Wait/Notify)로 수행한 PoC 기록
 
 ## 구현 전 확인 항목

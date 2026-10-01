@@ -506,7 +506,7 @@ ORM을 쓰지 않는 이유: 이 API의 핵심은 `SELECT ... FOR UPDATE`, 조�
 
 | 프로세스 | 진입점 | 역할 | 인스턴스 |
 |---|---|---|---|
-| `api` | `gunicorn load_control.main:app -k uvicorn.workers.UvicornWorker -w 4` | HTTP 엔드포인트(5장) | 2개 이상, LB 뒤 |
+| `api` | `gunicorn 'load_control.main:create_app()' -k uvicorn.workers.UvicornWorker -w 4` | HTTP 엔드포인트(5장) | 2개 이상, LB 뒤 |
 | `worker` | `python -m load_control.worker` | dispatcher(4장), sweeper(7장) | 2개(활성-활성) |
 
 dispatcher와 sweeper를 HTTP 프로세스와 분리하는 이유는 다음과 같다.
@@ -516,6 +516,8 @@ dispatcher와 sweeper를 HTTP 프로세스와 분리하는 이유는 다음과 �
 - worker가 둘 이상 떠도 lease(4.3)와 advisory lock(7장)이 중복 처리를 막으므로 이중화에 별도 리더 선출이 필요 없다.
 
 ### 9.3 프로젝트 구조
+
+구현은 저장소의 [`load-control-api/`](./load-control-api/)에 있다(12장 1~2단계 구현 완료).
 
 ```text
 load-control-api/
@@ -527,7 +529,9 @@ load-control-api/
 │       ├── 0001_nifi_ops_baseline.py      # 가이드 4.1 DDL
 │       └── 0002_...py
 ├── src/load_control/
-│   ├── main.py            # FastAPI app, lifespan, router 등록, 예외 처리기
+│   ├── main.py            # create_app() factory, lifespan, router 등록, 예외 처리기
+│   ├── domain.py          # RunStatus, PartitionStatus, 허용 실패 전이
+│   ├── metrics.py         # Prometheus 메트릭
 │   ├── config.py          # Settings
 │   ├── db.py              # engine, 트랜잭션 헬퍼(재시도 포함)
 │   ├── security.py        # 인증 의존성(role: nifi, operator)
@@ -540,14 +544,14 @@ load-control-api/
 │   ├── services/          # 트랜잭션 단위 업무 규칙
 │   │   ├── runs.py  manifest.py  completion.py  validation.py  publish.py
 │   ├── routers/
-│   │   ├── runs.py  partitions.py  validation.py  publish.py  ops.py  health.py
+│   │   ├── deps.py  runs.py  partitions.py  validation.py  publish.py  ops.py  health.py
 │   └── worker/
 │       ├── __main__.py    # dispatcher + sweeper 실행
 │       ├── dispatcher.py
 │       └── sweeper.py
 └── tests/
     ├── conftest.py        # testcontainers PostgreSQL, alembic upgrade
-    ├── test_completion.py test_concurrency.py test_dispatch.py test_sweeper.py ...
+    ├── test_partitions.py test_concurrency.py test_dispatch.py test_sweeper.py ...
 ```
 
 계층 규칙은 다음과 같다.
@@ -749,19 +753,14 @@ async def report_chunk(conn: AsyncConnection, run_id: UUID, partition_id: str,
 
 ```python
 # routers/partitions.py
-from fastapi import APIRouter, Depends, Request
-from load_control.db import in_tx
-from load_control.security import require_role
-
-router = APIRouter(prefix="/v1/runs/{run_id}/partitions/{partition_id}", tags=["partitions"])
+router = APIRouter(prefix="/v1/runs/{run_id}/partitions/{partition_id}", tags=["partitions"],
+                   dependencies=[Depends(require_role("nifi"))])
 
 
-@router.post("/chunks", response_model=ChunkResult,
-             dependencies=[Depends(require_role("nifi"))])
-async def post_chunk(run_id: UUID, partition_id: PartitionId, body: ChunkReport,
-                     request: Request) -> ChunkResult:
-    engine = request.app.state.engine
-    return await in_tx(engine, lambda conn: completion.report_chunk(conn, run_id, partition_id, body))
+@router.post("/chunks", response_model=ChunkResult)
+async def report_chunk(run_id: UUID, partition_id: PartitionIdPath, body: ChunkReport,
+                       request: Request) -> ChunkResult:
+    return await run_tx(request, lambda conn: completion.report_chunk(conn, run_id, partition_id, body))
 ```
 
 `enqueue_validation`의 SQL은 다음과 같다. `pg_notify`는 트랜잭션이 commit될 때만 전달되므로, rollback된 완료가 dispatcher를 깨우는 일은 없다.
@@ -973,8 +972,8 @@ API 전체 중단 중 시작된 run은 성공으로 판정되지 않고 TIMED_OU
 
 ## 12. 전환 순서
 
-1. **프로젝트 골격**: 9.3 구조, 설정, Alembic baseline(가이드 4.1 DDL), 인증, 오류 처리, health, 테스트 환경(testcontainers).
-2. **API 1차**: `/runs`, `/manifest`, `/claim`, `/chunks`, `/fail`, `GET /runs/{id}`, 판정 트랜잭션. 11.1의 동시성 테스트를 먼저 통과시킨다.
+1. **프로젝트 골격** (구현 완료): 9.3 구조, 설정, Alembic baseline(가이드 4.1 DDL), 인증, 오류 처리, health, 테스트 환경(testcontainers).
+2. **API 1차** (구현 완료): `/runs`, `/manifest`, `/claim`, `/chunks`, `/fail`, `GET /runs/{id}`, 판정 트랜잭션. 11.1의 동시성 테스트를 먼저 통과시킨다.
 3. **PG-10, PG-20 전환**: PoC 환경(NiFi 2.4.0 + PostgreSQL)에서 PoC와 같은 시나리오(105,000건, 8파티션, 0건 파티션, 배수 경계, 중복 실행, HDFS 실패 주입)를 다시 실행한다. 이 단계에서는 PG-30을 남겨 두고 API 판정 결과와 PG-30 판정 결과를 비교할 수 있다.
 4. **outbox와 검증 수신**: `load_dispatch`, dispatcher, `/validation/start`, PG-40 입구. 이후 PG-30과 DMC Controller Service를 삭제한다.
 5. **PG-50, PG-60 연동**: publish claim·result, validations, success.

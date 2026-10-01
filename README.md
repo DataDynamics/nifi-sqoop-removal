@@ -15,7 +15,13 @@ Oracle
   → 원천/대상 건수 검증
 ```
 
-TO-BE에서는 Sqoop Mapper가 담당하던 분할 조회, 병렬 실행, 실패 전파 및 전체 작업 완료 판정을 NiFi Flow와 영속 관리 테이블로 구현한다.
+TO-BE에서는 Sqoop Mapper가 담당하던 분할 조회와 병렬 실행을 NiFi Flow로, 실패 전파와 전체 작업 완료 판정을 Load Control API(Python FastAPI)와 PostgreSQL 영속 관리 테이블로 구현한다.
+
+```text
+NiFi             : Oracle 병렬 조회 → Parquet → HDFS 기록 → chunk마다 API에 보고
+Load Control API : 보고 기록 → 파티션·run 완료 판정 → 검증 flow 호출(run당 1회)
+NiFi 검증 flow    : Hive staging 검증 → INSERT OVERWRITE → Target 검증 → 결과를 API에 보고
+```
 
 ## 설계 목표
 
@@ -58,38 +64,42 @@ partition N-1 : seq >= bN-1 AND seq <= max_seq
 
 NULL 값은 사전 검증에서 실패시키거나 `IS NULL` 전용 파티션으로 분리한다. 값 분포가 불균등하면 단순 MIN/MAX 범위 대신 통계 또는 분위수 기반 경계를 사용한다.
 
-### 영속 Manifest
+### 영속 Manifest와 Load Control API
 
-NiFi Queue나 `Wait/Notify` cache만으로 작업 완료 여부를 판정하지 않는다. 관리 DB의 Run, Partition, File Manifest가 상태의 최종 원장이다.
+관리 DB의 Run, Partition, File Manifest가 상태의 최종 원장이다. 원장에 쓰는 주체는 Load Control API 하나이고, NiFi는 관측 이벤트만 직접 기록한다.
 
 ```text
 nifi_ops.load_run
 nifi_ops.load_partition
 nifi_ops.load_file
 nifi_ops.load_validation
+nifi_ops.load_dispatch   (검증 호출 outbox)
 nifi_ops.load_event
 ```
 
-`Wait/Notify`는 완료 확인을 빠르게 깨우는 용도로 사용한다. 게시 직전에는 반드시 Manifest를 다시 조회해 다음 조건을 확인한다.
+NiFi Worker는 PutHDFS가 성공한 chunk마다 API에 보고한다. API는 보고마다 run 행을 잠근 트랜잭션에서 다음을 판정하고, run 완료를 확정한 단 하나의 보고만 검증 flow 호출을 예약한다. NiFi Queue나 `Wait/Notify` cache는 쓰지 않는다.
 
 ```text
-모든 파티션 상태 = SUCCESS
-실패/대기/실행 중 파티션 = 0
-파티션 실제 건수 합계 = Oracle source count
+파티션: 받은 chunk 수 = fragment.count, row 합계 = expected count
+run   : 모든 파티션 상태 = SUCCESS
+        파티션 실제 건수 합계 = Oracle source count
 ```
+
+검증 호출은 outbox(`load_dispatch`)와 PostgreSQL `LISTEN/NOTIFY`로 commit 후에 전달하고, 받는 쪽은 `STAGE_VALIDATING` CAS로 중복을 걸러 낸다.
 
 ### CAS 기반 중복 방지
 
-파티션 Worker와 게시 Flow는 고유 token을 사용한 compare-and-set 방식으로 소유권을 획득한다.
+파티션 Worker와 게시 Flow는 API에 고유 token으로 소유권을 요청하고, API는 compare-and-set으로 하나의 요청에만 소유권을 준다.
 
 ```sql
 UPDATE nifi_ops.load_run
-   SET status = 'PUBLISHING', publish_token = ?
- WHERE run_id = ?
-   AND status = 'STAGING_VALIDATED';
+   SET status = 'PUBLISHING', publish_token = CAST(:publish_token AS uuid)
+ WHERE run_id = CAST(:run_id AS uuid)
+   AND status = 'STAGING_VALIDATED'
+RETURNING run_id;
 ```
 
-갱신 후 token을 다시 조회하여 소유권을 확인한 하나의 FlowFile만 `INSERT OVERWRITE`를 수행한다.
+반환 행이 있으면 API가 `claimed=true`를 돌려주고, 그 FlowFile만 `INSERT OVERWRITE`를 수행한다. 같은 token의 재요청은 성공으로 처리하므로 응답 유실 후 재시도해도 소유권을 잃지 않는다.
 
 ## 전체 처리 흐름
 
@@ -101,10 +111,11 @@ flowchart TD
     D --> E[INSP_DTL_SEQ Partition Manifest 생성]
     E --> F[NiFi Cluster 병렬 ExecuteSQLRecord]
     F --> G[Parquet 변환 및 run별 PutHDFS]
-    G --> H[Chunk 및 Partition 검증]
-    H --> I{모든 Partition 성공?}
+    G --> H[chunk마다 Load Control API에 보고]
+    H --> I{API: 모든 Partition 성공?}
     I -->|아니요| X[Run 실패 및 게시 차단]
-    I -->|예| J[HDFS SUCCESS marker 생성]
+    I -->|예| D2[API가 검증 flow 호출<br/>run당 1회]
+    D2 --> J[HDFS SUCCESS marker 생성]
     J --> K[Run 전용 Hive External Table 생성]
     K --> L[Source와 Staging 검증]
     L --> M{검증 통과?}
@@ -121,14 +132,20 @@ flowchart TD
 | Process Group | 역할 | 실행 위치 |
 |---|---|---|
 | `PG-00 Trigger` | 스케줄 및 업무키 생성 | Primary Node |
-| `PG-10 Run Coordinator` | 실행 Lock, SCN, source metrics, manifest 생성 | Primary Node |
-| `PG-20 Oracle Extract Workers` | Oracle 병렬 조회, Parquet 변환, HDFS 기록 | All Nodes |
-| `PG-30 Partition and Run Gate` | chunk·partition·run 완료 판정 | Primary Node 중심 |
-| `PG-40 Staging Validation` | External table 생성 및 staging 검증 | Primary Node |
-| `PG-50 Publish` | 게시 소유권 획득 및 `INSERT OVERWRITE` | Primary Node |
-| `PG-60 Target Validation` | 최종 테이블 사후 검증 | Primary Node |
-| `PG-70 Recovery Monitor` | stale run/partition 복구 | Primary Node |
-| `PG-90 Audit and Error` | 감사 이벤트, 오류 로그 및 알림 | All Nodes |
+| `PG-05 Control Receiver` | API의 검증·재발행 호출 수신, `jobKey`별 Job PG로 전달 | All Nodes |
+| `PG-10 Run Coordinator` | API에 run 등록, SCN, source metrics, manifest 계산과 등록 | Primary Node |
+| `PG-20 Oracle Extract Workers` | claim, Oracle 병렬 조회, Parquet 변환, HDFS 기록, chunk 보고 | All Nodes |
+| `PG-40 Staging Validation` | 검증 시작 CAS, External table 생성 및 staging 검증 | All Nodes |
+| `PG-50 Publish` | API 게시 소유권 획득 및 `INSERT OVERWRITE` | All Nodes |
+| `PG-60 Target Validation` | 최종 테이블 사후 검증 | All Nodes |
+| `PG-90 Audit and Error` | NiFi 오류·관측 이벤트, 알림 | All Nodes |
+
+| 구성요소 | 역할 |
+|---|---|
+| Load Control API (`api` 프로세스) | 원장 기록, 불변식 검증, 파티션·run 완료 판정, 상태 전이 CAS |
+| Load Control API (`worker` 프로세스) | outbox dispatcher(검증·재발행 호출), sweeper(stale·timeout 정리) |
+
+가이드 초안의 `PG-30 Partition and Run Gate`(Wait/Notify)와 `PG-70 Recovery Monitor`는 API로 대체되어 없다. PG-40~60은 API가 NiFi LB로 호출하므로 All Nodes에서 실행하고, 중복 실행은 Primary Node 대신 API CAS로 막는다.
 
 Worker 입력 Connection만 Round Robin Load Balance를 적용한다. 실제 Oracle 동시 세션 수는 다음 식으로 제한한다.
 
@@ -172,7 +189,8 @@ source count
 - Staging 검증 전에는 `INSERT OVERWRITE`를 실행하지 않는다.
 - Hive 게시 결과가 불명확한 timeout은 `PUBLISH_UNKNOWN`으로 기록하고 자동 재실행하지 않는다.
 - Target 사후 검증 실패는 중대 오류로 처리하며 자동 overwrite를 반복하지 않는다.
-- NiFi 재기동 시 cache가 아니라 관리 DB Manifest를 기준으로 복구한다.
+- NiFi나 API가 재기동되어도 관리 DB Manifest와 outbox를 기준으로 이어서 처리한다. stale 작업은 API sweeper가 정리한다.
+- NiFi→API 호출은 모두 멱등이므로 5xx·연결 오류는 같은 요청으로 재시도한다.
 
 ## 로그와 추적성
 
@@ -184,14 +202,18 @@ processor_name, node_id, attempt_no, row_count, duration_ms,
 error_class, error_code, message
 ```
 
-업무 상태와 검증 결과는 PostgreSQL 관리 테이블에 동기적으로 기록하고, 운영 관측 로그는 JSON 형식의 `LogMessage`와 `nifi_ops.load_event`에 저장한다. SQL 원문, 자격증명 및 원천 행 데이터는 로그에 남기지 않는다.
+업무 상태와 검증 결과는 NiFi가 Load Control API를 동기 호출해 PostgreSQL 관리 테이블에 기록한다. 상태 전이 이벤트는 API가 같은 트랜잭션에서, NiFi 오류·관측 이벤트는 PG-90이 `nifi_ops.load_event`에 저장한다. NiFi와 API 로그는 `run_id`와 `X-Request-Id`로 대조한다. SQL 원문, 자격증명 및 원천 행 데이터는 로그에 남기지 않는다.
 
 ## 문서 구성
 
 1. [Sqoop 병렬 처리 및 전환 사전 분석](./sqoop.md)
    - 기존 Sqoop Mapper, split-by, 성능과 정합성 특성
 2. [CFM 4.12.0 Sqoop 제거 통합 설계 및 NiFi Flow 구현 명세](./nifi-sqoop-removal-guide.md)
-   - 아키텍처, 상태·검증 모델, PostgreSQL DDL, Processor별 연결, Property, Parameter Context, SQL, Mermaid Flow, 로그 및 운영 설정
+   - 아키텍처, 상태·검증 모델, PostgreSQL DDL, Processor별 연결, Property, Parameter Context, API 연동, SQL, Mermaid Flow, 로그 및 운영 설정
+3. [Load Control API 설계](./load-control-api-design.md)
+   - 완료 판정 트랜잭션, outbox, API 명세, sweeper, FastAPI 구현(구조, 코드 예시, 배포, 테스트), 전환 순서
+4. [가이드 검토 및 NiFi 2.4.0 PoC 결과](./poc/REVIEW.md)
+   - API 도입 이전 구조(PG-30 Wait/Notify)로 수행한 PoC 기록
 
 ## 구현 전 확인 항목
 
@@ -205,11 +227,15 @@ error_class, error_code, message
 - 원천 0건 처리 정책
 - 필수 업무 검증 지표와 허용 오차
 - Kerberos, Ranger, HDFS 경로와 서비스 계정 권한
+- Load Control API 배포 환경(컨테이너/VM), 이중화 대수, 관리 DB 연결 수 한도
+- NiFi↔API mTLS 인증서 발급 주체와 방화벽 경로(NiFi→API, API→NiFi PG-05 포트)
+- API 소유·운영 조직과 장애 대응 절차
 
 ## 참고 자료
 
 - [Cloudera CFM 4.12.0 지원 Processor](https://docs.cloudera.com/cfm/4.12.0/release-notes/topics/cfm-supported-processors.html)
 - [Apache NiFi ExecuteSQLRecord](https://nifi.apache.org/components/org.apache.nifi.processors.standard.ExecuteSQLRecord/)
-- [Apache NiFi Wait](https://nifi.apache.org/components/org.apache.nifi.processors.standard.Wait/)
-- [Apache NiFi Notify](https://nifi.apache.org/components/org.apache.nifi.processors.standard.Notify/)
+- [Apache NiFi InvokeHTTP](https://nifi.apache.org/components/org.apache.nifi.processors.standard.InvokeHTTP/)
+- [Apache NiFi HandleHttpRequest](https://nifi.apache.org/components/org.apache.nifi.processors.standard.HandleHttpRequest/)
+- [FastAPI](https://fastapi.tiangolo.com/)
 - [Oracle Flashback Query와 Read Consistency](https://docs.oracle.com/cd/B28359_01/server.111/b28318/consist.htm)

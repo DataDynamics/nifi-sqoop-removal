@@ -1,5 +1,7 @@
 # nifi-sqoop-removal-guide.md 검토 및 NiFi 2.4.0 PoC 결과
 
+> 이 PoC는 Load Control API 도입 이전 구조(PG-30 Wait/Notify, NiFi `PutSQL`로 원장 직접 기록)로 수행했다. 현재 설계는 완료 판정과 원장 기록을 Load Control API(FastAPI)가 맡는다([API 설계](../load-control-api-design.md)). `poc/build_flow.py`는 이전 구조 그대로이며, API 구조로의 재검증은 API 설계 12장 3단계에서 수행한다. 아래 결과 중 Oracle 추출, Parquet 타입, PutHDFS, 경로, PostgreSQL 원천 관련 항목은 현재 설계에도 그대로 유효하다.
+
 - 검토일: 2026-10-01
 - 실행 환경: Apache NiFi 2.4.0 (단일 노드, `http://10.0.1.50:10001`), PostgreSQL 16
 - 대체 사항: 원천 Oracle → PostgreSQL `srcdb.app.insp_dtl`, HDFS → PutHDFS + `fs.defaultFS=file:///`

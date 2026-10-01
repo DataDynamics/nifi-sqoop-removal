@@ -204,7 +204,7 @@ manifest 일괄 등록은 가이드 초안의 파티션 행별 `PutSQL`(Fragment
 
 ### 3.5 실패 전파
 
-- Worker는 일시 오류를 NiFi `RetryFlowFile`로 제한 재시도한 뒤, 최종 실패일 때만 `POST .../fail`을 호출한다.
+- NiFi는 Processor 실패를 PG-90으로 모은 뒤, claim에 성공한 파티션의 실패만 `POST .../fail`로 보고한다(가이드 14.2). API 호출과 PutHDFS는 relationship 재시도로 제한 재시도하고, 파티션 쿼리는 재시도하지 않는다(가이드 16장).
 - API는 같은 트랜잭션에서 partition `FAILED`, run `FAILED_EXTRACT`(스냅샷 오류는 `FAILED_SNAPSHOT_EXPIRED`)로 바꾼다. outbox에는 아무것도 넣지 않는다.
 - 이후 다른 파티션의 chunk 보고는 file만 기록하고 `runStatus=FAILED_EXTRACT`를 반환한다. NiFi는 이 응답에 따라 분기하지 않고 data FlowFile을 끝낸다.
 - 아직 실행 중인 다른 Worker의 Oracle 쿼리는 중단하지 않는다. 결과 파일은 실패 run의 격리 경로에만 남는다(가이드 1장 실패 원칙). claim 요청도 run이 `EXTRACTING`이 아니면 `claimed=false`를 반환하므로 대기 중인 파티션은 조회를 시작하지 않는다.
@@ -416,8 +416,8 @@ NiFi `InvokeHTTP`의 relationship과 1:1로 대응하도록 정한다.
 | 200 | 처리 완료(멱등 재요청 포함) | Original(`Response Body Attribute Name` 설정 시) 또는 Response | 응답 본문으로 분기 |
 | 409 | 소유권·상태 충돌(`CLAIM_MISMATCH`, `CHUNK_CONFLICT`, `DUPLICATE_ACTIVE_RUN`) | No Retry | WARN 이벤트 후 종료. 재시도하지 않음 |
 | 404, 422 | run 없음, 불변식·입력 검증 실패 | No Retry | PG-90 ERROR |
-| 5xx | API 또는 DB 일시 장애 | Retry | `RetryFlowFile` 제한 재시도 |
-| 연결 실패, timeout | 네트워크 장애 | Failure | `RetryFlowFile` 제한 재시도 |
+| 5xx | API 또는 DB 일시 장애 | Retry | relationship 재시도(Retry Count, Penalize backoff) 후 PG-90 |
+| 연결 실패, timeout | 네트워크 장애 | Failure | relationship 재시도 후 PG-90 |
 
 run이 이미 실패했거나 종료된 상태에서 온 chunk 보고는 409가 아니라 200(`recorded=true`, `runStatus=FAILED_*`)으로 응답한다. 정상적인 경합이므로 NiFi에서 오류로 취급하지 않는다.
 
@@ -484,8 +484,8 @@ NiFi Processor 단위 설정은 가이드에 있다. 이 장은 API와 맞물리
 NiFi 쪽 공통 규칙은 다음과 같다.
 
 - `InvokeHTTP`의 `Response Body Attribute Name=api.response`로 응답을 받아 FlowFile content를 보존하고, `${api.response:jsonPath('$.claimed')}`처럼 EL `jsonPath()`로 분기한다.
-- 요청 본문은 `AttributesToJSON`(Destination=flowfile-content) 또는 `JoltTransformJSON`으로 만든다. PG-20에서는 PutHDFS **이후**에 content를 바꿔야 Parquet가 요청 본문으로 전송되지 않는다.
-- `AttributesToJSON`은 모든 값을 문자열로 만든다. API의 Pydantic 모델은 lax 모드로 `"5000"`을 정수로 받아들인다(9.4).
+- 요청 본문은 `ReplaceText`(Always Replace, EL로 JSON 작성, 문자열은 `escapeJson()`) 또는 `JoltTransformJSON`으로 만든다(가이드 2.1). PG-20에서는 PutHDFS **이후**에 content를 바꿔야 Parquet가 요청 본문으로 전송되지 않는다.
+- `ReplaceText` 본문에서 숫자는 따옴표 없이 넣는다. 문자열로 와도 API의 Pydantic 모델은 lax 모드로 `"5000"`을 정수로 받아들인다(9.4).
 - relationship 처리는 5.4 표를 따른다.
 
 ## 9. FastAPI 구현
@@ -651,7 +651,7 @@ class ChunkResult(ApiModel):
 ```
 
 - JSON 필드는 camelCase, Python 속성은 snake_case로 둔다. FastAPI는 응답을 alias(camelCase)로 직렬화한다.
-- Pydantic v2 기본 lax 모드는 `"5000"` 같은 숫자 문자열을 `int`로 받아들이므로, NiFi `AttributesToJSON`의 문자열 값을 그대로 받을 수 있다.
+- Pydantic v2 기본 lax 모드는 `"5000"` 같은 숫자 문자열을 `int`로 받아들이므로, NiFi가 숫자를 문자열로 보내도(예: Jolt `default`로 넣은 값) 그대로 받을 수 있다.
 - SCN, 경계값처럼 `numeric(38,0)` 범위의 값은 `DecimalStr`로 받아 정밀도 손실을 막고, DB에는 `CAST(:v AS numeric)`로 넣는다.
 - `extra="forbid"`로 알 수 없는 필드를 거부해 NiFi 쪽 attribute 목록 실수를 422로 드러낸다.
 - `coerce_numbers_to_str=True`는 Jolt나 `ExecuteSQLRecord`가 경계값을 JSON 숫자로 보낸 경우에도 `DecimalStr`로 받게 한다. 다만 큰 수는 JSON 숫자로 바뀌는 순간 정밀도를 잃을 수 있으므로 NiFi 쪽에서 `TO_CHAR`로 문자열을 보내는 것이 원칙이다(가이드 7.4).
@@ -943,7 +943,7 @@ logging:
 - API는 상태를 갖지 않으므로 2개 이상 인스턴스를 LB 뒤에 둔다. 모든 정합성은 PostgreSQL 트랜잭션(run 행 잠금, CAS, unique index)으로 보장한다.
 - dispatcher와 sweeper는 별도 worker 프로세스로 2개 띄운다(9.2). 4.3의 lease(`SKIP LOCKED`)와 sweeper advisory lock이 중복 처리를 막으므로 리더 선출이 필요 없다.
 - worker가 모두 내려가면 완료 판정은 계속되지만 검증 flow 호출과 timeout 정리가 멈춘다. `lca_dispatch_backlog{status="PENDING"}`의 지속 증가를 알림 조건으로 둔다.
-- API가 모두 내려가도 Oracle 조회와 HDFS 기록은 진행된다. 보고는 NiFi `RetryFlowFile`이 재시도하며, 재시도를 다 쓰면 run은 sweeper가 `TIMED_OUT`으로 정리한다. 따라서 `CONTROL.API.RETRY.MAX`와 penalty는 API 재기동 시간보다 길게 잡는다.
+- API가 모두 내려가도 Oracle 조회와 HDFS 기록은 진행된다. 보고는 NiFi `InvokeHTTP`의 relationship 재시도가 다시 보내며, 재시도를 다 쓰면 run은 sweeper가 `TIMED_OUT`으로 정리한다. 따라서 Retry Count(`CONTROL.API.RETRY.MAX` 기준값)와 backoff는 API 재기동 시간보다 길게 잡는다(가이드 9.3).
 - PostgreSQL이 단일 장애점이라는 점은 가이드와 같다.
 
 ### 10.2 보안

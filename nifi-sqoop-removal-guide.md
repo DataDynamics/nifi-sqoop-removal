@@ -200,58 +200,95 @@ run 완료 CAS(`EXTRACTING → EXTRACTED_VALIDATED`)에 성공한 단 하나의 
 
 ---
 
-## 2. 최상위 Canvas
+## 2. Canvas 구조
+
+Flow를 하나의 Process Group에 평면으로 그리지 않는다. Job마다 Job PG를 두고, 그 안을 책임별 자식 PG로 나눠 Input/Output Port로 연결한다. API 호출을 받는 PG-05만 모든 Job이 공유하므로 root에 둔다.
+
+```text
+root
+├── PG-05 Control Receiver            공통. PC_SQOOP_REPLACEMENT_COMMON
+└── JOB_ORACLE_INSP_DTL_DAILY          Job PG. PC_JOB_ORACLE_INSP_DTL_DAILY, Controller Service
+    ├── PG-00 Trigger
+    ├── PG-10 Run Coordinator
+    ├── PG-20 Extract Worker
+    ├── PG-40 Staging Validation
+    ├── PG-50 Publish
+    ├── PG-60 Target Validation
+    └── PG-90 Error and Event
+```
 
 ```mermaid
 flowchart LR
-    T[PG-00 Trigger] --> C[PG-10 Run Coordinator]
-    C -->|partition FlowFiles| W[PG-20 Extract Workers]
-    API[[Load Control API<br/>FastAPI]] -->|POST /validate/jobKey| RC[PG-05 Control Receiver]
-    RC -->|validate-in| S[PG-40 Staging Validation]
-    S -->|validated| P[PG-50 Publish]
-    P --> V[PG-60 Target Validation]
-    API -.->|POST /reissue/jobKey 선택| RC
-    RC -.->|reissue-in| W
-
-    C -- runs, manifest --> API
-    W -- claim, chunks, fail --> API
-    S -- start, validations --> API
-    P -- publish claim, result --> API
-    V -- validations, success --> API
+    API[[Load Control API]] -->|POST /validate, /reissue| R5[PG-05 Control Receiver]
+    subgraph JOB[JOB_ORACLE_INSP_DTL_DAILY]
+        T[PG-00 Trigger] -->|start-run| C[PG-10 Run Coordinator]
+        C -->|partitions, Round Robin| W[PG-20 Extract Worker]
+        VI((validate-in)) --> S[PG-40 Staging Validation]
+        RI((reissue-in)) -->|Round Robin| W
+        S -->|staging-valid| P[PG-50 Publish]
+        P -->|published| V[PG-60 Target Validation]
+        E[PG-90 Error and Event]
+    end
+    R5 -->|validate| VI
+    R5 -->|reissue| RI
+    T & C & W & S & P & V -.->|errors| E
+    C & W & S & P & V -->|InvokeHTTP| API
+    E -->|run, partition fail| API
     API --- M[(PostgreSQL nifi_ops)]
-
-    C -. event .-> A[PG-90 Audit and Notify]
-    W -. event .-> A
-    S -. event .-> A
-    P -. event .-> A
-    V -. event .-> A
-    A --- M
-
-    O[(Oracle Source)] --- C
-    O --- W
-    H[(HDFS)] --- W
-    H --- S
-    Q[(Hive)] --- S
-    Q --- P
-    Q --- V
 ```
+
+| 연결 | 출발 | 도착 | Load Balance |
+|---|---|---|---|
+| `start-run` | PG-00 Output Port | PG-10 Input Port | 없음 |
+| `partitions` | PG-10 Output Port | PG-20 Input Port | Round Robin |
+| `validate` | PG-05 Output Port(Job별) | Job PG `validate-in` → PG-40 Input Port | 없음 |
+| `reissue` | PG-05 Output Port(Job별) | Job PG `reissue-in` → PG-20 Input Port | Round Robin |
+| `staging-valid` | PG-40 Output Port | PG-50 Input Port | 없음 |
+| `published` | PG-50 Output Port | PG-60 Input Port | 없음 |
+| `errors` | 각 자식 PG Output Port | PG-90 Input Port | 없음 |
 
 가이드 초안의 PG-30 Partition and Run Gate(Wait/Notify)와 PG-70 Recovery Monitor는 없다. 완료 판정은 API가 하고, 검증 flow는 API의 호출을 PG-05가 받아 시작한다(9장). 복구는 API sweeper가 담당한다(13장).
 
-실행 정책은 다음과 같다.
+참조 구현은 `poc/build_flow_v3.py`다. 이 빌더는 Job이 하나뿐이라 PG-05를 Job PG 안에 두었다. 운영에서는 위 구조처럼 root로 옮긴다.
+
+### 2.1 구현 규칙
+
+모든 PG에 다음 규칙을 적용한다. NiFi 2.4.0 PoC에서 이 규칙으로 같은 범위(PG-00, 10, 20, 05, 40 입구, 90)의 Processor를 85개에서 41개로 줄였다.
+
+1. **재시도**: Processor relationship 재시도(Retry Count, Retried Relationships, Backoff Policy=Penalize FlowFile, Max Backoff Period)를 쓴다. `RetryFlowFile`은 두지 않는다. 재시도를 다 쓴 FlowFile은 해당 relationship 연결로 간다(16장).
+2. **오류 경로**: 실패 지점마다 오류용 `UpdateAttribute`를 두지 않는다. 단계 입구에 이미 있는 `UpdateAttribute`가 `load.stage`를 지정하고, 모든 실패 relationship은 PG의 `errors` Output Port로 보낸다. PG-90이 `load.stage`와 Processor가 남긴 attribute로 오류 코드와 메시지를 만들고, 필요한 실패 보고 API를 호출한다(14장).
+3. **요청 본문**: API 요청 본문은 `ReplaceText`(Replacement Strategy=Always Replace) 하나로 만든다. EL로 JSON을 쓰고 문자열 값은 `escapeJson()`으로 감싼다. `UpdateAttribute` + `AttributesToJSON` 조합은 쓰지 않는다.
+4. **이벤트**: 상태 전이 이벤트는 API가 같은 트랜잭션에서 기록한다. NiFi는 오류와 경고만 기록한다(14.4).
+5. **판정**: 판정은 API가 한다. NiFi는 API 응답의 boolean(`claimed`, `started`, `stageValidated`, `success`)으로만 분기하고, chunk 보고처럼 판정 결과를 담은 응답은 다시 해석하지 않는다.
+6. **attribute 평가 순서**: 하나의 `UpdateAttribute` 안에서 방금 만든 attribute를 참조하지 않는다. 모든 속성은 들어온 attribute 기준으로 평가된다(8.2).
+
+자식 PG는 Parameter Context를 상속하지 않는다. Job PG와 모든 자식 PG에 같은 `PC_JOB_<JOB_NAME>`을 지정한다. Controller Service는 Job PG에 두고 자식 PG가 공유한다. Trigger(PG-00의 00)는 DISABLED로 배포해 Job PG를 시작할 때 즉시 실행되지 않게 한다.
+
+### 2.2 PG별 Processor 수
+
+| PG | Processor | PoC 검증 |
+|---|---:|---|
+| PG-00 Trigger | 3 | 검증 |
+| PG-10 Run Coordinator | 10 | 검증(PostgreSQL 원천이라 SCN 조회 2개를 뺀 8개) |
+| PG-20 Extract Worker | 9 (+ 선택 `ValidateRecord` 1) | 검증(`ValidateRecord` 제외) |
+| PG-05 Control Receiver | 6 | 검증(Job PG 안에 둔 형태) |
+| PG-40 Staging Validation | 15 | 입구 7개만 검증(Hive 없음) |
+| PG-50 Publish | 12 | 미검증 |
+| PG-60 Target Validation | 7 | 미검증 |
+| PG-90 Error and Event | 8 (+ 선택 DLQ·알림 2) | 검증(선택 제외) |
+
+### 2.3 실행 정책
 
 | 영역 | 실행 노드 | Concurrent Tasks |
 |---|---|---:|
-| Trigger, Coordinator | Primary Node | 1 |
-| Oracle Extract, PutHDFS, API 보고 | All Nodes | 노드당 `WORKER.CONCURRENT.TASKS` 기준값 |
-| Control Receiver(`HandleHttpRequest`), Staging Validation, Publish, Target Validation | All Nodes | 1 |
-| Audit writer | All Nodes | 2~4 |
+| PG-00 Trigger, PG-10 Coordinator | Primary Node | 1 |
+| PG-20 Worker(Oracle 조회, PutHDFS, API 보고) | All Nodes | 노드당 `WORKER.CONCURRENT.TASKS` 기준값 |
+| PG-05 Control Receiver, PG-40, PG-50, PG-60 | All Nodes | 1 |
+| PG-90 Error and Event | All Nodes | 2~4 |
 
 API는 NiFi LB 주소 하나로 검증 flow를 호출하므로 어느 노드가 요청을 받을지 정할 수 없다. 그래서 PG-40~60은 All Nodes로 스케줄한다. Primary Node로 제한하면 다른 노드가 받은 FlowFile이 처리되지 않는다. 중복 실행은 Primary Node가 아니라 API의 CAS(`/validation/start`, `/publish/claim`)가 막는다.
 
-Coordinator에서 Worker로 가는 Connection은 `Round Robin` Load Balance를 설정한다. 그 외 제어 Connection은 load balance를 사용하지 않는다.
-
-Concurrent Tasks는 정수 스케줄링 설정이라 Parameter(`#{...}`)나 Expression Language(`${...}`)를 참조할 수 없다. REST API에서도 정수 필드로 정의되어 있다. `WORKER.CONCURRENT.TASKS`는 환경별 기준값으로 관리하고, 배포 스크립트나 운영 절차에서 해당 Processor의 Concurrent Tasks에 정수로 입력한다.
+Concurrent Tasks와 Retry Count는 정수 스케줄링 설정이라 Parameter(`#{...}`)나 Expression Language(`${...}`)를 참조할 수 없다. REST API에서도 정수 필드로 정의되어 있다. `WORKER.CONCURRENT.TASKS`, `CONTROL.API.RETRY.MAX` 같은 값은 환경별 기준값으로 관리하고, 배포 스크립트나 운영 절차에서 해당 Processor에 정수로 입력한다.
 
 ---
 
@@ -264,7 +301,7 @@ Concurrent Tasks는 정수 스케줄링 설정이라 Parameter(`#{...}`)나 Expr
 | `CONTROL.API.URL` | `https://load-control.internal:8443/v1` | N | Load Control API base URL |
 | `CONTROL.API.AUTHORIZATION` | 미표시(`Bearer <token>`) | Y | API 인증 헤더 값 전체(role=`nifi`). Sensitive 속성은 Parameter 참조 하나만 값으로 가질 수 있어 `Bearer `까지 Parameter에 넣는다(9.2) |
 | `CONTROL.API.TIMEOUT` | `30 sec` | N | `InvokeHTTP` Socket Read Timeout |
-| `CONTROL.API.RETRY.MAX` | `5` | N | API 호출 재시도 횟수. penalty와 곱해 API 재기동 시간보다 길게 |
+| `CONTROL.API.RETRY.MAX` | `5` | N | `InvokeHTTP` Retry Count 기준값. Retry Count는 정수 설정이라 Parameter를 참조할 수 없으므로 배포 시 입력한다. backoff와 곱해 API 재기동 시간보다 길게(9.3) |
 | `CONTROL.LISTEN.PORT` | `9443` | N | API→NiFi 호출 수신 포트(PG-05). 모든 Job이 공유 |
 | `META.JDBC.URL` | `jdbc:postgresql://meta:5432/nifiops` | N | 관리 DB. PG-90 이벤트 기록 전용 |
 | `META.JDBC.USER` | `nifi_runtime` | N | `load_event` INSERT 권한만 가진 계정 |
@@ -285,7 +322,7 @@ Concurrent Tasks는 정수 스케줄링 설정이라 Parameter(`#{...}`)나 Expr
 | `EXTRACT.FETCH.SIZE` | `5000` | N | JDBC fetch size |
 | `EXTRACT.ROWS.PER.FILE` | `500000` | N | chunk 행 수, 부하 시험으로 조정 |
 | `EXTRACT.QUERY.TIMEOUT` | `60 min` | N | 파티션 query timeout |
-| `PARTITION.RETRY.MAX` | `3` | N | 일시 오류 재시도 |
+| `PARTITION.RETRY.MAX` | `3` | N | PutHDFS Retry Count 기준값(배포 시 입력). 파티션 쿼리는 재시도하지 않는다(16장) |
 | `ALLOW.EMPTY.SOURCE` | `false` | N | 0건 overwrite 방지. `POST /runs`로 API에도 전달 |
 | `FAILED.RETENTION.DAYS` | `14` | N | 실패 staging 보존 |
 | `SUCCESS.RETENTION.DAYS` | `3` | N | 성공 staging 보존 |
@@ -301,8 +338,7 @@ run timeout, stale 판정, dispatch 재시도 같은 제어 설정은 NiFi Param
 | `SRC.TABLE` | `INSP_DTL` | Oracle table |
 | `SRC.COLUMNS` | `COL_A,COL_B,...,INSP_DTL_SEQ` | 순서를 고정한 컬럼 목록 |
 | `SRC.SPLIT.COLUMN` | `INSP_DTL_SEQ` | split-by 대체 컬럼 |
-| `SRC.BASE.WHERE` | `BASE_DT = ?` | 승인된 고정 조건 템플릿 |
-| `SRC.BUSINESS.KEY.TYPE` | `91` | JDBC type, DATE=91 등 |
+| `SRC.BASE.WHERE` | `BASE_DT = TO_DATE('${load.business.key}', 'YYYY-MM-DD')` | 승인된 고정 조건 템플릿. 업무키는 PG-00에서 형식을 고정한 값만 들어간다(6.2) |
 | `PARTITION.COUNT` | `8` | 논리 파티션 수 |
 | `SPLIT.NULL.POLICY` | `FAIL` | `FAIL` 또는 `SEPARATE` |
 | `HIVE.STAGE.DB` | `STG_DB` | 임시 external DB |
@@ -316,7 +352,7 @@ run timeout, stale 판정, dispatch 재시도 같은 제어 설정은 NiFi Param
 | `DQ.STAGE.SQL` | 대응 Hive SQL | 동일 의미의 집계 |
 | `DQ.TARGET.SQL` | 대응 target SQL | 게시 후 검증 |
 
-JDBC type 주요 값은 `NUMERIC=2`, `BIGINT=-5`, `VARCHAR=12`, `DATE=91`, `TIMESTAMP=93`이다. 실제 Oracle 컬럼 타입에 맞춰 지정한다.
+업무키를 JDBC bind parameter(`sql.args.N`)로 넘기지 않는다. `sql.args.N` attribute는 FlowFile을 따라다니며, 이후 같은 FlowFile로 실행하는 parameter 없는 SQL(예: SCN 조회)에도 적용되어 parameter 개수 오류를 일으킬 수 있다. 대신 PG-00에서 업무키 형식을 정규식으로 고정하고 EL로 SQL에 넣는다.
 
 ---
 
@@ -731,9 +767,9 @@ NiFi 계정이 원장을 직접 바꿀 수 없어야 "원장 writer는 API 하�
 | `load.run.id` | API `POST /runs` 응답 | UUID, 실행 불변 키 |
 | `load.job.key` | Trigger | `ORACLE_INSP_DTL_DAILY` |
 | `load.business.key` | Trigger | `2026-09-28` |
-| `load.snapshot.scn` | Snapshot query | 숫자 문자열 |
-| `load.source.count` | Source metrics | 전체 source count |
-| `load.partition.planned` | Coordinator | `#{PARTITION.COUNT}`(+NULL 파티션), manifest 요청의 `plannedPartitionCount` |
+| `load.stage` | 각 단계 입구의 `UpdateAttribute` | 현재 단계. PG-90이 오류 분류와 실패 보고 대상 결정에 쓴다(14.2) |
+| `load.snapshot.scn` | PG-10 SCN 조회, 재발행 본문 | 숫자 문자열 |
+| `load.source.count` | `/validation/start` 응답 | 전체 source count |
 | `load.hdfs.path` | API `POST /runs` 응답 | run 전용 root |
 | `load.stage.table` | API `POST /runs` 응답 | 안전한 run suffix 포함 |
 | `load.dispatch.id` | 검증 호출 수신 | outbox dispatch UUID, `/validation/start`에 전달 |
@@ -744,17 +780,12 @@ NiFi 계정이 원장을 직접 바꿀 수 없어야 "원장 writer는 API 하�
 | `partition.is.null` | Manifest 응답 split | NULL 전용 파티션 여부 |
 | `partition.expected.rows` | Manifest 응답 split | 동일 SCN 예상 건수 |
 | `partition.claim.token` | Worker | 중복 worker 방지 UUID |
-| `partition.retry.count` | RetryFlowFile | 재시도 횟수 |
-| `chunk.index` | Extract output | `${fragment.index}` |
-| `chunk.count` | Extract output | `${fragment.count}`, API 보고의 `chunkCount` |
-| `chunk.record.count` | Extract output | `${record.count}` |
-| `api.response` | `InvokeHTTP` | 2xx 응답 본문(`Response Body Attribute Name`), EL `jsonPath()`로 분기 |
-| `invokehttp.status.code` | `InvokeHTTP` | HTTP 상태 코드, 409/422 구분 |
-| `invokehttp.response.body` | `InvokeHTTP` | 2xx가 아닐 때의 응답 본문, `$.code`로 오류 코드 확인 |
-| `event.name` | 각 단계 | 구조화 이벤트 이름 |
-| `error.stage` | 오류 경로 | `ORACLE_EXTRACT`, `HDFS_WRITE` 등 |
-| `error.class` | 오류 경로 | `TRANSIENT`, `NON_RETRYABLE`, `VALIDATION` |
-| `error.message` | 오류 경로 | 비밀값을 제거한 메시지 |
+| `chunk.index` | PG-20 35 | `${fragment.index}`, 이벤트 기록용 |
+| `api.response` | `InvokeHTTP` | 응답 본문(`Response Body Attribute Name`). EL `jsonPath()`로 분기한다. 2xx가 아닌 응답의 본문도 여기에 들어간다(9.3) |
+| `invokehttp.status.code` | `InvokeHTTP` | HTTP 상태 코드. 409/422 구분 |
+| `invokehttp.java.exception.class` | `InvokeHTTP` | 연결 실패·timeout 시 예외 클래스. PG-90이 `API_UNREACHABLE`로 분류 |
+| `executesql.error.message` | `ExecuteSQLRecord` | SQL 실패 메시지. PG-90이 `ORA-nnnnn` 코드를 추출 |
+| `error.stage`, `error.code`, `error.class`, `error.message` | PG-90 90 | 정규화한 오류 정보(14.2). 각 PG에서는 만들지 않는다 |
 
 SCN, partition bound, count는 숫자 정규식으로 검증한 뒤 SQL에 사용한다. table/column/where 문자열을 외부 FlowFile에서 받지 않는다.
 
@@ -768,21 +799,23 @@ Parameter 참조는 Expression Language의 문자열 리터럴 안에서 치환�
 
 ```mermaid
 flowchart LR
-    A[00_Generate_Schedule<br/>GenerateFlowFile] --> B[01_Set_Trigger_Attributes<br/>UpdateAttribute]
+    A[00_Generate_Trigger<br/>GenerateFlowFile] --> B[01_Set_Trigger_Attributes<br/>UpdateAttribute]
     B --> C{02_Validate_Trigger<br/>RouteOnAttribute}
-    C -->|valid| D[Output: start-run]
-    C -->|invalid| E[PG-90 Fatal Error]
+    C -->|valid| D((start-run))
+    C -->|unmatched| E((errors))
 ```
 
 ### 6.2 주요 Processor 설정
 
 | ID | Processor | Scheduling | 주요 Properties | Relationship |
 |---|---|---|---|---|
-| 00 | `GenerateFlowFile` | Primary, 1, CRON | Custom Text=`{}`, Unique FlowFiles=true | success→01 |
-| 01 | `UpdateAttribute` | Primary, 1, input driven | `load.job.key=#{JOB.KEY}`, `load.business.key=${now():format('yyyy-MM-dd','Asia/Seoul')}`, `load.trigger.type=SCHEDULE` | success→02 |
-| 02 | `RouteOnAttribute` | Primary, 1 | 업무키 정규식, Job key와 필수 Parameter 존재 여부 검증 | valid→PG-10, unmatched→PG-90 Fatal |
+| 00 | `GenerateFlowFile` | Primary, 1, CRON | Custom Text=`{}`. DISABLED로 배포한 뒤 운영 전환 시 enable | success→01 |
+| 01 | `UpdateAttribute` | Primary, 1 | `load.job.key=#{JOB.KEY}`, `load.business.key=${now():format('yyyy-MM-dd','Asia/Seoul')}`, `load.trigger.type=SCHEDULE`, `load.stage=RUN_CREATE` | success→02 |
+| 02 | `RouteOnAttribute` | Primary, 1 | `valid=${load.business.key:matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$')}` | valid→`start-run`, unmatched→`errors` |
 
-외부에서 업무일자를 전달받는 경우 `HandleHttpRequest` 등을 직접 worker에 연결하지 않고 인증된 상위 orchestration flow가 이 Process Group의 Input Port를 호출하도록 한다.
+업무키는 `SRC.BASE.WHERE`를 통해 SQL에 들어가므로(3.2) 02의 정규식이 SQL 주입을 막는 경계다. API도 `businessKey` 형식을 검증하지만, API의 허용 문자 범위가 SQL에 넣기에는 넓으므로 02를 생략하지 않는다.
+
+외부에서 업무일자를 전달받는 경우 `HandleHttpRequest` 등을 직접 worker에 연결하지 않고, 인증된 상위 orchestration flow가 이 Process Group의 Input Port를 호출하도록 한다.
 
 ---
 
@@ -792,117 +825,134 @@ flowchart LR
 
 ```mermaid
 flowchart TD
-    I[Input: start-run] --> A[10_Build_Run_Request<br/>AttributesToJSON]
-    A --> B[11_Create_Run<br/>InvokeHTTP POST /runs]
-    B -->|Original 2xx| BA[11A_Set_Run_Attrs<br/>UpdateAttribute]
-    B -->|No Retry| DUP{11D_Route_Status<br/>RouteOnAttribute}
-    DUP -->|409| DW[PG-90 DUPLICATE_ACTIVE_RUN WARN]
-    DUP -->|기타| X0[PG-90 Fatal Error]
-    B -->|Retry or Failure| BR[11R_RetryFlowFile]
-    BR -->|retry| B
-    BR -->|exceeded| X0
-    BA --> C[12_Query_Current_SCN<br/>ExecuteSQLRecord]
-    C --> D[13_Extract_SCN<br/>EvaluateJsonPath]
-    D --> E{14_Validate_SCN<br/>RouteOnAttribute}
-    E -->|valid| F[15_Query_Source_Metrics<br/>ExecuteSQLRecord]
-    E -->|invalid| X[25_Report_Run_Fail<br/>InvokeHTTP POST /runs/id/fail]
-    F --> G[16_Extract_Source_Metrics<br/>EvaluateJsonPath]
-    G --> H{17_Source_Precheck<br/>RouteOnAttribute}
-    H -->|empty blocked or null invalid| X
-    H -->|valid| K[19_Query_Partition_Manifest<br/>ExecuteSQLRecord]
-    K --> J[20_Build_Manifest_Request<br/>JoltTransformJSON]
-    J --> M[21_Register_Manifest<br/>InvokeHTTP POST /runs/id/manifest]
-    M -->|Response 2xx| L[23_Split_Dispatch_Partitions<br/>SplitJson]
-    M -->|No Retry 422| XM[PG-90 FAILED_MANIFEST<br/>API가 상태 기록 완료]
-    M -->|Retry or Failure| MR[21R_RetryFlowFile]
-    MR -->|retry| M
-    MR -->|exceeded| X
-    L -->|split| P[24_Extract_Partition_Attrs<br/>EvaluateJsonPath]
-    P --> OUT[Output: partitions]
-    X --> XE[PG-90 RUN_FAILED]
+    I((start-run)) --> A[11_Build_Run_Body<br/>ReplaceText]
+    A --> B[12_Create_Run<br/>InvokeHTTP POST /runs]
+    B -->|Original 2xx| C[13_Set_Run_Attrs<br/>UpdateAttribute]
+    C --> D[14_Query_Current_SCN<br/>ExecuteSQLRecord]
+    D --> E[15_Extract_SCN<br/>EvaluateJsonPath]
+    E --> F[16_Query_Source_Manifest<br/>ExecuteSQLRecord]
+    F --> G[17_Build_Manifest_Body<br/>JoltTransformJSON]
+    G --> H[18_Register_Manifest<br/>InvokeHTTP POST /runs/id/manifest]
+    H -->|Response 2xx| J[19_Split_Dispatch_Partitions<br/>SplitJson]
+    J -->|split| K[20_Extract_Partition_Attrs<br/>EvaluateJsonPath]
+    K --> OUT((partitions))
+    B & D & E & F & G & H & J & K -.->|실패, 재시도 소진| ERR((errors))
 ```
 
 가이드 초안과 달라진 점은 다음과 같다.
 
 - run lock INSERT, snapshot 저장, manifest 불변식 검사, 파티션 행별 INSERT, 0건 파티션 처리, run-control 생성이 없다. 모두 API 두 번 호출(`POST /runs`, `POST /manifest`)로 대체된다.
-- 파티션 행별 `PutSQL`(Fragmented=true)이 없어지므로, PoC에서 재현된 fragment livelock이 구조적으로 생기지 않는다.
-- run을 만든 뒤 SCN이나 source 검증에서 실패하면 반드시 25에서 `POST /runs/{id}/fail`을 호출한다. 호출하지 않으면 run이 `CREATED`로 남아 active run lock을 잡고, API sweeper의 timeout까지 같은 업무키를 다시 실행할 수 없다.
+- 원천 지표와 파티션 경계·건수를 SQL 한 문장(16)으로 계산한다. 별도의 source metric 조회, 추출, 사전 검사(0건, NULL split, 합계)는 두지 않는다. 사전 검사는 API의 manifest 불변식 검사가 같은 조건으로 수행한다(7.4).
+- 파티션 행별 `PutSQL`(Fragmented=true)이 없으므로, PoC에서 재현된 fragment livelock이 구조적으로 생기지 않는다.
+- run을 만든 뒤 실패하면 run을 `FAILED_MANIFEST`로 보고해야 한다. 보고하지 않으면 run이 `CREATED`로 남아 active run lock을 잡고, API sweeper의 timeout까지 같은 업무키를 다시 실행할 수 없다. 이 보고는 PG-10이 아니라 PG-90이 `load.stage=MANIFEST`를 보고 수행한다(14.2).
 
 ### 7.2 주요 Processor 설정
 
 | ID | Processor | Scheduling | 주요 Properties | Relationship |
 |---|---|---|---|---|
-| 10 | `UpdateAttribute` + `AttributesToJSON` | Primary, 1 | `jobKey=${load.job.key}`, `businessKey=${load.business.key}`, `hdfsRoot=#{HDFS.STAGE.ROOT}`, `stageTablePrefix=#{HIVE.STAGE.TABLE.PREFIX}`, `allowEmptySource=#{ALLOW.EMPTY.SOURCE}` 설정 후 Destination=flowfile-content, 위 다섯 attribute만 포함 | success→11 |
-| 11 | `InvokeHTTP` | Primary, 1 | 9.2 공통 설정, URL=`#{CONTROL.API.URL}/runs`, `Response Body Attribute Name=api.response` | Original→11A, No Retry→11D, Retry/Failure→11R, Response→auto-terminate |
-| 11A | `UpdateAttribute` | Primary, 1 | `load.run.id=${api.response:jsonPath('$.runId')}`, `load.hdfs.path=${api.response:jsonPath('$.hdfsRunPath')}`, `load.stage.table=${api.response:jsonPath('$.stageTable')}` | success→12 |
-| 11D | `RouteOnAttribute` | Primary, 1 | `duplicate=${invokehttp.status.code:equals('409')}` | duplicate→PG-90 WARN 후 종료, unmatched→PG-90 Fatal |
-| 11R, 21R | `RetryFlowFile` | Primary, 1 | Maximum=`#{CONTROL.API.RETRY.MAX}`, Penalize=true | retry→재호출, exceeded→PG-90 또는 25 |
-| 12 | `ExecuteSQLRecord` | Primary, 1 | `CS_DBCP_ORACLE`, current SCN SQL, `CS_JSON_WRITER_ARRAY`, Max Rows=0 | success→13, failure→25 |
-| 13 | `EvaluateJsonPath` | Primary, 1 | `load.snapshot.scn=$[0].SNAPSHOT_SCN`, Destination=attribute | matched→14, failure/unmatched→25 |
-| 14 | `RouteOnAttribute` | Primary, 1 | `${load.snapshot.scn:matches('^[0-9]+$')}` | valid→15, unmatched→25 |
-| 15 | `ExecuteSQLRecord` | Primary, 1 | `CS_DBCP_ORACLE`, source metrics SQL, JSON array writer, Query Timeout | success→16, failure→25 |
-| 16 | `EvaluateJsonPath` | Primary, 1 | `load.source.count`, `load.source.min`, `load.source.max`, `load.source.null.count`와 DQ 값을 attribute로 추출 | matched→17, failure/unmatched→25 |
-| 17 | `RouteOnAttribute` | Primary, 1 | empty source, NULL 정책, min/max 유효성 | valid→19, invalid→25 |
-| 19 | `UpdateAttribute` + `ExecuteSQLRecord` | Primary, 1 | `load.partition.planned` 설정 후 동일 SCN manifest SQL(7.4), JSON array writer, Max Rows=0, Output Batch=0 | success→20, failure→25 |
-| 20 | `JoltTransformJSON` | Primary, 1 | manifest 배열을 `partitions`로 감싸고 SCN·metric attribute를 상위 필드로 추가(아래 spec) | success→21, failure→25 |
-| 21 | `InvokeHTTP` | Primary, 1 | 9.2 공통 설정, URL=`#{CONTROL.API.URL}/runs/${load.run.id}/manifest`. `Response Body Attribute Name`은 비워 응답을 content로 받음 | Response→23, No Retry→PG-90 `FAILED_MANIFEST`, Retry/Failure→21R, Original→auto-terminate |
-| 23 | `SplitJson` | Primary, 1 | JsonPath Expression=`$.dispatchPartitions` | split→24, original→terminate, failure→PG-90 |
-| 24 | `EvaluateJsonPath` | Primary, 1 | `partition.id=$.partitionId`, `partition.lower=$.lowerBound`, `partition.upper=$.upperBound`, `partition.upper.inclusive=$.upperInclusive`, `partition.is.null=$.isNullPartition`, `partition.expected.rows=$.expectedRowCount` | matched→Worker Output Port, failure/unmatched→PG-90 |
-| 25 | `AttributesToJSON` + `InvokeHTTP` | Primary, 1 | 본문 `expectedStatus=CREATED`, `failStatus=FAILED_MANIFEST`, `errorStage`, `errorCode`, `message`. URL=`#{CONTROL.API.URL}/runs/${load.run.id}/fail` | Original→PG-90 `RUN_FAILED`, Retry/Failure→재시도 후 PG-90 ERROR |
+| 11 | `ReplaceText` | Primary, 1 | 본문 `{"jobKey":"${load.job.key}","businessKey":"${load.business.key}","hdfsRoot":"#{HDFS.STAGE.ROOT}","stageTablePrefix":"#{HIVE.STAGE.TABLE.PREFIX}","allowEmptySource":#{ALLOW.EMPTY.SOURCE}}` | success→12 |
+| 12 | `InvokeHTTP` | Primary, 1 | 9.2 공통 설정, URL=`#{CONTROL.API.URL}/runs`, `Response Body Attribute Name=api.response` | Original→13, No Retry/Retry/Failure→`errors` |
+| 13 | `UpdateAttribute` | Primary, 1 | `load.run.id=${api.response:jsonPath('$.runId')}`, `load.hdfs.path=${api.response:jsonPath('$.hdfsRunPath')}`, `load.stage.table=${api.response:jsonPath('$.stageTable')}`, `load.stage=MANIFEST` | success→14 |
+| 14 | `ExecuteSQLRecord` | Primary, 1 | `CS_DBCP_ORACLE`, `SELECT TO_CHAR(CURRENT_SCN) AS SNAPSHOT_SCN FROM V$DATABASE`, `CS_JSON_WRITER_ARRAY` | success→15, failure→`errors` |
+| 15 | `EvaluateJsonPath` | Primary, 1 | `load.snapshot.scn=$[0].SNAPSHOT_SCN`, Destination=flowfile-attribute | matched→16, unmatched/failure→`errors` |
+| 16 | `ExecuteSQLRecord` | Primary, 1 | `CS_DBCP_ORACLE`, 원천 지표+manifest SQL(7.3), JSON array writer, Max Wait Time=`#{EXTRACT.QUERY.TIMEOUT}` | success→17, failure→`errors` |
+| 17 | `JoltTransformJSON` | Primary, 1 | 0번 행에서 원천 지표를 꺼내고 배열을 `partitions`로 감싼다(아래 spec) | success→18, failure→`errors` |
+| 18 | `InvokeHTTP` | Primary, 1 | 9.2 공통 설정, URL=`#{CONTROL.API.URL}/runs/${load.run.id}/manifest`. `Response Body Attribute Name`은 비워 응답을 content로 받음 | Response→19, No Retry/Retry/Failure→`errors`, Original→auto-terminate |
+| 19 | `SplitJson` | Primary, 1 | JsonPath Expression=`$.dispatchPartitions` | split→20, failure→`errors` |
+| 20 | `EvaluateJsonPath` | Primary, 1 | `partition.id=$.partitionId`, `partition.lower=$.lowerBound`, `partition.upper=$.upperBound`, `partition.upper.inclusive=$.upperInclusive`, `partition.is.null=$.isNullPartition`, `partition.expected.rows=$.expectedRowCount` | matched→`partitions`, unmatched/failure→`errors` |
 
-20 `JoltTransformJSON` spec 예시(Jolt Specification은 FlowFile attribute EL을 지원한다):
+`V$DATABASE` 조회 권한이 없으면 14를 `SELECT TO_CHAR(DBMS_FLASHBACK.GET_SYSTEM_CHANGE_NUMBER) AS SNAPSHOT_SCN FROM DUAL`로 바꾼다. 16은 SCN이 숫자가 아니면 SQL 오류로 실패하도록 `${load.snapshot.scn:matches('^[0-9]+$'):ifElse(${load.snapshot.scn},'INVALID_SCN')}`로 넣는다. 숫자 검증용 `RouteOnAttribute`를 따로 두지 않는다.
+
+17 `JoltTransformJSON` spec(Jolt Specification은 FlowFile attribute EL을 지원한다). shift는 `"0"`과 `"*"`가 같은 키에 맞으면 `"0"`만 적용하므로, 0번 행에도 파티션 필드 매핑을 함께 둔다.
 
 ```json
 [
   { "operation": "shift",
-    "spec": { "*": {
-      "PARTITION_ID": "partitions[&1].partitionId",
-      "LOWER_BOUND": "partitions[&1].lowerBound",
-      "UPPER_BOUND": "partitions[&1].upperBound",
-      "UPPER_INCLUSIVE": "partitions[&1].upperInclusive",
-      "IS_NULL_PARTITION": "partitions[&1].isNullPartition",
-      "EXPECTED_ROW_COUNT": "partitions[&1].expectedRowCount" } } },
-  { "operation": "default",
     "spec": {
-      "snapshotScn": "${load.snapshot.scn}",
-      "sourceCount": "${load.source.count}",
-      "sourceNullSplitCount": "${load.source.null.count}",
-      "sourceMinSplit": "${load.source.min}",
-      "sourceMaxSplit": "${load.source.max}",
-      "plannedPartitionCount": "${load.partition.planned}" } }
+      "0": {
+        "PARTITION_ID": "partitions[&1].partitionId",
+        "LOWER_BOUND": "partitions[&1].lowerBound",
+        "UPPER_BOUND": "partitions[&1].upperBound",
+        "UPPER_INCLUSIVE": "partitions[&1].upperInclusive",
+        "IS_NULL_PARTITION": "partitions[&1].isNullPartition",
+        "EXPECTED_ROW_COUNT": "partitions[&1].expectedRowCount",
+        "SOURCE_COUNT": "sourceCount",
+        "SOURCE_NULL_SPLIT_COUNT": "sourceNullSplitCount",
+        "SOURCE_MIN": "sourceMinSplit",
+        "SOURCE_MAX": "sourceMaxSplit",
+        "PLANNED_PARTITION_COUNT": "plannedPartitionCount",
+        "AMOUNT_SUM": "sourceMetrics.AMOUNT_SUM",
+        "MIN_TS": "sourceMetrics.MIN_TS",
+        "MAX_TS": "sourceMetrics.MAX_TS" },
+      "*": {
+        "PARTITION_ID": "partitions[&1].partitionId",
+        "LOWER_BOUND": "partitions[&1].lowerBound",
+        "UPPER_BOUND": "partitions[&1].upperBound",
+        "UPPER_INCLUSIVE": "partitions[&1].upperInclusive",
+        "IS_NULL_PARTITION": "partitions[&1].isNullPartition",
+        "EXPECTED_ROW_COUNT": "partitions[&1].expectedRowCount" } } },
+  { "operation": "default",
+    "spec": { "snapshotScn": "${load.snapshot.scn}" } }
 ]
 ```
 
-`load.partition.planned`는 19 앞의 `UpdateAttribute`에서 `#{PARTITION.COUNT}`로 설정한다. `SPLIT.NULL.POLICY=SEPARATE`이면 Parameter를 먼저 attribute로 옮긴 뒤 `${load.partition.planned:plus(1)}`로 1을 더한다(5장).
+`InvokeHTTP` 응답 처리 규칙: `Response Body Attribute Name`을 설정하면 응답 본문은 **Original** relationship의 FlowFile에 attribute로 붙는다. 응답 본문을 content로 받아야 하는 18만 Response relationship을 쓴다. 2xx가 아니면 요청 FlowFile이 Retry(5xx)나 No Retry(4xx)로 가며, 재시도를 다 쓰면 `errors`로 간다.
 
-`InvokeHTTP` 응답 처리 규칙: `Response Body Attribute Name`을 설정하면 2xx 응답 본문은 **Original** relationship의 FlowFile에 attribute로 붙는다. 응답 본문을 content로 받아야 하는 21만 Response relationship을 쓴다. 2xx가 아니면 요청 FlowFile이 Retry(5xx)나 No Retry(4xx)로 가며 `invokehttp.status.code`, `invokehttp.response.body` attribute가 붙는다.
+중복 실행은 API가 active run unique index 위반을 409 `DUPLICATE_ACTIVE_RUN`으로 응답해 구분한다. NiFi는 SQLState를 해석하지 않는다. PG-90이 `load.stage=RUN_CREATE`이고 409이면 WARN `DUPLICATE_ACTIVE_RUN`으로 기록한다(14.2).
 
-중복 실행은 API가 active run unique index 위반을 409 `DUPLICATE_ACTIVE_RUN`으로 응답해 구분한다. NiFi는 SQLState를 해석하지 않는다. 연결 장애와 5xx만 11R에서 제한 재시도한다.
+### 7.3 원천 지표와 Manifest SQL
 
-### 7.3 Source metric SQL
-
-`snapshot_scn`은 숫자 검증을 마친 시스템 생성 값이다. 업무값은 bind parameter를 사용한다.
+원천 지표와 파티션별 예상 건수를 한 문장에서 같은 SCN으로 계산한다. 한 문장이므로 지표와 파티션 건수가 같은 시점 값임이 보장된다. 업무 조건은 `#{SRC.BASE.WHERE}`(3.2)로 넣는다.
 
 ```sql
-SELECT COUNT(*) AS SOURCE_COUNT,
-       TO_CHAR(MIN(INSP_DTL_SEQ)) AS MIN_SEQ,
-       TO_CHAR(MAX(INSP_DTL_SEQ)) AS MAX_SEQ,
-       SUM(CASE WHEN INSP_DTL_SEQ IS NULL THEN 1 ELSE 0 END) AS NULL_SEQ_COUNT,
-       COUNT(DISTINCT INSP_DTL_SEQ) AS DISTINCT_SEQ_COUNT
-  FROM APP.INSP_DTL AS OF SCN ${load.snapshot.scn}
- WHERE BASE_DT = ?
+WITH m AS (
+  SELECT COUNT(*) AS source_count,
+         COUNT(*) - COUNT(INSP_DTL_SEQ) AS null_cnt,
+         NVL(MIN(INSP_DTL_SEQ), 0) AS mn,
+         NVL(MAX(INSP_DTL_SEQ), 0) AS mx,
+         NVL(SUM(<BUSINESS_AMOUNT>), 0) AS amount_sum,
+         MIN(<BUSINESS_TIMESTAMP>) AS min_ts,
+         MAX(<BUSINESS_TIMESTAMP>) AS max_ts
+    FROM APP.INSP_DTL AS OF SCN ${load.snapshot.scn}
+   WHERE #{SRC.BASE.WHERE}
+), g AS (
+  SELECT LEVEL - 1 AS pid FROM DUAL CONNECT BY LEVEL <= #{PARTITION.COUNT}
+), b AS (
+  SELECT g.pid,
+         m.mn + FLOOR(g.pid * (m.mx - m.mn + 1) / #{PARTITION.COUNT}) AS lo,
+         CASE WHEN g.pid = #{PARTITION.COUNT} - 1 THEN m.mx
+              ELSE m.mn + FLOOR((g.pid + 1) * (m.mx - m.mn + 1) / #{PARTITION.COUNT}) END AS hi,
+         CASE WHEN g.pid = #{PARTITION.COUNT} - 1 THEN 1 ELSE 0 END AS incl
+    FROM m CROSS JOIN g
+), c AS (
+  SELECT b.*,
+         (SELECT COUNT(*) FROM APP.INSP_DTL AS OF SCN ${load.snapshot.scn} s
+           WHERE #{SRC.BASE.WHERE}
+             AND s.INSP_DTL_SEQ >= b.lo
+             AND (s.INSP_DTL_SEQ < b.hi OR (b.incl = 1 AND s.INSP_DTL_SEQ = b.hi))) AS cnt
+    FROM b
+)
+SELECT LPAD(c.pid, 4, '0') AS PARTITION_ID,
+       TO_CHAR(c.lo) AS LOWER_BOUND, TO_CHAR(c.hi) AS UPPER_BOUND,
+       CASE c.incl WHEN 1 THEN 'true' ELSE 'false' END AS UPPER_INCLUSIVE,
+       'false' AS IS_NULL_PARTITION, c.cnt AS EXPECTED_ROW_COUNT,
+       m.source_count AS SOURCE_COUNT, m.null_cnt AS SOURCE_NULL_SPLIT_COUNT,
+       TO_CHAR(m.mn) AS SOURCE_MIN, TO_CHAR(m.mx) AS SOURCE_MAX,
+       #{PARTITION.COUNT} AS PLANNED_PARTITION_COUNT,
+       TO_CHAR(m.amount_sum) AS AMOUNT_SUM,
+       TO_CHAR(m.min_ts, 'YYYY-MM-DD HH24:MI:SS.FF6') AS MIN_TS,
+       TO_CHAR(m.max_ts, 'YYYY-MM-DD HH24:MI:SS.FF6') AS MAX_TS
+  FROM c CROSS JOIN m
+ ORDER BY c.pid
 ```
 
-```text
-sql.args.1.type  = #{SRC.BUSINESS.KEY.TYPE}
-sql.args.1.value = ${load.business.key}
-```
+실제 구현에서는 `APP.INSP_DTL`, 컬럼, WHERE 부분을 Job Parameter로 치환한다. `${load.snapshot.scn}` 자리에는 7.2의 숫자 검증 식을 쓴다. 원천이 0건이면 경계를 0으로 두고 모든 파티션의 예상 건수가 0이 된다. 허용 여부는 API가 `allowEmptySource`로 판정한다.
 
-실제 구현에서는 `APP.INSP_DTL`, 컬럼, WHERE 부분을 Job Parameter로 치환한다.
+이 구조는 PostgreSQL 원천 PoC(`poc/build_flow_v3.py` 14번)로 검증했다. Oracle 문법(`AS OF SCN`, `CONNECT BY`, 상관 서브쿼리)은 PoC 범위 밖이므로 대상 DB에서 실행 계획과 함께 확인한다. 파티션마다 상관 서브쿼리가 원천을 다시 읽으므로, split 컬럼과 업무 조건에 맞는 인덱스가 없으면 `GROUP BY` 방식(`WIDTH_BUCKET` 등으로 버킷을 계산해 한 번에 집계)으로 바꾼다.
 
 ### 7.4 Manifest SQL 원칙
 
-Oracle `CONNECT BY LEVEL <= #{PARTITION.COUNT}` 또는 관리 DB에서 경계를 생성한다. 모든 파티션은 다음 규칙을 만족해야 한다.
+모든 파티션은 다음 규칙을 만족해야 한다.
 
 ```text
 0..N-2 : split_column >= lower AND split_column < upper
@@ -910,7 +960,7 @@ N-1    : split_column >= lower AND split_column <= upper
 NULL    : split_column IS NULL, SPLIT.NULL.POLICY=SEPARATE일 때만
 ```
 
-각 range의 `EXPECTED_ROW_COUNT`를 동일 SCN에서 계산한다. 결과 컬럼은 `PARTITION_ID`, `LOWER_BOUND`, `UPPER_BOUND`, `UPPER_INCLUSIVE`, `IS_NULL_PARTITION`, `EXPECTED_ROW_COUNT`로 고정한다(20의 Jolt spec과 일치). `LOWER_BOUND`, `UPPER_BOUND`, SCN은 `TO_CHAR(...)`로 문자열로 반환한다. `NUMBER(38)` 값이 JSON 숫자로 바뀌며 정밀도를 잃는 것을 막기 위해서다.
+각 range의 `EXPECTED_ROW_COUNT`를 동일 SCN에서 계산한다. 결과 컬럼 이름은 17의 Jolt spec과 일치해야 한다. `LOWER_BOUND`, `UPPER_BOUND`, SCN, 원천 최솟값·최댓값은 `TO_CHAR(...)`로 문자열로 반환한다. `NUMBER(38)` 값이 JSON 숫자로 바뀌며 정밀도를 잃는 것을 막기 위해서다. `SPLIT.NULL.POLICY=SEPARATE`이면 `IS NULL` 파티션 행을 `UNION ALL`로 추가하고 `PLANNED_PARTITION_COUNT`에 1을 더한다.
 
 불변식은 API가 `POST /manifest`에서 한 트랜잭션으로 검증한다(API 설계 3.4).
 
@@ -919,142 +969,127 @@ SUM(expected_row_count) = source_count
 AND 파티션 수 = plannedPartitionCount
 AND lower(i+1) = upper(i), 마지막 파티션만 upper_inclusive = true
 AND NULL 파티션은 SPLIT.NULL.POLICY=SEPARATE일 때만 존재
+AND source_count = 0이면 allowEmptySource = true일 때만 허용
 ```
 
-불일치면 API가 run을 `FAILED_MANIFEST`로 기록하고 422를 반환한다. NiFi는 Worker를 시작하지 않고 PG-90에 이벤트만 남긴다. `expectedRowCount=0`인 파티션은 API가 바로 `SUCCESS`(actual=0)로 기록하고 `dispatchPartitions`에서 뺀다. 그래서 0건 파티션은 Worker로 가지 않는다.
+불일치면 API가 run을 `FAILED_MANIFEST`로 기록하고 422를 반환한다. NiFi는 Worker를 시작하지 않고 PG-90에 이벤트만 남긴다(PG-90은 422면 run 실패를 다시 보고하지 않는다). `expectedRowCount=0`인 파티션은 API가 바로 `SUCCESS`(actual=0)로 기록하고 `dispatchPartitions`에서 뺀다. 그래서 0건 파티션은 Worker로 가지 않는다.
 
 ---
 
-## 8. PG-20 Oracle Extract Workers
+## 8. PG-20 Extract Worker
 
 ### 8.1 Processor 흐름
 
 ```mermaid
 flowchart TD
-    I[Input: partition<br/>Round Robin] --> A[20_Set_Claim_Request<br/>UpdateAttribute + AttributesToJSON]
-    A --> B[21_Claim_Partition<br/>InvokeHTTP POST claim]
-    B -->|Retry or Failure| BR[21R_RetryFlowFile]
-    BR -->|retry| B
-    BR -->|exceeded| EV0[PG-90 ERROR<br/>sweeper가 정리]
-    B -->|No Retry| EV0
-    B -->|Original 2xx| D{23_Is_Owner<br/>RouteOnAttribute}
-    D -->|no| DROP[Terminate duplicate or failed run]
-    D -->|yes| E[24_Build_Oracle_SQL<br/>ReplaceText]
-    E --> F[25_Execute_Partition_Query<br/>ExecuteSQLRecord]
-    F -->|failure| ER{27_Classify_DB_Error}
-    ER -->|transient| RETRY[28_RetryFlowFile]
-    RETRY -->|retry| E
-    RETRY -->|exceeded| FAIL[29_Report_Partition_Fail<br/>InvokeHTTP POST fail]
-    ER -->|ORA-01555 or permanent| FAIL
-    F -->|success| U[31_Set_Chunk_Attrs<br/>UpdateAttribute]
-    U --> VAL[32_ValidateRecord<br/>ParquetReader and fixed schema]
-    VAL -->|valid| H[33_PutHDFS]
-    VAL -->|invalid or failure| FAIL
-    H -->|failure| HR[35_Retry_HDFS]
-    HR -->|retry| H
-    HR -->|exceeded| FAIL
-    H -->|success| J[34A_Build_Chunk_Report<br/>AttributesToJSON]
-    J --> R[34B_Report_Chunk<br/>InvokeHTTP POST chunks]
-    R -->|Original 2xx| LOG[34D_Log_Result<br/>RouteOnAttribute]
-    LOG --> TERM[Terminate]
-    R -->|No Retry 409/4xx| EV1[PG-90 WARN 또는 ERROR]
-    R -->|Retry or Failure| RR[34C_RetryFlowFile]
-    RR -->|retry| R
-    RR -->|exceeded| EV2[PG-90 ERROR<br/>sweeper가 정리]
-    FAIL --> EV3[PG-90 PARTITION_FAILED]
+    I((partitions<br/>Round Robin)) --> A[30_Set_Claim_Token<br/>UpdateAttribute]
+    A --> B[31_Build_Claim_Body<br/>ReplaceText]
+    B --> C[32_Claim_Partition<br/>InvokeHTTP POST claim]
+    C -->|Original 2xx| D{33_Is_Owner<br/>RouteOnAttribute}
+    D -->|unmatched| DROP[종료<br/>다른 Worker 소유 또는 run 종료]
+    D -->|owner| E[34_Execute_Partition_Query<br/>ExecuteSQLRecord]
+    E -->|success, chunk마다| U[35_Set_Chunk_Attrs<br/>UpdateAttribute]
+    U --> VAL[36_ValidateRecord<br/>선택]
+    VAL --> H[37_PutHDFS]
+    H --> J[38_Build_Chunk_Report<br/>ReplaceText]
+    J --> R[39_Report_Chunk<br/>InvokeHTTP POST chunks]
+    R -->|Original 2xx| TERM[종료<br/>판정은 API]
+    C & E & VAL & H & R -.->|실패, 재시도 소진| ERR((errors))
 ```
 
-Worker에는 대기 단계가 없다. 각 chunk는 HDFS에 기록되고 API에 보고되면 끝난다. 파티션과 run의 완료는 API가 보고를 받을 때마다 판정한다(9장). 가이드 초안의 첫 fragment 분기(26), `DuplicateFlowFile`(29, 29A), partition-control FlowFile(30), file audit `PutSQL`(34), `Notify`(36)는 없다. API 보고에 `chunkCount=${fragment.count}`가 들어가므로 파티션 완료 판정에 별도 control FlowFile이 필요 없다.
+Worker에는 대기 단계가 없다. 각 chunk는 HDFS에 기록되고 API에 보고되면 끝난다. 파티션과 run의 완료는 API가 보고를 받을 때마다 판정한다(9장). 가이드 초안의 첫 fragment 분기, `DuplicateFlowFile`, partition-control FlowFile, file audit `PutSQL`, `Notify`는 없다. API 보고에 `chunkCount=${fragment.count}`가 들어가므로 파티션 완료 판정에 별도 control FlowFile이 필요 없다.
+
+파티션 실패 보고(`POST .../fail`)도 PG-20에 두지 않는다. 34·36·37·39의 실패는 `errors`로 가고, PG-90이 claim에 성공한 파티션(`load.stage`가 `EXTRACT` 또는 `CHUNK_WRITE`이고 `api.response`의 `claimed=true`)이면 파티션 실패를 보고한다(14.2).
 
 ### 8.2 주요 Processor 설정
 
-PG-20의 Connection은 PG-10에서 들어오는 입력에만 Round Robin Load Balance를 적용한다. 각 Worker Processor는 All Nodes에서 동작하며 동시성은 Oracle pool 상한을 넘지 않게 한다.
+PG-20의 입력 Connection(PG-10 `partitions`, PG-05 `reissue`)에만 Round Robin Load Balance를 적용한다. 각 Worker Processor는 All Nodes에서 동작하며 동시성은 Oracle pool 상한을 넘지 않게 한다.
 
 | ID | Processor | Scheduling | 주요 Properties | Relationship |
 |---|---|---|---|---|
-| 20 | `UpdateAttribute` ×2 + `AttributesToJSON` | All Nodes, worker concurrency | 20: `partition.claim.token=${UUID()}`. 20B: `claimToken=${partition.claim.token}`, `workerNode=${hostname(true)}`. 이어서 Destination=flowfile-content, Attributes List=`claimToken,workerNode` | success→21 |
-| 21 | `InvokeHTTP` | All Nodes, worker concurrency | 9.2 공통 설정, URL=`#{CONTROL.API.URL}/runs/${load.run.id}/partitions/${partition.id}/claim`, `Response Body Attribute Name=api.response` | Original→23, No Retry→PG-90, Retry/Failure→21R |
-| 23 | `RouteOnAttribute` | All Nodes, worker concurrency | `owner=${api.response:jsonPath('$.claimed'):equals('true')}` | owner→24, unmatched→종료(DEBUG) |
-| 24 | `ReplaceText` | All Nodes, worker concurrency | Replacement Strategy=Entire text, partition 유형별 Oracle SQL 생성 | success→25, failure→29 |
-| 25 | `ExecuteSQLRecord` | All Nodes, worker concurrency | `CS_DBCP_ORACLE`, `CS_PARQUET_WRITER`, Fetch/Rows/Timeout은 8.4 표 참조 | success→31, failure→27 |
-| 27 | `RouteOnAttribute` | All Nodes, worker concurrency | Oracle vendor code/SQLState로 transient, ORA-01555, permanent 분류 | transient→28, non-retryable→29 |
-| 28 | `RetryFlowFile` | All Nodes, worker concurrency | Retry Attribute=`partition.retry.count`, Maximum=`#{PARTITION.RETRY.MAX}`, Penalize=true | retry→24, exceeded/failure→29 |
-| 29 | `UpdateAttribute` + `AttributesToJSON` + `InvokeHTTP` | All Nodes, worker concurrency | 본문 `claimToken`, `errorStage`, `errorClass`, `errorCode`, `message`, `attempt`. URL=`.../partitions/${partition.id}/fail` | Original→PG-90 `PARTITION_FAILED`, Retry/Failure→제한 재시도 후 PG-90 ERROR |
-| 31 | `UpdateAttribute` | All Nodes, worker concurrency | chunk index/count, 결정적 filename 설정(8.5) | success→32 |
-| 32 | `ValidateRecord` | All Nodes, worker concurrency | Reader=`CS_PARQUET_READER`, Writer=`CS_PARQUET_WRITER`, validation schema 고정 | valid→33, invalid/failure→29 |
-| 33 | `PutHDFS` | All Nodes, HDFS 부하 기준 | Hadoop config만 설정, Kerberos service 미설정, umask, replication, replace, Write and rename | success→34A, failure→35 |
-| 34A | `AttributesToJSON` | All Nodes, worker concurrency | Destination=flowfile-content, chunk 보고 attribute 목록(8.5) | success→34B, failure→PG-90 |
-| 34B | `InvokeHTTP` | All Nodes, worker concurrency | 9.2 공통 설정, URL=`.../partitions/${partition.id}/chunks`, `Response Body Attribute Name=api.response` | Original→34D, No Retry→PG-90, Retry/Failure→34C |
-| 34C | `RetryFlowFile` | All Nodes, worker concurrency | Retry Attribute=`api.retry.count`, Maximum=`#{CONTROL.API.RETRY.MAX}`, Penalize=true | retry→34B, exceeded→PG-90 ERROR |
-| 34D | `RouteOnAttribute` | All Nodes, worker concurrency | `${api.response:jsonPath('$.validationScheduled'):equals('true')}`이면 INFO `EXTRACT_VALIDATED` 로그 | 모두 종료 |
-| 35 | `RetryFlowFile` | All Nodes, worker concurrency | HDFS 전용 retry attribute, 최대 횟수와 penalty 설정 | retry→33, exceeded/failure→29 |
+| 30 | `UpdateAttribute` | All Nodes, worker concurrency | `partition.claim.token=${UUID()}`, `load.stage=EXTRACT` | success→31 |
+| 31 | `ReplaceText` | All Nodes, worker concurrency | 본문 `{"claimToken":"${partition.claim.token}","workerNode":"${hostname(true):escapeJson()}"}` | success→32 |
+| 32 | `InvokeHTTP` | All Nodes, worker concurrency | 9.2 공통 설정, URL=`#{CONTROL.API.URL}/runs/${load.run.id}/partitions/${partition.id}/claim`, `Response Body Attribute Name=api.response` | Original→33, No Retry/Retry/Failure→`errors` |
+| 33 | `RouteOnAttribute` | All Nodes, worker concurrency | `owner=${api.response:jsonPath('$.claimed'):equals('true')}`이고 `partition.lower`, `partition.upper`, `load.snapshot.scn`이 숫자 정규식에 맞을 것(NULL 파티션은 경계 검사 제외) | owner→34, unmatched→auto-terminate |
+| 34 | `ExecuteSQLRecord` | All Nodes, worker concurrency | `CS_DBCP_ORACLE`, SQL Query 속성에 파티션 SQL(8.4), `CS_PARQUET_WRITER`. 재시도 없음(16장) | success→35, failure→`errors` |
+| 35 | `UpdateAttribute` | All Nodes, worker concurrency | `filename=part-${partition.id}-${fragment.index:padLeft(6,'0')}.parquet`, `chunk.index=${fragment.index}`, `load.stage=CHUNK_WRITE` | success→36 |
+| 36 | `ValidateRecord` (선택) | All Nodes, worker concurrency | Reader=`CS_PARQUET_READER`, Writer=`CS_PARQUET_WRITER`, validation schema 고정 | valid→37, invalid/failure→`errors` |
+| 37 | `PutHDFS` | All Nodes, HDFS 부하 기준 | 8.5 표. Retry Count=`PARTITION.RETRY.MAX` 기준값, Retried Relationships=failure | success→38, failure→`errors` |
+| 38 | `ReplaceText` | All Nodes, worker concurrency | chunk 보고 본문(8.5) | success→39 |
+| 39 | `InvokeHTTP` | All Nodes, worker concurrency | 9.2 공통 설정, URL=`.../partitions/${partition.id}/chunks`, `Response Body Attribute Name=api.response` | Original→auto-terminate, No Retry/Retry/Failure→`errors` |
 
-20은 token 생성(20)과 본문용 복사(20B)를 반드시 두 `UpdateAttribute`로 나눈다. `UpdateAttribute`는 모든 속성을 **들어온** attribute 기준으로 평가하므로, 같은 processor 안에서 방금 만든 `partition.claim.token`을 참조하면 빈 값이 된다. API PoC에서 이 때문에 모든 claim이 422(`claimToken` UUID 형식 오류)를 받는 것을 재현했다. 다른 단계도 같은 processor 안에서 만든 attribute를 다시 참조하지 않는다.
+30은 token만 만들고 본문은 31에서 만든다. `UpdateAttribute`는 모든 속성을 **들어온** attribute 기준으로 평가하므로, 같은 Processor 안에서 방금 만든 `partition.claim.token`을 참조하면 빈 값이 된다. API PoC에서 이 때문에 모든 claim이 422(`claimToken` UUID 형식 오류)를 받는 것을 재현했다.
 
-20은 content를 claim 요청 JSON으로 바꾼다. 파티션 정보는 PG-10의 24에서 만든 `partition.*` attribute에 있고 24가 content를 Oracle SQL로 덮어쓰므로, manifest 레코드 content는 이후에 쓰지 않는다.
+claim 응답을 잃고 32가 재시도하면 같은 FlowFile, 즉 같은 `partition.claim.token`으로 다시 요청한다. API는 같은 token의 재요청에 `claimed=true`를 돌려주므로 Worker가 스스로 종료하지 않는다(4.1 "Claim과 상태 전이"). relationship 재시도는 들어온 FlowFile을 다시 처리하므로 token이 바뀌지 않는다.
 
-claim 응답을 잃고 21이 재시도하면 같은 `partition.claim.token`으로 다시 요청한다. API는 같은 token의 재요청에 `claimed=true`를 돌려주므로 Worker가 스스로 종료하지 않는다(4.1 "Claim과 상태 전이"). 이를 위해 token은 20에서 한 번만 만들고 재시도 루프에서 다시 만들지 않는다.
-
-`claimed=false`는 다른 Worker가 이미 처리 중이거나 run이 실패 또는 종료된 경우다(`$.runStatus`로 구분). 둘 다 정상 경합이므로 DEBUG 로그만 남기고 종료한다.
+`claimed=false`는 다른 Worker가 이미 처리 중이거나 run이 실패 또는 종료된 경우다(`$.runStatus`로 구분). 둘 다 정상 경합이므로 오류로 남기지 않고 종료한다.
 
 ### 8.3 Claim과 실패 보고
 
 - claim은 API가 run 행을 잠근 뒤 조건부 UPDATE로 처리한다. run이 `EXTRACTING`이 아니면 `claimed=false`이므로 실패한 run의 대기 파티션은 Oracle 조회를 시작하지 않는다.
-- 29의 실패 보고는 일시 오류 재시도(28, 35)를 다 쓴 뒤나 재시도 불가 오류일 때만 호출한다. API는 같은 트랜잭션에서 partition `FAILED`, run `FAILED_EXTRACT`로 바꾼다. `errorCode=ORA-01555`이면 `FAILED_SNAPSHOT_EXPIRED`로 바꾼다.
+- 파티션 실패는 PG-90이 보고한다. `errorCode`는 PG-90이 `executesql.error.message`에서 추출한 `ORA-nnnnn` 코드이거나 `CHUNK_WRITE_FAILED` 같은 단계 코드다. API는 같은 트랜잭션에서 partition `FAILED`, run `FAILED_EXTRACT`로 바꾼다. `errorCode=ORA-01555`이면 `FAILED_SNAPSHOT_EXPIRED`로 바꾼다.
 - 실패 후 같은 run의 다른 Worker는 Oracle 쿼리를 중단하지 않고 끝까지 실행한다. 이후 chunk 보고는 200(`runStatus=FAILED_*`)을 받고 종료하며, 파일은 실패 run의 격리 경로에만 남는다.
 - 가이드 초안의 실패 시 Wait 해제 Notify는 필요 없다. 기다리는 FlowFile이 없기 때문이다.
 
 ### 8.4 Extract SQL 생성
 
-중간 파티션:
+SQL은 34의 SQL Query 속성에 둔다. 가이드 초안의 SQL 생성용 `ReplaceText`는 두지 않는다. 경계와 SCN은 33에서 숫자 정규식으로 검증한 값만 EL로 넣고, 업무키는 PG-00에서 형식을 고정한 값이 `#{SRC.BASE.WHERE}`로 들어간다(3.2).
+
+`SPLIT.NULL.POLICY=FAIL`(NULL 파티션 없음)이면 다음과 같다.
 
 ```sql
 SELECT #{SRC.COLUMNS}
   FROM #{SRC.OWNER}.#{SRC.TABLE} AS OF SCN ${load.snapshot.scn}
  WHERE #{SRC.BASE.WHERE}
-   AND #{SRC.SPLIT.COLUMN} >= ?
-   AND #{SRC.SPLIT.COLUMN} < ?
+   AND #{SRC.SPLIT.COLUMN} >= ${partition.lower}
+   AND #{SRC.SPLIT.COLUMN} ${partition.upper.inclusive:equals('true'):ifElse('<=','<')} ${partition.upper}
 ```
 
-마지막 파티션은 `< ?` 대신 `<= ?`, NULL 파티션은 `IS NULL`을 사용한다.
+`SPLIT.NULL.POLICY=SEPARATE`이면 NULL 파티션과 범위 파티션을 SQL의 상수 조건으로 나눈다. Parameter는 EL 문자열 리터럴 안에서 치환되지 않으므로(5장) `#{SRC.SPLIT.COLUMN}`을 EL 밖에 둔다. 상수 조건은 실행 계획에서 제거된다.
 
-```text
-sql.args.1 = business key
-sql.args.2 = lower bound, NUMERIC(2)
-sql.args.3 = upper bound, NUMERIC(2)
+```sql
+SELECT #{SRC.COLUMNS}
+  FROM #{SRC.OWNER}.#{SRC.TABLE} AS OF SCN ${load.snapshot.scn}
+ WHERE #{SRC.BASE.WHERE}
+   AND (   ('${partition.is.null}' = 'true' AND #{SRC.SPLIT.COLUMN} IS NULL)
+        OR ('${partition.is.null}' <> 'true'
+            AND #{SRC.SPLIT.COLUMN} >= ${partition.lower:replaceEmpty('NULL')}
+            AND #{SRC.SPLIT.COLUMN} ${partition.upper.inclusive:equals('true'):ifElse('<=','<')} ${partition.upper:replaceEmpty('NULL')}))
 ```
 
-24 `ReplaceText`는 Entire text를 위 SQL로 치환한다. 25 `ExecuteSQLRecord` 설정은 다음과 같다.
+34 `ExecuteSQLRecord` 설정은 다음과 같다.
 
 | Property | 값 |
 |---|---|
 | Database Connection Pooling Service | `CS_DBCP_ORACLE` |
-| SQL select query | 빈 값, FlowFile content 사용 |
+| SQL Query | 위 SQL |
 | Record Writer | `CS_PARQUET_WRITER` |
 | Fetch Size | `#{EXTRACT.FETCH.SIZE}` |
 | Max Rows Per FlowFile | `#{EXTRACT.ROWS.PER.FILE}` |
 | Output Batch Size | `0` |
 | Max Wait Time | `#{EXTRACT.QUERY.TIMEOUT}` |
 | Use Avro Logical Types | `true` (DATE/TIMESTAMP/DECIMAL 타입 유지, 4장 참조) |
+| Retry Count | `0` (16장) |
 | Concurrent Tasks | `WORKER.CONCURRENT.TASKS` 기준값을 정수로 입력 (Parameter 참조 불가) |
 | Execution | All Nodes |
 
 `Output Batch Size=0`이어야 한 ResultSet의 `fragment.count`, `fragment.index`, `fragment.identifier`가 완전하게 생성된다. 파티션 크기가 너무 커 session/repository 압력이 생기면 Output Batch를 켜기보다 논리 파티션 수를 늘린다.
 
+PostgreSQL 원천이면 `AS OF SCN`을 빼고 `Set Auto Commit=false`를 둔다(1장 "Oracle 이외 원천").
+
 ### 8.5 Chunk 기록과 보고
 
-31에서 다음 속성을 만든다.
+35에서 다음 속성을 만든다.
 
 ```text
-chunk.index        = ${fragment.index:padLeft(6,'0')}
-chunk.count        = ${fragment.count}
-chunk.record.count = ${record.count}
-filename           = part-${partition.id}-${chunk.index}.parquet
+filename    = part-${partition.id}-${fragment.index:padLeft(6,'0')}.parquet
+chunk.index = ${fragment.index}
+load.stage  = CHUNK_WRITE
 ```
 
 하위 디렉터리를 만들지 않으므로 별도 part path attribute는 두지 않는다(1장 경로 원칙 참조).
 
-33 `PutHDFS`:
+37 `PutHDFS`:
 
 | Property | 값 |
 |---|---|
@@ -1065,23 +1100,20 @@ filename           = part-${partition.id}-${chunk.index}.parquet
 | Writing Strategy | `Write and rename` |
 | Permissions umask | `#{HDFS.PERMISSIONS.UMASK}` |
 | Replication | `#{HDFS.REPLICATION}` 또는 공란으로 HDFS 기본값 사용 |
+| Retry | Retry Count=`PARTITION.RETRY.MAX` 기준값, Retried Relationships=failure, Backoff=Penalize FlowFile |
 | Concurrent Tasks | Worker 동시성과 HDFS 부하에 맞춰 설정 |
 
 HDFS에는 Kerberos가 적용되지 않았으므로 `Kerberos User Service`, principal, keytab을 구성하지 않는다. NiFi 프로세스를 실행하는 OS 사용자가 HDFS client의 effective user가 되므로 staging root와 하위 경로에 필요한 POSIX 권한 또는 ACL을 사전에 부여한다. `core-site.xml`의 인증 방식과 `fs.defaultFS`가 실제 HDFS 환경을 가리키는지 확인한다. `replace`는 run 전용 경로와 결정적 파일명인 경우에만 허용한다.
 
-34A `AttributesToJSON`은 PutHDFS **성공 이후에** content를 보고 JSON으로 바꾼다. 그 전에 `InvokeHTTP`를 호출하면 Parquet content가 요청 본문으로 전송된다. 앞단 `UpdateAttribute`에서 API 필드 이름으로 attribute를 만든 뒤 그 목록만 포함한다.
+38 `ReplaceText`는 PutHDFS **성공 이후에** content를 보고 JSON으로 바꾼다. 그 전에 `InvokeHTTP`를 호출하면 Parquet content가 요청 본문으로 전송된다. Replacement Strategy=Always Replace이므로 Parquet content를 읽지 않는다.
 
-```text
-claimToken         = ${partition.claim.token}
-chunkIndex         = ${fragment.index}
-chunkCount         = ${fragment.count}
-fragmentIdentifier = ${fragment.identifier}
-hdfsPath           = ${absolute.hdfs.path}/${filename}
-recordCount        = ${record.count}
-byteCount          = ${fileSize}
+```json
+{"claimToken":"${partition.claim.token}","chunkIndex":${fragment.index},"chunkCount":${fragment.count},
+ "fragmentIdentifier":"${fragment.identifier}","hdfsPath":"${absolute.hdfs.path:escapeJson()}/${filename}",
+ "recordCount":${record.count},"byteCount":${fileSize}}
 ```
 
-`chunkIndex`는 0부터 시작하는 숫자(`fragment.index`)다. 파일명에 쓰는 0 채움 값(`chunk.index`)과 구분한다. `AttributesToJSON`은 모든 값을 문자열로 만들지만, API는 숫자 문자열을 정수로 받아들인다(API 설계 9.4). API는 `hdfsPath`가 해당 run의 `hdfs_run_path` 아래인지 검증한다.
+`chunkIndex`는 0부터 시작하는 숫자(`fragment.index`)다. 파일명에 쓰는 0 채움 값과 구분한다. `fileSize`는 EL 평가 시점, 즉 content를 바꾸기 전 Parquet 크기다. API는 `hdfsPath`가 해당 run의 `hdfs_run_path` 아래인지 검증한다.
 
 API는 보고를 받을 때마다 같은 트랜잭션에서 다음을 처리한다(API 설계 3.2).
 
@@ -1097,13 +1129,13 @@ API는 보고를 받을 때마다 같은 트랜잭션에서 다음을 처리한�
   "receivedChunks": 3, "chunkCount": 3, "validationScheduled": true }
 ```
 
-NiFi는 이 응답으로 흐름을 바꾸지 않는다. 34D가 로그 수준만 정하고 FlowFile을 종료한다.
+NiFi는 이 응답으로 흐름을 바꾸지 않는다. 39의 Original은 auto-terminate한다. 파티션 판정과 이벤트(`PARTITION_SUCCESS`, `PARTITION_FAILED`, `EXTRACT_VALIDATED`)는 API가 기록한다.
 
 heartbeat는 claim과 chunk 보고 때만 갱신된다. `ExecuteSQLRecord`는 `Output Batch Size=0`이면 ResultSet을 끝까지 읽은 뒤 모든 chunk FlowFile을 한 번에 내보낸다. 따라서 파티션 쿼리가 실행되는 동안(최대 `EXTRACT.QUERY.TIMEOUT`)에는 heartbeat가 갱신되지 않는다. API sweeper의 stale 기준(13장)은 이 공백을 고려해 정한다.
 
-34B가 재시도를 다 써도 보고하지 못하면 파티션은 미완료로 남는다. 이 경우 run은 API sweeper가 timeout으로 정리한다. HDFS 파일은 run 격리 경로에 있으므로 다른 run에 영향을 주지 않는다.
+39가 재시도를 다 써도 보고하지 못하면 파티션은 미완료로 남는다. 이 경우 run은 API sweeper가 timeout으로 정리한다. HDFS 파일은 run 격리 경로에 있으므로 다른 run에 영향을 주지 않는다.
 
-32 `ValidateRecord`는 Reader=`CS_PARQUET_READER`, validation schema=`CS_SCHEMA_REGISTRY`의 승인 버전, Writer=`CS_PARQUET_WRITER`로 설정한다. `invalid` 또는 `failure`가 한 건이라도 발생하면 해당 partition 전체를 실패시킨다. 대용량 재직렬화 비용이 허용되지 않으면 이 Processor를 제거할 수 있지만, 그 경우 동일 schema 검증을 staging Hive 조회에서 필수로 수행한다.
+36 `ValidateRecord`는 Reader=`CS_PARQUET_READER`, validation schema=`CS_SCHEMA_REGISTRY`의 승인 버전, Writer=`CS_PARQUET_WRITER`로 설정한다. `invalid` 또는 `failure`가 한 건이라도 발생하면 `errors`를 거쳐 해당 partition 전체를 실패시킨다. 대용량 재직렬화 비용이 허용되지 않으면 이 Processor를 제거할 수 있지만, 그 경우 동일 schema 검증을 staging Hive 조회에서 필수로 수행한다.
 
 ---
 
@@ -1137,12 +1169,12 @@ sequenceDiagram
 
 | 상황 | API 처리 | NiFi 동작 |
 |---|---|---|
-| 파티션 진행 중 | file 기록 | 34D 로그 후 종료 |
-| 파티션 완료, run 진행 중 | partition `SUCCESS` | 34D 로그 후 종료 |
-| 마지막 파티션 완료 | run `EXTRACTED_VALIDATED`, outbox 예약 | 34D INFO 로그 후 종료. 검증 flow는 API가 시작 |
-| row 수 불일치 | partition `FAILED`, run `FAILED_EXTRACT` | 34D ERROR 로그 후 종료 |
-| 이미 실패한 run의 보고 | file만 기록, `runStatus=FAILED_*` | 34D DEBUG 로그 후 종료 |
-| 파티션 최종 실패 보고(29) | partition `FAILED`, run `FAILED_EXTRACT` | PG-90 `PARTITION_FAILED` |
+| 파티션 진행 중 | file 기록 | 39 Original에서 종료 |
+| 파티션 완료, run 진행 중 | partition `SUCCESS`, `PARTITION_SUCCESS` 이벤트 | 39 Original에서 종료 |
+| 마지막 파티션 완료 | run `EXTRACTED_VALIDATED`, outbox 예약, `EXTRACT_VALIDATED` 이벤트 | 39 Original에서 종료. 검증 flow는 API가 시작 |
+| row 수 불일치 | partition `FAILED`, run `FAILED_EXTRACT`, `PARTITION_FAILED` 이벤트 | 39 Original에서 종료 |
+| 이미 실패한 run의 보고 | file만 기록, `runStatus=FAILED_*` | 39 Original에서 종료 |
+| Processor 실패 보고(PG-90 95) | partition `FAILED`, run `FAILED_EXTRACT` | PG-90이 오류 이벤트 기록 |
 
 PoC에서 PG-30이 실패 후 0.1초 만에 run 실패를 확정하던 동작은 API에서 `fail` 호출 한 번으로 즉시 확정된다. 기다리는 FlowFile이 없으므로 Wait 해제 처리도 없다.
 
@@ -1157,28 +1189,34 @@ PoC에서 PG-30이 실패 후 0.1초 만에 run 실패를 확정하던 동작은
 | Socket Read Timeout | `#{CONTROL.API.TIMEOUT}` |
 | Request Content-Type | `application/json` |
 | Request Body Enabled | `true` (FlowFile content가 본문) |
-| Response Body Attribute Name | `api.response` (응답이 작은 호출). PG-10 21만 비움 |
-| Response Body Attribute Size | `4096` |
+| Response Body Attribute Name | `api.response` (응답이 작은 호출). PG-10 18만 비움 |
+| Response Body Attribute Size | `16384` |
 | Response Generation Required | `false` |
 | 동적 속성 `Authorization` | `#{CONTROL.API.AUTHORIZATION}` — **Sensitive 동적 속성**으로 추가해야 Sensitive Parameter를 참조할 수 있다. Sensitive 속성은 Parameter 참조 외의 텍스트를 가질 수 없으므로 `Bearer #{...}`처럼 쓰면 NiFi가 400으로 거부한다(NiFi 2.4.0에서 확인). Parameter 값을 `Bearer <token>` 전체로 둔다 |
 | 동적 속성 `X-Request-Id` | `${UUID()}` |
 | 동적 속성 `X-Run-Id` | `${load.run.id}` |
+| Retry Count | `CONTROL.API.RETRY.MAX` 기준값(정수 입력) |
+| Retried Relationships | `Retry`, `Failure` |
+| Backoff Policy | Penalize FlowFile |
+| Max Backoff Period | `1 min` |
+| Penalty Duration | `5 sec` |
+| Relationship | Original(또는 Response)→다음 단계, `No Retry`, `Retry`, `Failure`→`errors` |
 
-요청 본문은 `AttributesToJSON` 또는 `JoltTransformJSON`으로 만든다. API는 알 수 없는 필드를 422로 거부하므로(API 설계 9.4) `AttributesToJSON`의 Attributes List를 명시하고 `Include Core Attributes=false`로 둔다.
+요청 본문은 앞 단계의 `ReplaceText`가 EL로 만든 JSON이다(2.1 규칙 3). API는 알 수 없는 필드를 422로 거부하므로(API 설계 9.4) 본문에는 API 필드만 넣는다. 문자열 값은 `escapeJson()`으로 감싸고, 숫자 값(`fragment.index`, `record.count`, `fileSize`)은 따옴표 없이 넣는다. 본문이 `{}`인 호출(`/stage-validated`, `/success`)도 `ReplaceText`로 `{}`를 만든다. 앞 호출의 content가 남아 있으면 그 내용이 본문으로 가기 때문이다.
 
 ### 9.3 Relationship 처리
 
 | HTTP 결과 | Relationship | 처리 |
 |---|---|---|
 | 2xx | Original(`Response Body Attribute Name` 설정 시) 또는 Response | 응답 본문으로 분기 |
-| 409 (`CLAIM_MISMATCH`, `CHUNK_CONFLICT`, `DUPLICATE_ACTIVE_RUN`) | No Retry | WARN 이벤트 후 종료. 재시도하지 않음 |
-| 404, 422 (run 없음, 입력·불변식 위반) | No Retry | PG-90 ERROR. 입력 오류이므로 재시도하지 않음 |
-| 5xx | Retry | `RetryFlowFile`(`#{CONTROL.API.RETRY.MAX}`, penalty) 후 재호출 |
-| 연결 실패, timeout | Failure | Retry와 같게 처리 |
+| 409 (`CLAIM_MISMATCH`, `CHUNK_CONFLICT`, `DUPLICATE_ACTIVE_RUN`) | No Retry | `errors` → PG-90. 재시도하지 않음 |
+| 404, 422 (run 없음, 입력·불변식 위반) | No Retry | `errors` → PG-90 ERROR. 입력 오류이므로 재시도하지 않음 |
+| 5xx | Retry | relationship 재시도 후 소진되면 `errors` |
+| 연결 실패, timeout | Failure | relationship 재시도 후 소진되면 `errors`(PG-90 `API_UNREACHABLE`) |
 
-No Retry의 오류 코드는 `${invokehttp.response.body:jsonPath('$.code')}`로 확인한다. API 호출 재시도는 모든 상태 변경 호출이 멱등이기 때문에 안전하다. 같은 chunk 보고나 같은 token의 claim이 두 번 가도 결과는 한 번 호출한 것과 같다.
+`Response Body Attribute Name`을 설정하면 2xx가 아닌 응답의 본문도 그 attribute(`api.response`)에 들어가고 `invokehttp.response.body`는 비어 있다(NiFi 2.4.0 PoC에서 확인). 오류 코드는 `${api.response:jsonPath('$.code')}`로 확인하며, PG-90은 두 attribute를 모두 본다. API 호출 재시도는 모든 상태 변경 호출이 멱등이기 때문에 안전하다. 같은 chunk 보고나 같은 token의 claim이 두 번 가도 결과는 한 번 호출한 것과 같다.
 
-재시도 대기는 API 재기동 시간을 견딜 만큼 길어야 한다. 예를 들어 Penalty Duration 30초 × `CONTROL.API.RETRY.MAX` 5회면 약 2.5분이다. API가 이보다 오래 내려가면 보고가 유실되고, run은 sweeper가 timeout으로 정리한다(13장). 이 경우 데이터는 잘못 게시되지 않고 run이 실패할 뿐이다.
+재시도 대기는 API 재기동 시간을 견딜 만큼 길어야 한다. Penalty Duration 5초에서 시작해 두 배씩 늘고 Max Backoff Period 1분에서 멈추므로, Retry Count 5회면 약 5+10+20+40+60초 = 2분 15초다. API가 이보다 오래 내려가면 보고가 유실되고, run은 sweeper가 timeout으로 정리한다(13장). 이 경우 데이터는 잘못 게시되지 않고 run이 실패할 뿐이다.
 
 ### 9.4 API 호출 목록
 
@@ -1201,32 +1239,32 @@ No Retry의 오류 코드는 `${invokehttp.response.body:jsonPath('$.code')}`로
 
 ### 9.5 API 호출 수신: PG-05 Control Receiver
 
-API는 검증 시작(`VALIDATE_RUN`)과 선택 기능인 파티션 재발행(`REISSUE_PARTITION`)을 NiFi에 HTTP로 요청한다. Job마다 Process Group과 Parameter Context(`PC_JOB_<JOB_NAME>`)가 다르고 한 포트는 하나의 `HandleHttpRequest`만 열 수 있다. 그래서 root 수준에 공통 수신 Process Group 하나를 두고 `jobKey`로 각 Job PG에 전달한다.
+API는 검증 시작(`VALIDATE_RUN`)과 선택 기능인 파티션 재발행(`REISSUE_PARTITION`)을 NiFi에 HTTP로 요청한다. Job마다 Job PG와 Parameter Context(`PC_JOB_<JOB_NAME>`)가 다르고 한 포트는 하나의 `HandleHttpRequest`만 열 수 있다. 그래서 root에 공통 PG-05 하나를 두고 요청 경로의 `jobKey`로 각 Job PG의 Input Port(`validate-in`, `reissue-in`)에 전달한다.
 
 ```mermaid
 flowchart LR
-    L[05_Listen<br/>HandleHttpRequest] --> V{06_Validate_Request<br/>RouteOnAttribute}
-    V -->|invalid| R4[07_Respond_400<br/>HandleHttpResponse]
+    L[05_Listen_Control<br/>HandleHttpRequest] --> V{06_Validate_Request<br/>RouteOnAttribute}
+    V -->|unmatched| R4[07_Respond_400<br/>HandleHttpResponse]
     V -->|valid| R2[08_Respond_202<br/>HandleHttpResponse]
-    R2 --> J[09_Extract_Body<br/>EvaluateJsonPath]
-    J --> RT{10_Route_By_Job<br/>RouteOnAttribute}
-    RT -->|ORACLE_INSP_DTL_DAILY validate| P1[Output: INSP_DTL validate-in]
-    RT -->|ORACLE_INSP_DTL_DAILY reissue| P2[Output: INSP_DTL reissue-in]
-    RT -->|unmatched| E[PG-90 ERROR<br/>미등록 jobKey]
+    R2 --> J[09_Extract_Control_Body<br/>EvaluateJsonPath]
+    J --> RT{10_Route_By_Job_Action<br/>RouteOnAttribute}
+    RT -->|INSP_DTL validate| P1((Output: INSP_DTL validate))
+    RT -->|INSP_DTL reissue| P2((Output: INSP_DTL reissue))
 ```
 
 | ID | Processor | Scheduling | 주요 Properties | Relationship |
 |---|---|---|---|---|
-| 05 | `HandleHttpRequest` | All Nodes, 1 | Listening Port=`#{CONTROL.LISTEN.PORT}`, SSL Context Service=`CS_SSL_SERVER`, Client Authentication=`REQUIRED`, HTTP Context Map=`CS_HTTP_CONTEXT_MAP`, Allowed Paths=`/(validate\|reissue)/[A-Z0-9_]{1,200}`, Allow GET/PUT/DELETE/HEAD/OPTIONS=false | success→06 |
+| 05 | `HandleHttpRequest` | All Nodes, 1 | Listening Port=`#{CONTROL.LISTEN.PORT}`, SSL Context Service=`CS_SSL_SERVER`, Client Authentication=`REQUIRED`, HTTP Context Map=`CS_HTTP_CONTEXT_MAP`, Allowed Paths=`/(validate\|reissue)/(ORACLE_INSP_DTL_DAILY\|...)`(등록된 Job만), Allow GET/PUT/DELETE/HEAD/OPTIONS=false | success→06 |
 | 06 | `RouteOnAttribute` | All Nodes, 1 | `http.method`=POST, `http.headers.X-Run-Id`와 `X-Dispatch-Id`가 UUID 형식 | valid→08, unmatched→07 |
-| 07 | `HandleHttpResponse` | All Nodes, 1 | HTTP Status Code=400 | success→PG-90 WARN |
+| 07 | `HandleHttpResponse` | All Nodes, 1 | HTTP Status Code=400 | success→auto-terminate |
 | 08 | `HandleHttpResponse` | All Nodes, 1 | HTTP Status Code=202 | success→09 |
-| 09 | `EvaluateJsonPath` + `UpdateAttribute` | All Nodes, 1 | `load.run.id=$.runId`, `load.dispatch.id=$.dispatchId`, `partition.id=$.partitionId`, `control.action=${http.request.uri:substringAfter('/'):substringBefore('/')}`, `load.job.key=${http.request.uri:substringAfterLast('/')}` | matched→10 |
-| 10 | `RouteOnAttribute` | All Nodes, 1 | Job별 `${load.job.key:equals('ORACLE_INSP_DTL_DAILY'):and(${control.action:equals('validate')})}` 등 | Job PG Output Port, unmatched→PG-90 ERROR |
+| 09 | `EvaluateJsonPath` | All Nodes, 1 | Path Not Found Behavior=ignore. `load.run.id=$.runId`, `load.dispatch.id=$.dispatchId`와 재발행 필드(`partition.id`, `load.business.key`, `load.snapshot.scn`, `load.hdfs.path`, `partition.lower`, `partition.upper`, `partition.upper.inclusive`, `partition.is.null`, `partition.expected.rows`)를 한 번에 추출. 검증 요청에는 없는 필드가 빈 값이 된다 | matched→10, unmatched/failure→auto-terminate |
+| 10 | `RouteOnAttribute` | All Nodes, 1 | Job·동작별 route. 예: `INSP_DTL_validate=${http.request.uri:equals('/validate/ORACLE_INSP_DTL_DAILY')}`, `INSP_DTL_reissue=${http.request.uri:equals('/reissue/ORACLE_INSP_DTL_DAILY')}` | Job별 Output Port, unmatched→auto-terminate |
 
 - 검증은 수십 분 걸릴 수 있으므로 08에서 먼저 202를 응답하고 HTTP 연결을 붙잡지 않는다. API는 2xx를 받으면 dispatch를 `SENT`로 바꾸고, 검증 flow가 `/validation/start`를 호출해야 `ACKED`가 된다. 202 응답 직후 노드가 죽어 FlowFile이 사라지면 API가 ACK timeout 뒤 다시 보낸다.
-- `HandleHttpRequest`는 모든 노드에서 동작한다. API는 NiFi LB 주소(`nifi.receiver_url`)로 호출하며, 어느 노드가 받든 Job PG의 첫 단계 CAS가 중복 실행을 막는다. 그래서 PG-40~60은 All Nodes로 스케줄한다(2장).
-- 새 Job을 추가하면 10에 route 두 개(validate, reissue)와 Output Port를 추가한다. 등록되지 않은 `jobKey`는 ERROR로 남기고, API의 dispatch는 ACK timeout 뒤 재전송된다. 계속 실패하면 `DEAD`가 되어 알림이 간다.
+- 등록되지 않은 `jobKey`는 05의 Allowed Paths에서 걸러져 `HandleHttpRequest`가 404로 응답한다. 07·09·10의 unmatched도 API 쪽에서 ACK timeout 후 재전송되고, 계속 실패하면 dispatch가 `DEAD`가 되어 API가 `DISPATCH_DEAD` 이벤트로 알린다. 그래서 PG-05는 별도 오류 기록 Processor를 두지 않는다. 원인은 NiFi Bulletin과 Provenance로 확인한다.
+- `HandleHttpRequest`는 모든 노드에서 동작한다. API는 NiFi LB 주소(`nifi.receiver_url`)로 호출하며, 어느 노드가 받든 Job PG의 첫 단계 CAS가 중복 실행을 막는다. 그래서 PG-40~60은 All Nodes로 스케줄한다(2.3).
+- 새 Job을 추가하면 05의 Allowed Paths에 `jobKey`를 넣고, 10에 route 두 개(validate, reissue)와 Output Port를 추가해 새 Job PG의 Input Port에 연결한다.
 - 05의 TLS client 인증으로 API만 호출할 수 있게 한다. 방화벽으로 수신 포트를 API 서버 대역에만 연다.
 
 ---
@@ -1237,54 +1275,56 @@ flowchart LR
 
 ```mermaid
 flowchart TD
-    I[Input: validate-in<br/>PG-05에서 전달] --> ST[40S_Validation_Start<br/>InvokeHTTP POST validation/start]
-    ST -->|Original 2xx| T{40T_Is_Started<br/>RouteOnAttribute}
-    ST -->|Retry or Failure| SR[40R_RetryFlowFile]
-    SR -->|retry| ST
-    SR -->|exceeded| F0[PG-90 ERROR<br/>API가 ACK timeout 후 재전송]
-    T -->|no| X[DEBUG 후 종료<br/>중복 dispatch]
-    T -->|yes| U[40U_Set_Run_Attrs<br/>UpdateAttribute]
-    U --> A[40_Create_SUCCESS_Marker<br/>ReplaceText + PutHDFS]
-    A --> B[41_Build_Create_External_SQL<br/>ReplaceText]
-    B --> C[42_Create_External_Table<br/>PutHive3QL]
-    C -->|success| D[43_Query_Stage_Metrics<br/>SelectHive3QL]
-    C -->|failure| F[47_Report_Stage_Fail<br/>InvokeHTTP POST fail]
-    D --> E[44_Extract_Stage_Metrics]
-    E --> R{45_Compare_Source_Stage}
-    R -->|match or mismatch| V[46A_Report_Validations<br/>InvokeHTTP POST validations]
-    V -->|mismatch| F
-    V -->|match| S[46B_Stage_Validated<br/>InvokeHTTP POST stage-validated]
-    S -->|stageValidated=true| O[Output: staging-valid]
-    S -->|false| F
-    F --> FE[PG-90 RUN_FAILED]
+    I((validate)) --> A[40_Set_Validation_Stage<br/>UpdateAttribute]
+    A --> B[41_Build_Start_Body<br/>ReplaceText]
+    B --> C[42_Validation_Start<br/>InvokeHTTP POST validation/start]
+    C -->|Original 2xx| D{43_Is_Started<br/>RouteOnAttribute}
+    D -->|unmatched| X[종료<br/>중복 dispatch]
+    D -->|started| E[44_Set_Run_Attrs<br/>UpdateAttribute]
+    E --> F[45_Empty_Content<br/>ReplaceText]
+    F --> G[46_PutHDFS_SUCCESS_Marker]
+    G --> H[47_Build_External_DDL<br/>ReplaceText]
+    H --> J[48_Create_External_Table<br/>Hive 실행]
+    J --> K[49_Query_Stage_Metrics<br/>Hive 조회]
+    K --> L[4A_Build_Validations_Body<br/>JoltTransformJSON]
+    L --> M[4B_Report_Validations<br/>InvokeHTTP POST validations]
+    M --> N[4C_Empty_Json<br/>ReplaceText]
+    N --> P[4D_Stage_Validated<br/>InvokeHTTP POST stage-validated]
+    P --> Q{4E_Is_Stage_Validated<br/>RouteOnAttribute}
+    Q -->|true| OUT((staging-valid))
+    Q -->|unmatched| ERR((errors))
+    C & G & J & K & L & M & P -.->|실패, 재시도 소진| ERR
 ```
+
+PoC는 40~46(입구와 `_SUCCESS`)까지 검증했다. 47 이후는 Hive가 필요하므로 V3 규칙을 적용한 설계다.
 
 ### 10.2 주요 Processor 설정
 
 | ID | Processor | Scheduling | 주요 Properties | Relationship |
 |---|---|---|---|---|
-| 40S | `AttributesToJSON` + `InvokeHTTP` | All Nodes, 1 | 본문 `dispatchId=${load.dispatch.id}`, `node=${hostname(true)}`. URL=`#{CONTROL.API.URL}/runs/${load.run.id}/validation/start`, `Response Body Attribute Name=api.response`, `Response Body Attribute Size=16384` | Original→40T, No Retry→PG-90, Retry/Failure→40R |
-| 40T | `RouteOnAttribute` | All Nodes, 1 | `${api.response:jsonPath('$.started'):equals('true')}` | started→40U, unmatched→DEBUG 후 종료 |
-| 40U | `UpdateAttribute` | All Nodes, 1 | 응답에서 `load.hdfs.path`, `load.stage.table`, `load.business.key`, `load.snapshot.scn`, `load.source.count`, `load.extracted.count`, `validation.source.*`(`$.sourceMetrics.*`)를 `jsonPath()`로 추출 | success→40A |
-| 40A | `ReplaceText` | All Nodes, 1 | Replacement Strategy=Entire text, Replacement Value=빈 값 | success→40B, failure→47 |
-| 40B | `UpdateAttribute` | All Nodes, 1 | `filename=_SUCCESS`, Directory=`${load.hdfs.path}` | success→40C |
-| 40C | `PutHDFS` | All Nodes, 1 | Hadoop config만 설정, Kerberos service 미설정, Write and rename, conflict=replace | success→41, failure→제한 재시도 후 47 |
-| 41 | `ReplaceText` | All Nodes, 1 | 승인된 external table DDL로 전체 content 치환 | success→42, failure→47 |
-| 42 | `PutHive3QL` 또는 `PutClouderaHiveQL` | All Nodes, 1 | `CS_HIVE3_DBCP`, Query Timeout, DDL 1건 | success→43, failure→47 |
-| 43 | `SelectHive3QL` 또는 `ExecuteSQLRecord` | All Nodes, 1 | stage count/NULL/중복/min/max/업무 합계 SQL, JSON writer | success→44, failure→47 |
-| 44 | `EvaluateJsonPath` | All Nodes, 1 | stage metrics를 `validation.stage.*` attribute로 추출 | matched→45, failure/unmatched→47 |
-| 45 | `RouteOnAttribute` + `UpdateAttribute` | All Nodes, 1 | source/extracted/staging count 및 DQ 지표 비교, 지표별 `PASS`/`FAIL` attribute 설정 | 모두→46A(결과에 따라 `validation.result` 설정) |
-| 46A | `JoltTransformJSON` + `InvokeHTTP` | All Nodes, 1 | `stage=STAGING`, 지표 배열(`metricName`, `expectedValue`, `actualValue`, `result`, `queryVersion`)을 본문으로 `POST /validations` | Original→`validation.result`가 PASS면 46B, FAIL이면 47 |
-| 46B | `InvokeHTTP` | All Nodes, 1 | `POST /runs/${load.run.id}/stage-validated`, 본문 `{}`, `Response Body Attribute Name=api.response` | `$.stageValidated=true`→PG-50, false→47 |
-| 47 | `AttributesToJSON` + `InvokeHTTP` | All Nodes, 1 | `POST /fail`, 본문 `expectedStatus=STAGE_VALIDATING`, `failStatus=FAILED_STAGE_VALIDATION`, `errorStage`, `errorCode`, `message` | Original→PG-90 `RUN_FAILED` |
+| 40 | `UpdateAttribute` | All Nodes, 1 | `load.stage=VALIDATION_START` | success→41 |
+| 41 | `ReplaceText` | All Nodes, 1 | 본문 `{"dispatchId":"${load.dispatch.id}","node":"${hostname(true):escapeJson()}"}` | success→42 |
+| 42 | `InvokeHTTP` | All Nodes, 1 | 9.2 공통 설정, URL=`#{CONTROL.API.URL}/runs/${load.run.id}/validation/start`, `Response Body Attribute Name=api.response` | Original→43, No Retry/Retry/Failure→`errors` |
+| 43 | `RouteOnAttribute` | All Nodes, 1 | `started=${api.response:jsonPath('$.started'):equals('true')}` | started→44, unmatched→auto-terminate |
+| 44 | `UpdateAttribute` | All Nodes, 1 | 응답에서 `load.job.key`, `load.business.key`, `load.snapshot.scn`, `load.hdfs.path`, `load.stage.table`, `load.source.count`, `load.extracted.count`, `validation.source.*`(`$.sourceMetrics.*`)를 `jsonPath()`로 추출. `filename=_SUCCESS`, `load.stage=STAGE_VALIDATION` | success→45 |
+| 45 | `ReplaceText` | All Nodes, 1 | Replacement Value=빈 값 | success→46 |
+| 46 | `PutHDFS` | All Nodes, 1 | Directory=`${load.hdfs.path}`, Write and rename, conflict=replace, Retry Count 기준값 | success→47, failure→`errors` |
+| 47 | `ReplaceText` | All Nodes, 1 | 승인된 external table DDL로 전체 content 치환 | success→48 |
+| 48 | Hive 실행 Processor | All Nodes, 1 | `CS_HIVE3_DBCP`, Query Timeout, DDL 1건 | success→49, failure→`errors` |
+| 49 | Hive 조회 Processor 또는 `ExecuteSQLRecord` | All Nodes, 1 | 지표·기대값·PASS/FAIL을 한 번에 계산하는 SQL(10.3), JSON writer | success→4A, failure→`errors` |
+| 4A | `JoltTransformJSON` | All Nodes, 1 | 지표 행 배열을 `{"stage":"STAGING","queryVersion":"v1","metrics":[...]}`로 변환 | success→4B, failure→`errors` |
+| 4B | `InvokeHTTP` | All Nodes, 1 | `POST /runs/${load.run.id}/validations` | Original→4C, No Retry/Retry/Failure→`errors` |
+| 4C | `ReplaceText` | All Nodes, 1 | 본문 `{}` | success→4D |
+| 4D | `InvokeHTTP` | All Nodes, 1 | `POST /runs/${load.run.id}/stage-validated`, `Response Body Attribute Name=api.response` | Original→4E, No Retry/Retry/Failure→`errors` |
+| 4E | `RouteOnAttribute` | All Nodes, 1 | `${api.response:jsonPath('$.stageValidated'):equals('true')}` | matched→`staging-valid`, unmatched→`errors` |
 
-검증 flow는 API 호출로 새로 시작되므로, PG-10에서 만든 attribute(SCN, source count, source DQ 지표, HDFS 경로)를 가지고 있지 않다. 그래서 40S의 `/validation/start` 응답이 검증에 필요한 값을 모두 돌려준다. source DQ 지표는 PG-10이 `/manifest` 요청의 `sourceMetrics`로 보내 API가 `load_validation`(stage=`SOURCE`)에 저장해 둔 값이다(API 설계 5.3).
+검증 flow는 API 호출로 새로 시작되므로, PG-10에서 만든 attribute(SCN, source count, source DQ 지표)를 가지고 있지 않다. 그래서 42의 `/validation/start` 응답이 검증에 필요한 값을 모두 돌려준다. source DQ 지표는 PG-10이 `/manifest` 요청의 `sourceMetrics`로 보내 API가 `load_validation`(stage=`SOURCE`)에 저장해 둔 값이다(API 설계 5.3).
 
-40S는 반드시 첫 단계다. API는 `EXTRACTED_VALIDATED → STAGE_VALIDATING` CAS에 성공한 호출에만 `started=true`를 돌려준다. 같은 run의 검증 요청이 두 번 와도(outbox 재전송, LB 재시도) 두 번째는 40T에서 종료된다.
+42는 반드시 첫 API 호출이다. API는 `EXTRACTED_VALIDATED → STAGE_VALIDATING` CAS에 성공한 호출에만 `started=true`를 돌려준다. 같은 run의 검증 요청이 두 번 와도(outbox 재전송, LB 재시도) 두 번째는 43에서 종료된다. 43 이전의 실패는 `load.stage=VALIDATION_START`이므로 PG-90이 이벤트만 남기고, API가 ACK timeout 뒤 다시 보낸다. 44 이후의 실패는 `load.stage=STAGE_VALIDATION`이므로 PG-90이 run을 `FAILED_STAGE_VALIDATION`으로 보고한다(14.2). 4E의 `stageValidated=false`도 같은 경로로 실패를 확정한다.
 
-40은 수신 FlowFile의 content를 `ReplaceText`로 비우고 `filename=_SUCCESS`를 설정한 뒤 run root에 `Write and rename`으로 기록한다. FlowFile attribute는 유지되므로 PutHDFS 성공 관계에서 바로 41로 진행한다. 이 파일은 API가 run 완료를 확정한 뒤에만 존재한다.
+45~46은 수신 FlowFile의 content를 비우고 run root에 `_SUCCESS`를 `Write and rename`으로 기록한다. FlowFile attribute는 유지되므로 PutHDFS 성공 관계에서 바로 47로 진행한다. 이 파일은 API가 run 완료를 확정한 뒤에만 존재한다. NiFi 2.4.0 PoC에서 0바이트 `_SUCCESS`가 생성됨을 확인했다.
 
-41의 예시 SQL:
+47의 예시 SQL:
 
 ```sql
 CREATE EXTERNAL TABLE #{HIVE.STAGE.DB}.${load.stage.table} (
@@ -1296,27 +1336,40 @@ LOCATION '${load.hdfs.path}'
 
 `load.stage.table`은 `${load.run.id}`에서 하이픈을 제거한 안전한 suffix만 사용하고 정규식으로 검증한다.
 
-Apache NiFi 2.x에는 Hive 번들이 없다. NiFi 2.4.0 배포본의 Processor 목록에서 `PutHive3QL`/`SelectHive3QL`이 없음을 확인했다. 이 문서의 `PutHive3QL`, `SelectHive3QL`, `PutClouderaHiveQL`, `CS_HIVE3_DBCP`는 CFM이 제공하는 Hive 구성요소를 가리키는 자리표시자다. 구현 전에 CFM 4.12.0 supported processors 목록(21장)에서 실제 Processor와 Controller Service 이름, 지원 속성(Query Timeout, Rollback On Failure 등)을 확정한다. 제공 구성요소가 없다면 Hive JDBC driver와 `ExecuteSQL`/`ExecuteSQLRecord`로 DDL·DML을 실행할 수 있는지 사전 시험한 뒤 대체한다.
+Apache NiFi 2.x에는 Hive 번들이 없다. NiFi 2.4.0 배포본의 Processor 목록에서 `PutHive3QL`/`SelectHive3QL`이 없음을 확인했다. 이 문서의 "Hive 실행 Processor", "Hive 조회 Processor", `CS_HIVE3_DBCP`는 CFM이 제공하는 Hive 구성요소를 가리키는 자리표시자다(`PutHive3QL`, `SelectHive3QL`, `PutClouderaHiveQL` 등). 구현 전에 CFM 4.12.0 supported processors 목록(21장)에서 실제 Processor와 Controller Service 이름, 지원 속성(Query Timeout, Rollback On Failure 등)을 확정한다. 제공 구성요소가 없다면 Hive JDBC driver와 `ExecuteSQL`/`ExecuteSQLRecord`로 DDL·DML을 실행할 수 있는지 사전 시험한 뒤 대체한다.
 
-42는 확정된 Hive 실행 Processor를 사용한다. 43은 Hive 조회 Processor가 제공되면 사용하고, 환경 표준이 Hive JDBC라면 `ExecuteSQLRecord + CS_HIVE3_DBCP`로 대체한다.
+### 10.3 Stage 지표 SQL
 
-필수 stage 지표:
+비교를 NiFi `RouteOnAttribute`로 하지 않고 SQL 안에서 한다. 기대값은 44가 `/validation/start` 응답에서 꺼낸 attribute이고, SQL은 지표마다 한 행(`metric_name`, `expected_value`, `actual_value`, `result`)을 돌려준다. 4A는 이 행을 그대로 `metrics` 배열로 옮긴다.
 
 ```sql
-SELECT COUNT(*) AS STAGE_COUNT,
-       SUM(CASE WHEN INSP_DTL_SEQ IS NULL THEN 1 ELSE 0 END) AS NULL_SEQ_COUNT,
-       COUNT(*) - COUNT(DISTINCT <BUSINESS_PK>) AS DUP_PK_COUNT,
-       MIN(INSP_DTL_SEQ) AS MIN_SEQ,
-       MAX(INSP_DTL_SEQ) AS MAX_SEQ,
-       SUM(<BUSINESS_AMOUNT>) AS AMOUNT_SUM,
-       CAST(MIN(<BUSINESS_TIMESTAMP>) AS STRING) AS MIN_TS,
-       CAST(MAX(<BUSINESS_TIMESTAMP>) AS STRING) AS MAX_TS
-  FROM #{HIVE.STAGE.DB}.${load.stage.table}
+WITH s AS (
+  SELECT COUNT(*) AS cnt,
+         SUM(CASE WHEN INSP_DTL_SEQ IS NULL THEN 1 ELSE 0 END) AS null_cnt,
+         COUNT(*) - COUNT(DISTINCT <BUSINESS_PK>) AS dup_cnt,
+         SUM(<BUSINESS_AMOUNT>) AS amount_sum,
+         CAST(MIN(<BUSINESS_TIMESTAMP>) AS STRING) AS min_ts,
+         CAST(MAX(<BUSINESS_TIMESTAMP>) AS STRING) AS max_ts
+    FROM #{HIVE.STAGE.DB}.${load.stage.table}
+)
+SELECT 'ROW_COUNT' AS metric_name, '${load.source.count}' AS expected_value, CAST(cnt AS STRING) AS actual_value,
+       IF(cnt = ${load.source.count}, 'PASS', 'FAIL') AS result FROM s
+UNION ALL
+SELECT 'NULL_SPLIT_COUNT', '0', CAST(null_cnt AS STRING), IF(null_cnt = 0, 'PASS', 'FAIL') FROM s
+UNION ALL
+SELECT 'DUP_PK_COUNT', '0', CAST(dup_cnt AS STRING), IF(dup_cnt = 0, 'PASS', 'FAIL') FROM s
+UNION ALL
+SELECT 'AMOUNT_SUM', '${validation.source.AMOUNT_SUM}', CAST(amount_sum AS STRING),
+       IF(CAST(amount_sum AS DECIMAL(38,2)) = CAST('${validation.source.AMOUNT_SUM}' AS DECIMAL(38,2)), 'PASS', 'FAIL') FROM s
+UNION ALL
+SELECT 'MIN_TS', '${validation.source.MIN_TS}', min_ts, IF(min_ts = '${validation.source.MIN_TS}', 'PASS', 'FAIL') FROM s
+UNION ALL
+SELECT 'MAX_TS', '${validation.source.MAX_TS}', max_ts, IF(max_ts = '${validation.source.MAX_TS}', 'PASS', 'FAIL') FROM s
 ```
 
-`MIN_TS`/`MAX_TS`는 동일 의미로 계산한 원천 값과 문자열로 비교한다. 시간대 해석이 어긋나면 count는 같아도 이 지표가 불일치한다.
+`MIN_TS`/`MAX_TS`는 원천(7.3)과 같은 형식의 문자열로 비교한다. 시간대 해석이 어긋나면 count는 같아도 이 지표가 불일치한다(4장). Hive는 결과 컬럼 이름을 소문자로 돌려주므로 4A의 Jolt spec은 소문자 이름(`metric_name` 등)을 `metricName` 등으로 옮긴다. CTE가 지표마다 다시 계산되면 `hive.optimize.cte.materialize.threshold`로 한 번만 계산하게 한다.
 
-46A는 지표별 PASS/FAIL을 모두 보고한다. FAIL이 있어도 먼저 기록한 뒤 47로 실패를 확정한다. 46B에서 API는 NiFi의 판정을 그대로 믿지 않고, 저장된 STAGING 지표가 모두 PASS일 때만 `STAGE_VALIDATING → STAGING_VALIDATED`로 CAS 갱신한다.
+4B는 지표별 PASS/FAIL을 모두 보고한다. FAIL이 있어도 먼저 기록한 뒤 4D에서 판정한다. API는 NiFi의 판정을 그대로 믿지 않고, 저장된 STAGING 지표가 모두 PASS일 때만 `STAGE_VALIDATING → STAGING_VALIDATED`로 CAS 갱신하고 `stageValidated=true`를 돌려준다.
 
 ---
 
@@ -1326,39 +1379,46 @@ SELECT COUNT(*) AS STAGE_COUNT,
 
 ```mermaid
 flowchart TD
-    I[Input: staging-valid] --> T[50_Create_Publish_Token<br/>UpdateAttribute]
-    T --> C[51_Claim_Publish<br/>InvokeHTTP POST publish/claim]
+    I((staging-valid)) --> T[50_Set_Publish_Token<br/>UpdateAttribute]
+    T --> B0[51_Build_Claim_Body<br/>ReplaceText]
+    B0 --> C[52_Claim_Publish<br/>InvokeHTTP POST publish/claim]
     C -->|Original 2xx| R{53_Is_Publish_Owner<br/>RouteOnAttribute}
-    C -->|Retry or Failure| CR[51R_RetryFlowFile]
-    CR -->|retry| C
-    CR -->|exceeded| F0[PG-90 ERROR<br/>게시 전이므로 재실행 가능]
-    R -->|no| X[Terminate duplicate publish]
-    R -->|yes| B[54_Build_Insert_Overwrite_SQL<br/>ReplaceText]
-    B --> P[55_PutHive3QL_INSERT_OVERWRITE]
-    P -->|success| S[56_Report_PUBLISHED<br/>InvokeHTTP POST publish/result]
-    P -->|failure| PA{55A_Classify_Publish_Failure}
-    PA -->|pre_execution| SF[56F_Report_FAILED_PUBLISH<br/>InvokeHTTP POST publish/result]
-    PA -->|unmatched| SU[56U_Report_PUBLISH_UNKNOWN<br/>InvokeHTTP POST publish/result]
-    S -->|Original 2xx| O[Output: published]
-    SF --> FE[PG-90 RUN_FAILED]
-    SU --> UE[PG-90 PUBLISH_UNKNOWN ERROR]
+    R -->|unmatched| X[종료<br/>중복 publish]
+    R -->|claimed| B[54_Build_Insert_Overwrite_SQL<br/>ReplaceText]
+    B --> P[55_Insert_Overwrite<br/>Hive 실행]
+    P -->|success| S1[56_Body_PUBLISHED<br/>ReplaceText]
+    P -->|failure| PA{55A_Classify_Publish_Failure<br/>RouteOnAttribute}
+    PA -->|pre_execution| S2[56F_Body_FAILED_PUBLISH<br/>ReplaceText]
+    PA -->|unmatched| S3[56U_Body_PUBLISH_UNKNOWN<br/>ReplaceText]
+    S1 & S2 & S3 --> RS[57_Report_Publish_Result<br/>InvokeHTTP POST publish/result]
+    RS --> RR{58_Is_Published<br/>RouteOnAttribute}
+    RR -->|PUBLISHED| O((published))
+    RR -->|unmatched| ERR((errors))
+    C & RS -.->|실패, 재시도 소진| ERR
 ```
+
+PG-50은 PoC 범위 밖이다(Hive 없음). V3 규칙을 적용한 설계다.
 
 ### 11.2 주요 Processor 설정
 
 | ID | Processor | Scheduling | 주요 Properties | Relationship |
 |---|---|---|---|---|
-| 50 | `UpdateAttribute` | All Nodes, 1 | `publish.token=${UUID()}`, `publishToken=${publish.token}`, 이어서 `AttributesToJSON`(Attributes List=`publishToken`) | success→51 |
-| 51 | `InvokeHTTP` | All Nodes, 1 | `POST /runs/${load.run.id}/publish/claim`, `Response Body Attribute Name=api.response` | Original→53, No Retry→PG-90, Retry/Failure→51R |
-| 53 | `RouteOnAttribute` | All Nodes, 1 | `${api.response:jsonPath('$.claimed'):equals('true')}` | true→54, false→중복 publish 종료 |
-| 54 | `ReplaceText` | All Nodes, 1 | 승인된 target/partition/column로 `INSERT OVERWRITE` SQL 생성 | success→55, failure→56F |
-| 55 | `PutHive3QL` 또는 `PutClouderaHiveQL` | All Nodes, 1 | `CS_HIVE3_DBCP`, Query Timeout, 환경 지원 시 Rollback On Failure=true | success→56, failure→55A |
+| 50 | `UpdateAttribute` | All Nodes, 1 | `publish.token=${UUID()}`, `load.stage=PUBLISH` | success→51 |
+| 51 | `ReplaceText` | All Nodes, 1 | 본문 `{"publishToken":"${publish.token}"}` | success→52 |
+| 52 | `InvokeHTTP` | All Nodes, 1 | `POST /runs/${load.run.id}/publish/claim`, `Response Body Attribute Name=api.response` | Original→53, No Retry/Retry/Failure→`errors` |
+| 53 | `RouteOnAttribute` | All Nodes, 1 | `claimed=${api.response:jsonPath('$.claimed'):equals('true')}` | claimed→54, unmatched→auto-terminate |
+| 54 | `ReplaceText` | All Nodes, 1 | 승인된 target/partition/column로 `INSERT OVERWRITE` SQL 생성 | success→55 |
+| 55 | Hive 실행 Processor | All Nodes, 1 | `CS_HIVE3_DBCP`, Query Timeout, 환경 지원 시 Rollback On Failure=true. **재시도 없음** | success→56, failure→55A |
 | 55A | `RouteOnAttribute` | All Nodes, 1 | 오류 attribute로 실행 전 실패 여부 판별(아래 기준) | pre_execution→56F, unmatched→56U |
-| 56, 56F, 56U | `AttributesToJSON` + `InvokeHTTP` | All Nodes, 1 | `POST /runs/${load.run.id}/publish/result`, 본문 `publishToken`, `outcome`(`PUBLISHED`/`FAILED_PUBLISH`/`PUBLISH_UNKNOWN`), `errorCode`, `message` | Original→PG-60(56) 또는 PG-90, Retry/Failure→제한 재시도 후 PG-90 ERROR |
+| 56, 56F, 56U | `ReplaceText` | All Nodes, 1 | 본문 `{"publishToken":"${publish.token}","outcome":"PUBLISHED"}`(56). 56F·56U는 `outcome`을 `FAILED_PUBLISH`·`PUBLISH_UNKNOWN`으로 하고 `"errorCode"`, `"message"`(`escapeJson`)를 넣는다 | success→57 |
+| 57 | `InvokeHTTP` | All Nodes, 1 | `POST /runs/${load.run.id}/publish/result`, `Response Body Attribute Name=api.response` | Original→58, No Retry/Retry/Failure→`errors` |
+| 58 | `RouteOnAttribute` | All Nodes, 1 | `published=${api.response:jsonPath('$.runStatus'):equals('PUBLISHED')}` | published→`published`, unmatched→`errors`(이벤트만) |
 
-51은 API가 `STAGING_VALIDATED → PUBLISHING`을 publish token으로 CAS하고 결과를 `claimed`로 돌려준다. 같은 token의 재요청은 `claimed=true`이므로, 응답을 잃고 재시도해도 게시 소유권을 잃지 않는다. token은 50에서 한 번만 만들고 재시도 루프에서 다시 만들지 않는다.
+52는 API가 `STAGING_VALIDATED → PUBLISHING`을 publish token으로 CAS하고 결과를 `claimed`로 돌려준다. 같은 token의 재요청은 `claimed=true`이므로, 응답을 잃고 재시도해도 게시 소유권을 잃지 않는다. token은 50에서 한 번만 만들고, relationship 재시도는 같은 FlowFile을 다시 보내므로 token이 바뀌지 않는다.
 
-56은 token이 일치할 때만 `PUBLISHING → PUBLISHED`로 바꾼다. Hive 실행은 성공했는데 56이 재시도를 다 써도 API에 보고하지 못하면 run은 `PUBLISHING`에 남는다. API sweeper가 `PUBLISH.STALE` 경과 후 `PUBLISH_UNKNOWN`으로 바꾸고 알린다. 이 경우 자동 재게시는 하지 않는다.
+게시 결과는 PG-50이 57에서 직접 보고한다. PG-90은 `load.stage=PUBLISH`인 오류에 대해 run 실패를 보고하지 않고 이벤트만 기록한다(14.2). 결과를 PG-90에 맡기면 `PUBLISH_UNKNOWN`과 `FAILED_PUBLISH` 구분이 사라지기 때문이다.
+
+57은 token이 일치할 때만 `PUBLISHING → PUBLISHED`로 바꾼다. Hive 실행은 성공했는데 57이 재시도를 다 써도 API에 보고하지 못하면 run은 `PUBLISHING`에 남는다. API sweeper가 `recovery.publish_stale` 경과 후 `PUBLISH_UNKNOWN`으로 바꾸고 알린다. 이 경우 자동 재게시는 하지 않는다.
 
 54 SQL 예시:
 
@@ -1371,7 +1431,7 @@ SELECT #{HIVE.INSERT.COLUMNS}
 
 전체 테이블이 아니라 업무일자 파티션만 교체해야 한다면 `TARGET.PARTITION.CLAUSE`를 반드시 설정한다. SQL에는 FlowFile에서 받은 임의 identifier를 사용하지 않는다.
 
-Hive 응답을 받지 못해 성공 여부가 불명확한 timeout은 자동 재실행하지 않고 `PUBLISH_UNKNOWN`으로 기록한다. 운영자가 Hive query history와 target 지표를 확인한 뒤 API의 운영자 엔드포인트(`POST /runs/{id}/publish-unknown/resolve`)로 확정한다.
+55는 relationship 재시도를 설정하지 않는다. `INSERT OVERWRITE`를 자동으로 다시 실행하면 결과가 불명확한 게시를 반복하게 된다. Hive 응답을 받지 못해 성공 여부가 불명확한 timeout은 `PUBLISH_UNKNOWN`으로 기록한다. 운영자가 Hive query history와 target 지표를 확인한 뒤 API의 운영자 엔드포인트(`POST /runs/{id}/publish-unknown/resolve`)로 확정한다.
 
 Hive Processor의 `failure` relationship만으로는 "SQL이 실행되지 않은 실패"와 "실행 후 응답을 잃은 경우"를 구분할 수 없다. 따라서 55의 failure는 기본적으로 `PUBLISH_UNKNOWN`으로 보낸다. 55A는 실행 전에 실패했음이 확실한 경우에만 `FAILED_PUBLISH`로 분류한다.
 
@@ -1379,7 +1439,7 @@ Hive Processor의 `failure` relationship만으로는 "SQL이 실행되지 않은
 - 권한 오류: authorization 실패 메시지
 - 연결 획득 실패: 연결 수립 단계 오류로, 문장 제출 전임이 확실한 경우
 
-timeout, connection reset, 원인 불명 오류는 모두 `PUBLISH_UNKNOWN`이다. CFM Hive Processor가 failure FlowFile에 어떤 오류 attribute(SQLState, message)를 붙이는지는 구현 전에 확인한다. attribute가 없으면 55A를 두지 않고 모든 failure를 `PUBLISH_UNKNOWN`으로 처리한다.
+timeout, connection reset, 원인 불명 오류는 모두 `PUBLISH_UNKNOWN`이다. CFM Hive Processor가 failure FlowFile에 어떤 오류 attribute(SQLState, message)를 붙이는지는 구현 전에 확인한다. attribute가 없으면 55A와 56F를 두지 않고 모든 failure를 `PUBLISH_UNKNOWN`으로 처리한다.
 
 ---
 
@@ -1389,34 +1449,35 @@ timeout, connection reset, 원인 불명 오류는 모두 `PUBLISH_UNKNOWN`이�
 
 ```mermaid
 flowchart TD
-    I[Input: published] --> Q[60_Query_Target_Metrics<br/>SelectHive3QL]
-    Q --> E[61_Extract_Target_Metrics]
-    E --> C{62_Compare_All_Stages}
-    C -->|match or mismatch| V[63_Report_Validations<br/>InvokeHTTP POST validations]
-    V -->|match| S[64_Report_SUCCESS<br/>InvokeHTTP POST success]
-    V -->|mismatch| F[66_Report_Target_Fail<br/>InvokeHTTP POST fail]
-    S -->|success=true| L[65_Log_Run_SUCCESS]
-    S -->|false| F
-    L --> O[Output: success]
-    Q -->|failure| F
-    F --> FE[PG-90 FAILED_TARGET_VALIDATION]
+    I((published)) --> A[60_Set_Target_Stage<br/>UpdateAttribute]
+    A --> Q[61_Query_Target_Metrics<br/>Hive 조회]
+    Q --> J[62_Build_Validations_Body<br/>JoltTransformJSON]
+    J --> V[63_Report_Validations<br/>InvokeHTTP POST validations]
+    V --> B[64_Empty_Json<br/>ReplaceText]
+    B --> S[65_Report_Success<br/>InvokeHTTP POST success]
+    S --> R{66_Is_Success<br/>RouteOnAttribute}
+    R -->|true| O[종료<br/>RUN_SUCCESS는 API가 기록]
+    R -->|unmatched| ERR((errors))
+    Q & J & V & S -.->|실패, 재시도 소진| ERR
 ```
+
+PG-60은 PoC 범위 밖이다(Hive 없음). V3 규칙을 적용한 설계다.
 
 ### 12.2 주요 Processor 설정
 
 | ID | Processor | Scheduling | 주요 Properties | Relationship |
 |---|---|---|---|---|
-| 60 | `SelectHive3QL` 또는 `ExecuteSQLRecord` | All Nodes, 1 | target 업무 범위 count/NULL/중복/min/max/업무 합계 SQL, JSON writer | success→61, failure→66 |
-| 61 | `EvaluateJsonPath` | All Nodes, 1 | target metrics를 `validation.target.*` attribute로 추출 | matched→62, failure/unmatched→66 |
-| 62 | `RouteOnAttribute` + `UpdateAttribute` | All Nodes, 1 | source/extracted/stage/target count와 DQ 지표 비교, 지표별 PASS/FAIL 설정 | 모두→63 |
-| 63 | `JoltTransformJSON` + `InvokeHTTP` | All Nodes, 1 | `stage=TARGET` 지표 배열을 `POST /validations` | Original→PASS면 64, FAIL이면 66 |
-| 64 | `InvokeHTTP` | All Nodes, 1 | `POST /runs/${load.run.id}/success`, 본문 `targetCount`, `Response Body Attribute Name=api.response` | `$.success=true`→65, false→66 |
-| 65 | `UpdateAttribute` + PG-90 port | All Nodes, 1 | `event.name=RUN_SUCCESS`, `event.level=INFO`, 최종 count/duration 설정 | success→완료 Output Port |
-| 66 | `AttributesToJSON` + `InvokeHTTP` | All Nodes, 1 | `POST /fail`, 본문 `expectedStatus=PUBLISHED`, `failStatus=FAILED_TARGET_VALIDATION` | Original→PG-90 ERROR |
+| 60 | `UpdateAttribute` | All Nodes, 1 | `load.stage=TARGET_VALIDATION` | success→61 |
+| 61 | Hive 조회 Processor 또는 `ExecuteSQLRecord` | All Nodes, 1 | target 업무 범위의 지표·기대값·PASS/FAIL SQL(10.3과 같은 형식, FROM만 target 업무 범위) | success→62, failure→`errors` |
+| 62 | `JoltTransformJSON` | All Nodes, 1 | `{"stage":"TARGET","queryVersion":"v1","metrics":[...]}` | success→63, failure→`errors` |
+| 63 | `InvokeHTTP` | All Nodes, 1 | `POST /runs/${load.run.id}/validations` | Original→64, No Retry/Retry/Failure→`errors` |
+| 64 | `ReplaceText` | All Nodes, 1 | 본문 `{}`(`targetCount`는 선택 필드) | success→65 |
+| 65 | `InvokeHTTP` | All Nodes, 1 | `POST /runs/${load.run.id}/success`, `Response Body Attribute Name=api.response` | Original→66, No Retry/Retry/Failure→`errors` |
+| 66 | `RouteOnAttribute` | All Nodes, 1 | `${api.response:jsonPath('$.success'):equals('true')}` | matched→auto-terminate, unmatched→`errors` |
 
-PG-40에서 이어진 같은 FlowFile이므로 source와 stage 지표 attribute를 그대로 비교에 쓴다.
+PG-40에서 이어진 같은 FlowFile이므로 44가 꺼낸 source 기대값 attribute를 61의 SQL에 그대로 쓴다. 61 이후의 실패와 66의 `success=false`는 `load.stage=TARGET_VALIDATION`이므로 PG-90이 run을 `FAILED_TARGET_VALIDATION`으로 보고한다(14.2).
 
-62 조건:
+61 조건:
 
 ```text
 target_count = stage_count = extracted_count = source_count
@@ -1424,7 +1485,7 @@ AND target key/null/duplicate metrics pass
 AND target business aggregates = stage/source aggregates
 ```
 
-API는 64에서 저장된 TARGET 지표가 모두 PASS이고 `status='PUBLISHED'`일 때만 `SUCCESS`로 갱신하며, 완료시각과 모든 count를 저장한다. Target 검증 실패 시 재추출이나 overwrite를 자동 반복하지 않는다.
+API는 65에서 저장된 TARGET 지표가 모두 PASS이고 `status='PUBLISHED'`일 때만 `SUCCESS`로 갱신하며, 완료시각과 모든 count를 저장하고 `RUN_SUCCESS` 이벤트를 기록한다. Target 검증 실패 시 재추출이나 overwrite를 자동 반복하지 않는다.
 
 ---
 
@@ -1457,120 +1518,101 @@ API는 64에서 저장된 TARGET 지표가 모두 PASS이고 `status='PUBLISHED'
   "upperInclusive": false, "isNullPartition": false, "expectedRowCount": 15000 }
 ```
 
-| ID | Processor | Scheduling | 주요 Properties | Relationship |
-|---|---|---|---|---|
-| 70 | `EvaluateJsonPath` | All Nodes, 1 | 본문을 `load.*`, `partition.*` attribute로 추출(5장 이름과 동일) | matched→71 |
-| 71 | `RouteOnAttribute` | All Nodes, 1 | SCN·경계·건수 숫자 정규식 검증 | valid→72, unmatched→PG-90 ERROR |
-| 72 | `UpdateAttribute` + Output Port | All Nodes, 1 | `event.name=RECOVERY_REISSUED`, `event.level=WARN` | success→PG-20 입력(Round Robin) |
+재발행 수신에는 별도 Processor가 없다. PG-05의 09가 본문 필드를 `load.*`, `partition.*` attribute로 한 번에 추출하고(9.5), 10이 Job PG의 `reissue-in`으로 보낸다. `reissue-in`은 PG-20의 `partitions` Input Port에 Round Robin으로 연결된다. 숫자 검증(SCN, 경계)은 PG-20의 33이 수행한다. 재발행 이벤트(`RECOVERY_REISSUED`)는 API sweeper가 기록한다.
 
-재발행된 FlowFile은 PG-20의 20에서 새 claim token으로 claim한다. 이 claim이 재발행 수신 확인(ACK)이 되며, ACK 없이 `dispatch.ack_timeout`이 지나면 API가 재발행 요청을 다시 보낸다. API는 `RETRY` 상태 파티션만 claim을 허용하므로 이전 Worker가 늦게 살아나도 이전 token의 chunk 보고는 409 `CLAIM_MISMATCH`로 거부된다. API는 재발행 전에 이전 시도의 chunk 기록을 집계에서 빼므로, 새 Worker의 보고만으로 파티션을 판정한다. 같은 `run_id + partition_id`와 같은 SCN, 같은 결정적 파일명을 쓰므로 PutHDFS `replace`로 이전 파일을 덮어쓴다. 재발행은 Oracle UNDO 보존 시간이 run 최대 시간보다 길다는 것을 확인한 뒤 켠다.
+재발행된 FlowFile은 PG-20의 30에서 새 claim token을 만들어 claim한다. 이 claim이 재발행 수신 확인(ACK)이 되며, ACK 없이 `dispatch.ack_timeout`이 지나면 API가 재발행 요청을 다시 보낸다. API는 `RETRY` 상태 파티션만 claim을 허용하므로 이전 Worker가 늦게 살아나도 이전 token의 chunk 보고는 409 `CLAIM_MISMATCH`로 거부된다. API는 재발행 전에 이전 시도의 chunk 기록을 집계에서 빼므로, 새 Worker의 보고만으로 파티션을 판정한다. 같은 `run_id + partition_id`와 같은 SCN, 같은 결정적 파일명을 쓰므로 PutHDFS `replace`로 이전 파일을 덮어쓴다. 재발행은 Oracle UNDO 보존 시간이 run 최대 시간보다 길다는 것을 확인한 뒤 켠다.
 
 ---
 
-## 14. PG-90 Audit, Error and Notification
+## 14. PG-90 Error and Event
 
-### 14.1 이벤트 흐름
+모든 자식 PG의 `errors` Output Port가 PG-90의 Input Port 하나로 모인다. PG-90은 오류를 정규화하고, 상태 보고가 필요한 오류는 Load Control API에 실패를 보고한 뒤, `load_event`와 로그를 남긴다.
+
+### 14.1 Processor 흐름
 
 ```mermaid
 flowchart LR
-    I[Input event FlowFile] --> P[90_Prepare_Event_Attributes<br/>UpdateAttribute]
-    P --> A[91_AttributesToJSON]
-    A --> B[92_PutSQL<br/>nifi_ops.load_event]
-    B -->|success| C[93_LogMessage]
-    B -->|failure| D[94_Event_DLQ<br/>PutFile or Kafka]
-    C --> E{95_Alert_Required}
-    E -->|yes| F[96_PutEmail or enterprise alert]
-    E -->|no| T[Terminate]
+    I((errors)) --> N[90_Normalize_Error<br/>UpdateAttribute]
+    N --> R{91_Route_Failure_Report<br/>RouteOnAttribute}
+    R -->|report_run| RB[92_Build_Run_Fail_Body<br/>ReplaceText]
+    RB --> RI[93_Report_Run_Fail<br/>InvokeHTTP POST fail]
+    R -->|report_partition| PB[94_Build_Partition_Fail_Body<br/>ReplaceText]
+    PB --> PI[95_Report_Partition_Fail<br/>InvokeHTTP POST partition fail]
+    R -->|unmatched| EV[96_Insert_Load_Event<br/>PutSQL]
+    RI & PI --> EV
+    EV -->|success| L[97_LogMessage]
+    EV -->|failure, retry| D[98_Event_DLQ<br/>PutFile 선택]
+    L --> AL{99_Alert<br/>선택}
 ```
 
-업무 상태를 바꾸는 `nifi_ops.load_run/load_partition/load_file/load_validation/load_dispatch` 기록은 각 주 흐름이 Load Control API를 동기적으로 호출해 처리한다. 상태 전이 이벤트는 API가 같은 트랜잭션에서 `load_event`에 기록한다. PG-90은 NiFi Processor 오류와 Data plane 관측 이벤트만 기록한다. 이벤트 DB 장애가 데이터 FlowFile을 무한 정지시키지 않도록 로컬 보호 DLQ 또는 운영 Kafka로 보낸다.
+업무 상태를 바꾸는 기록(`load_run`, `load_partition`, `load_file`, `load_validation`, `load_dispatch`)은 각 PG가 API를 동기적으로 호출해 처리하고, 상태 전이 이벤트는 API가 같은 트랜잭션에서 `load_event`에 기록한다. PG-90은 NiFi Processor 오류만 기록한다. 이벤트 DB 장애가 FlowFile을 무한 정지시키지 않도록 96의 실패는 로컬 DLQ 또는 운영 Kafka로 보낸다.
 
 ### 14.2 주요 Processor 설정
 
 | ID | Processor | Scheduling | 주요 Properties | Relationship |
 |---|---|---|---|---|
-| 90 | `UpdateAttribute` | All Nodes, 2~4 | event_id/time/level/name, run/partition/chunk, 오류 및 처리량 속성 정규화 | success→91 |
-| 91 | `AttributesToJSON` | All Nodes, 2~4 | Destination=flowfile-content, 지정 attribute 목록만 포함, pretty print=false | success→92, failure→94 |
-| 92 | `PutSQL` | All Nodes, 2~4 | `CS_DBCP_META`, event INSERT prepared SQL, Batch=1, Fragmented=false | success→93, retry/failure→94 |
-| 93 | `LogMessage` | All Nodes, 2~4 | Prefix=`SQOOP_REPLACEMENT`, Level=`${event.level}`, 구조화 JSON message | success→95 |
-| 94 | `PutFile` 또는 운영 Kafka Publisher | All Nodes, 1~2 | 복구 가능한 DLQ 경로 또는 topic, 결정적 event filename/key | success→오류 카운터, failure→Bulletin/운영 알림 |
-| 95 | `RouteOnAttribute` | All Nodes, 2~4 | ERROR, PUBLISH_UNKNOWN, 최종 실패 등 알림 대상 분기 | alert→96, unmatched→terminate |
-| 96 | `PutEmail` 또는 조직 알림 Processor | All Nodes, 1 | 제목에 job/run/status, 본문에 비밀값 없는 요약 | success→terminate, failure→DLQ/Bulletin |
+| 90 | `UpdateAttribute` | All Nodes, 2~4 | `error.stage`, `error.code`, `error.class`, `error.message`, `load.fail.expected`, `load.fail.status`를 아래 규칙으로 계산 | success→91 |
+| 91 | `RouteOnAttribute` | All Nodes, 2~4 | `report_run`, `report_partition`(아래 규칙) | report_run→92, report_partition→94, unmatched→96 |
+| 92 | `ReplaceText` | All Nodes, 2~4 | 본문 `{"expectedStatus":"${load.fail.expected}","failStatus":"${load.fail.status}","errorStage":"${error.stage}","errorCode":"${error.code}","message":"<escapeJson한 error.message>"}` | success→93 |
+| 93 | `InvokeHTTP` | All Nodes, 2~4 | `POST /runs/${load.run.id}/fail`, 9.2 공통 설정 | 모든 relationship→96 |
+| 94 | `ReplaceText` | All Nodes, 2~4 | 본문 `{"claimToken":"${partition.claim.token}","errorStage":"${error.stage}","errorClass":"${error.class}","errorCode":"${error.code}","message":"<escapeJson한 error.message>"}` | success→95 |
+| 95 | `InvokeHTTP` | All Nodes, 2~4 | `POST /runs/${load.run.id}/partitions/${partition.id}/fail`, 9.2 공통 설정 | 모든 relationship→96 |
+| 96 | `PutSQL` | All Nodes, 2~4 | `CS_DBCP_META`, `load_event` INSERT(14.3), Batch=1, Support Fragmented Transactions=false | success→97, failure/retry→98 |
+| 97 | `LogMessage` | All Nodes, 2~4 | Prefix=`SQOOP_REPLACEMENT`, Level=`${error.code:equals('DUPLICATE_ACTIVE_RUN'):ifElse('warn','error')}`, 구조화 JSON(14.5) | success→99 또는 auto-terminate |
+| 98 | `PutFile` 또는 운영 Kafka Publisher (선택) | All Nodes, 1~2 | 복구 가능한 DLQ 경로 또는 topic | success→auto-terminate, failure→Bulletin |
+| 99 | 알림 Processor (선택) | All Nodes, 1 | ERROR 수준을 조직 알림으로 전달. API 이벤트 기반 알림이 있으면 두지 않는다 | auto-terminate |
+
+**90 오류 정규화 규칙.** 같은 `UpdateAttribute` 안에서는 방금 만든 값을 참조할 수 없으므로(2.1 규칙 6), 식마다 원천 attribute를 직접 쓴다.
+
+| 속성 | 규칙 |
+|---|---|
+| `error.stage` | `${load.stage}`. 없으면 `CONTROL_RECEIVER` |
+| `error.code` | 상태 코드가 3xx~5xx이면 `HTTP_<code>`, 단 `load.stage=RUN_CREATE`이고 409이면 `DUPLICATE_ACTIVE_RUN` → `invokehttp.java.exception.class`가 있으면 `API_UNREACHABLE` → `executesql.error.message`에 `ORA-nnnnn`이 있으면 그 코드, 없으면 `SQL_ERROR` → 그 밖에는 `<stage>_FAILED` |
+| `error.class` | 연결 예외면 `TRANSIENT`, 4xx면 `VALIDATION`, 그 밖에는 `NON_RETRYABLE` |
+| `error.message` | 3xx~5xx이면 `invokehttp.response.body`, 없으면 `api.response`(9.3) → `executesql.error.message` → `invokehttp.java.exception.message` → 고정 문구 `processor routed failure; see bulletin and provenance` |
+| `load.fail.expected`, `load.fail.status` | 아래 표 |
+
+상태 코드는 3xx~5xx만 본다. 2xx는 앞 단계 API 호출이 성공한 흔적으로 FlowFile에 남아 있을 뿐이기 때문이다. PutHDFS처럼 오류 attribute를 남기지 않는 Processor의 실패는 `load.stage`로만 식별되므로(예: `CHUNK_WRITE_FAILED`), 상세 원인은 NiFi Bulletin과 Provenance에서 `run_id`, `partition_id`로 찾는다.
+
+**91 실패 보고 규칙.**
+
+| `load.stage` | 보고 | `expectedStatus` → `failStatus` | 조건 |
+|---|---|---|---|
+| `RUN_CREATE` | 없음(이벤트만) | - | run이 만들어지지 않았다 |
+| `MANIFEST` | `report_run` | `CREATED` → `FAILED_MANIFEST` | `load.run.id`가 있고, manifest 422가 아님(422면 API가 이미 기록) |
+| `EXTRACT`, `CHUNK_WRITE` | `report_partition` | partition `FAILED`, run `FAILED_EXTRACT` | `api.response`의 `claimed=true`(claim에 성공한 파티션) |
+| `VALIDATION_START` | 없음(이벤트만) | - | API가 ACK timeout 뒤 다시 보낸다 |
+| `STAGE_VALIDATION` | `report_run` | `STAGE_VALIDATING` → `FAILED_STAGE_VALIDATION` | |
+| `PUBLISH` | 없음(이벤트만) | - | PG-50이 `publish/result`로 직접 보고한다(11.2) |
+| `TARGET_VALIDATION` | `report_run` | `PUBLISHED` → `FAILED_TARGET_VALIDATION` | |
+
+claim 응답 이후 chunk 보고 전까지 `api.response`는 claim 응답으로 남아 있다. 그래서 `claimed=true` 조건으로 "이 Worker가 소유한 파티션의 실패"만 보고한다. 93·95의 결과와 무관하게 96에서 이벤트를 기록한다. 보고 자체가 실패하면 run은 API sweeper가 timeout으로 정리한다.
 
 ### 14.3 PostgreSQL 이벤트 기록
 
-테이블은 4.1의 `nifi_ops.load_event` DDL을 사용한다. `90_Prepare_Event_Attributes`는 아래 PostgreSQL 컬럼명과 동일한 attribute를 만들고, `91_AttributesToJSON`은 해당 attribute 목록을 FlowFile content로 직렬화한다. `92_PutSQL`은 `CS_DBCP_META`, Batch Size=1, Support Fragmented Transactions=false로 설정한다.
-
-`UpdateAttribute` 동적 Property 예시는 다음과 같다.
-
-```text
-event_id      = ${UUID()}
-event_time    = ${now():format("yyyy-MM-dd'T'HH:mm:ss.SSSXXX","UTC")}
-event_level   = ${event.level}
-event_name    = ${event.name}
-run_id        = ${load.run.id}
-job_key       = ${load.job.key}
-business_key  = ${load.business.key}
-partition_id  = ${partition.id}
-chunk_index   = ${chunk.index}
-process_group = ${event.process.group}
-processor_name = ${event.processor.name}
-node_id       = ${hostname(true)}
-attempt_no    = ${partition.retry.count}
-row_count     = ${event.row.count}
-duration_ms   = ${event.duration.ms}
-error_class   = ${error.class}
-error_code    = ${error.code}
-message       = ${error.message}
-```
-
-`AttributesToJSON`은 Destination=`flowfile-content`, Attributes List=`event_id,event_time,event_level,event_name,run_id,job_key,business_key,partition_id,chunk_index,process_group,processor_name,node_id,attempt_no,row_count,duration_ms,error_class,error_code,message`로 설정한다. 이 content는 DLQ와 운영 분석에 사용하고, DB INSERT는 아래 prepared SQL을 사용한다.
+테이블은 4.1의 `nifi_ops.load_event` DDL을 사용한다. 96은 SQL Statement 속성에 EL로 값을 넣는다. 문자열은 작은따옴표를 두 개로 바꾸고 줄바꿈을 제거하며 1,500자로 자른다. 값은 모두 NiFi 내부 attribute에서 오며 업무 데이터나 외부 입력 원문은 넣지 않는다. 운영 표준이 prepared statement라면 90에서 `sql.args.N.type/value`를 함께 만들고 `?` 자리표시자를 쓴다.
 
 ```sql
 INSERT INTO nifi_ops.load_event (
-    event_id, event_time, event_level, event_name,
-    run_id, job_key, business_key, partition_id, chunk_index,
-    process_group, processor_name, node_id,
-    attempt_no, row_count, duration_ms,
+    event_id, event_level, event_name, run_id, job_key, business_key,
+    partition_id, chunk_index, process_group, node_id,
     error_class, error_code, message
 ) VALUES (
-    CAST(? AS uuid), CAST(? AS timestamptz), ?, ?,
-    CAST(NULLIF(?, '') AS uuid), ?, ?, ?, CAST(NULLIF(?, '') AS integer),
-    ?, ?, ?,
-    CAST(NULLIF(?, '') AS integer), CAST(NULLIF(?, '') AS bigint),
-    CAST(NULLIF(?, '') AS bigint),
-    NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, '')
+    gen_random_uuid(),
+    CASE WHEN '${error.code}' = 'DUPLICATE_ACTIVE_RUN' THEN 'WARN' ELSE 'ERROR' END,
+    CASE WHEN '${error.code}' = 'DUPLICATE_ACTIVE_RUN' THEN 'DUPLICATE_ACTIVE_RUN'
+         ELSE '${error.stage}_FAILED' END,
+    CAST(NULLIF('${load.run.id}', '') AS uuid),
+    COALESCE(NULLIF('${load.job.key}', ''), '#{JOB.KEY}'),
+    NULLIF('${load.business.key}', ''), NULLIF('${partition.id}', ''),
+    CAST(NULLIF('${chunk.index}', '') AS integer),
+    'JOB_ORACLE_INSP_DTL_DAILY', '${hostname(true)}',
+    NULLIF('${error.class}', ''), NULLIF('${error.code}', ''),
+    NULLIF('<정리한 error.message>', '')
 );
 ```
 
-`sql.args.1`부터 `sql.args.18`까지 위 컬럼 순서로 매핑하고 type은 문자열 전달이 가능한 `VARCHAR(12)`를 사용한다. PostgreSQL `CAST/NULLIF`가 UUID, timestamp 및 숫자 변환을 담당하므로 선택 숫자 값이 비어 있어도 INSERT가 실패하지 않는다.
-
-생성되는 JSON 예시는 다음과 같다.
-
-```json
-{
-  "event_id": "0199d100-1111-7000-8000-000000000001",
-  "event_time": "2026-09-28T05:10:12.123Z",
-  "event_level": "INFO",
-  "event_name": "CHUNK_REPORTED",
-  "run_id": "0199d100-2222-7000-8000-000000000002",
-  "job_key": "ORACLE_INSP_DTL_DAILY",
-  "business_key": "2026-09-28",
-  "partition_id": "0003",
-  "chunk_index": 2,
-  "process_group": "PG-20 Extract Workers",
-  "processor_name": "34B_Report_Chunk",
-  "node_id": "nifi-02.example.com",
-  "attempt_no": 1,
-  "row_count": 500000,
-  "duration_ms": 82451,
-  "error_class": null,
-  "error_code": null,
-  "message": "partitionStatus=SUCCESS runStatus=EXTRACTING"
-}
-```
-
-이벤트 INSERT 실패는 main flow 상태를 되돌리지 않고 JSON content를 DLQ에 저장하되, Run/Partition/File/Validation 상태 기록 실패는 해당 단계 자체를 실패시킨다.
+`job_key`의 `'#{JOB.KEY}'`는 EL 밖에 있으므로 Parameter가 치환된다. 이벤트 INSERT 실패는 main flow 상태를 되돌리지 않는다.
 
 ### 14.4 필수 이벤트
 
@@ -1581,53 +1623,33 @@ INSERT INTO nifi_ops.load_event (
 | INFO | `MANIFEST_CREATED` | SCN·metric 저장, manifest 등록 | API |
 | ERROR | `MANIFEST_INVALID` | 불변식 위반, `FAILED_MANIFEST` | API |
 | INFO | `PARTITION_STARTED` | claim 성공 | API |
-| DEBUG | `CHUNK_REPORTED` | PutHDFS 성공 후 보고; 운영 로그량에 따라 생략 가능 | NiFi PG-90 |
 | INFO | `PARTITION_SUCCESS` | 파티션 row/file 판정 성공 | API |
-| ERROR | `PARTITION_FAILED` | 재시도 소진, 비일시 오류, row 수 불일치 | API(상태), NiFi PG-90(Processor 오류 상세) |
+| ERROR | `PARTITION_FAILED` | 실패 보고, row 수 불일치 | API |
 | INFO | `EXTRACT_VALIDATED` | 전체 파티션 판정 성공, 검증 호출 예약 | API |
-| ERROR | `DISPATCH_DEAD` | 검증 호출 최대 시도 초과 | API |
+| ERROR | `DISPATCH_DEAD` | 검증·재발행 호출 최대 시도 초과 | API |
 | INFO | `STAGE_VALIDATION_STARTED` | `/validation/start` CAS 성공 | API |
 | INFO | `STAGE_VALIDATED` | external table 검증 성공 | API |
 | INFO | `PUBLISH_STARTED` | publish CAS 획득 | API |
-| INFO | `PUBLISH_FINISHED` | HiveQL 성공 보고 | API |
-| ERROR | `PUBLISH_UNKNOWN` | timeout/연결 단절로 결과 불명, 또는 sweeper 판정 | API |
+| ERROR | `PUBLISH_UNKNOWN` | 결과 불명 보고 또는 sweeper 판정 | API |
 | INFO | `RUN_SUCCESS` | target 검증 완료 | API |
 | ERROR | `RUN_FAILED` | 최종 실패 확정 | API |
 | ERROR | `RUN_TIMED_OUT` | sweeper timeout | API |
-| ERROR | `CONTROL_API_UNREACHABLE` | API 호출 재시도 소진 | NiFi PG-90 |
-| WARN | `RECOVERY_REISSUED` | stale partition 재발행 | API, NiFi PG-90(수신) |
+| WARN | `RECOVERY_REISSUED` | stale partition 재발행 | API |
+| ERROR | `<STAGE>_FAILED` | NiFi Processor 실패. `error_code`에 `HTTP_<code>`, `API_UNREACHABLE`, `ORA-nnnnn`, `<STAGE>_FAILED` 등 | NiFi PG-90 |
+
+NiFi는 상태 전이 이벤트를 다시 기록하지 않는다. NiFi 2.4.0 PoC V2에서 `EXTRACT_VALIDATED`, `STAGE_VALIDATION_STARTED`가 API와 NiFi 양쪽에 중복 기록된 것을 확인하고 V3에서 제거했다. 같은 실패가 API의 `PARTITION_FAILED`/`RUN_FAILED`와 NiFi의 `<STAGE>_FAILED`로 함께 남는 것은 의도한 것이다. 전자는 상태, 후자는 Processor 오류 상세다.
 
 ### 14.5 `LogMessage` 형식
 
 ```text
 Log Prefix  = SQOOP_REPLACEMENT
-Log Level   = ${event.level}
-Log Message = {"event":"${event.name}","run_id":"${load.run.id}",
- "job_key":"${load.job.key}","business_key":"${load.business.key}",
- "partition_id":"${partition.id}","chunk_index":"${chunk.index}",
- "node":"${hostname(true)}","attempt":"${partition.retry.count}",
- "rows":"${event.row.count}","duration_ms":"${event.duration.ms}",
- "error_class":"${error.class}","error_code":"${error.code}",
- "message":"${error.message}"}
+Log Level   = ${error.code:equals('DUPLICATE_ACTIVE_RUN'):ifElse('warn','error')}
+Log Message = {"stage":"${error.stage}","code":"${error.code}","class":"${error.class}",
+ "run_id":"${load.run.id}","job_key":"${load.job.key}","business_key":"${load.business.key}",
+ "partition_id":"${partition.id}","message":"<escapeJson한 error.message>"}
 ```
 
 `error.message`는 줄바꿈 제거, 길이 제한 및 비밀값 마스킹 후 기록한다. SQL 본문 전체, JDBC URL의 credential, 원천 행 데이터는 로그에 기록하지 않는다.
-
-### 14.6 오류 공통 경로
-
-각 Processor의 failure 관계에는 먼저 전용 `UpdateAttribute`를 둔다.
-
-```text
-error.stage     = ORACLE_EXTRACT | HDFS_WRITE | STAGE_VALIDATE | PUBLISH ...
-error.processor = 25_Execute_Partition_Query
-error.class     = TRANSIENT | NON_RETRYABLE | VALIDATION | UNKNOWN
-error.code      = processor가 제공한 SQLState/vendor code 또는 INTERNAL
-error.message   = processor error attribute, 없으면 고정 설명
-event.level     = ERROR
-event.name      = PARTITION_FAILED 또는 RUN_FAILED
-```
-
-`ExecuteSQLRecord`의 `executesql.error.message`처럼 Processor가 제공하는 attribute를 사용한다. PutHDFS처럼 구체적인 오류 attribute가 없는 경우 `PutHDFS routed failure; see bulletin and provenance for run_id/partition_id`를 기록하고 NiFi Bulletin/Provenance와 상관 조회한다.
 
 ---
 
@@ -1635,21 +1657,21 @@ event.name      = PARTITION_FAILED 또는 RUN_FAILED
 
 | Connection | Object threshold | Data threshold | 기타 |
 |---|---:|---:|---|
-| Coordinator → Worker | `2 × 전체 worker 수` 이상 | 제어 FlowFile이므로 100 MB | Round Robin |
-| PutHDFS → 보고(34A/34B) | 1,000 | 100 MB | PutHDFS 후 content를 보고 JSON으로 바꾸므로 작음 |
-| ExecuteSQLRecord → Validate/PutHDFS | 100~500 | HDFS 지연을 견디되 repository 용량의 20% 이하 | Oldest First |
-| PutHDFS retry loop | 100 | 10 GB 예시 | RetryFlowFile penalty 사용 |
-| API 보고 retry loop(34C) | 1,000 | 100 MB | 보고 JSON만 담긴 작은 FlowFile, RetryFlowFile penalty |
-| Control Receiver → Job PG | active run 수 × 2 | 10 MB | 검증·재발행 요청 |
-| Audit | 10,000 | 1 GB | 중요 이벤트 우선순위 가능 |
+| PG-10 `partitions` → PG-20 | `2 × 전체 worker 수` 이상 | 제어 FlowFile이므로 100 MB | Round Robin |
+| PG-20 34 → 35~37 | 100~500 | HDFS 지연을 견디되 repository 용량의 20% 이하 | Oldest First |
+| PG-20 37 → 38 → 39 | 1,000 | 100 MB | PutHDFS 후 content를 보고 JSON으로 바꾸므로 작음 |
+| PG-05 → Job PG `validate-in`, `reissue-in` | active run 수 × 2 | 10 MB | 검증·재발행 요청 |
+| 각 PG `errors` → PG-90 | 10,000 | 1 GB | 오류 폭주 시에도 main flow를 막지 않도록 넉넉히 |
+
+relationship 재시도 중인 FlowFile은 penalty 상태로 **해당 Processor의 입력 Connection**에 남는다. 별도의 retry loop Connection이 없으므로, 입력 Connection의 threshold에 재시도 대기분을 포함해 산정한다. 예를 들어 API가 내려가 있으면 39의 입력 Connection에 보고 대기 FlowFile이 쌓이고, threshold에 도달하면 37(PutHDFS)이 멈춘다.
 
 정확한 값은 평균 FlowFile 크기, Content Repository 용량, 동시 run 수로 산정한다. Back Pressure가 걸렸는데 Coordinator가 새 run을 계속 생성하지 않도록 활성 run lock을 유지한다.
 
 ### 15.1 `PutSQL` 사용 범위
 
-NiFi의 `PutSQL`은 PG-90의 `load_event` INSERT(92)에만 쓴다. 원장 쓰기는 모두 API 호출이므로 가이드 초안의 manifest 행별 INSERT(Fragmented=true)와 그로 인한 livelock 문제는 생기지 않는다.
+NiFi의 `PutSQL`은 PG-90의 `load_event` INSERT(96)에만 쓴다. 원장 쓰기는 모두 API 호출이므로 가이드 초안의 manifest 행별 INSERT(Fragmented=true)와 그로 인한 livelock 문제는 생기지 않는다.
 
-`SplitJson`이나 `ExecuteSQLRecord`가 만든 FlowFile에는 `fragment.identifier/count/index`가 남아 있다. 이벤트 FlowFile이 이 attribute를 가진 채 92에 들어오면 `PutSQL`이 fragment가 모두 모일 때까지 기다릴 수 있다. 따라서 92는 `Support Fragmented Transactions=false`를 반드시 명시한다. NiFi 2.4.0 PoC에서 Fragmented=true인 `PutSQL`이 일부 fragment만 poll되면 FlowFile을 penalize해 되돌리고, Penalty Duration이 0보다 크면 livelock이 생기는 것을 재현했다.
+`SplitJson`이나 `ExecuteSQLRecord`가 만든 FlowFile에는 `fragment.identifier/count/index`가 남아 있다. 오류 FlowFile이 이 attribute를 가진 채 96에 들어오면 `PutSQL`이 fragment가 모두 모일 때까지 기다릴 수 있다. 따라서 96은 `Support Fragmented Transactions=false`를 반드시 명시한다. NiFi 2.4.0 PoC에서 Fragmented=true인 `PutSQL`이 일부 fragment만 poll되면 FlowFile을 penalize해 되돌리고, Penalty Duration이 0보다 크면 livelock이 생기는 것을 재현했다.
 
 ---
 
@@ -1657,25 +1679,27 @@ NiFi의 `PutSQL`은 PG-90의 `load_event` INSERT(92)에만 쓴다. 원장 쓰기
 
 | 분류 | 예 | 동작 |
 |---|---|---|
-| 일시적 | connection reset, 일시 HDFS unavailable, DB pool timeout | 최대 `${PARTITION.RETRY.MAX}`, penalty/backoff 후 같은 partition 재시도 |
-| 스냅샷 불가 | `ORA-01555`, snapshot too old | 즉시 전체 run 실패, 새 SCN 일부 재시도 금지 |
-| 영구 SQL | ORA-00942, 문법/컬럼/권한 오류 | 즉시 실패 |
+| API 일시 장애 | 5xx, 연결 실패, timeout | `InvokeHTTP` relationship 재시도(Retry, Failure). 소진 시 `errors` → PG-90, run은 API sweeper가 정리 |
+| API 거부 | 409, 404, 422 | 재시도하지 않음(No Retry → `errors`). 409는 정상 경합(WARN), 404/422는 설정·입력 오류(ERROR) |
+| HDFS 일시 장애 | 일시 HDFS unavailable | `PutHDFS` relationship 재시도(failure). 소진 시 파티션 실패 |
+| 원천 SQL 오류 | connection reset, `ORA-01555`, ORA-00942, 문법/권한 오류 | 재시도하지 않음. 즉시 파티션 실패 보고 후 run 실패, 새 `run_id`로 재실행 |
 | 데이터 | schema 변환 실패, expected/actual mismatch | 즉시 실패 및 파일 격리 |
-| 게시 불명 | Hive timeout, connection loss after submit | `PUBLISH_UNKNOWN`, 자동 overwrite 재실행 금지 |
-| API 일시 장애 | 5xx, 연결 실패, timeout | `CONTROL.API.RETRY.MAX`까지 같은 요청 재시도(멱등). 소진 시 PG-90 ERROR, run은 API sweeper가 정리 |
-| API 거부 | 409, 404, 422 | 재시도하지 않음. 409는 정상 경합(WARN), 404/422는 설정·입력 오류(ERROR) |
+| 게시 불명 | Hive timeout, connection loss after submit | 재시도하지 않음. `PUBLISH_UNKNOWN`, 자동 overwrite 재실행 금지 |
 
-`RetryFlowFile` 설정 예:
+relationship 재시도 설정(Processor 설정의 Relationships 탭):
 
 ```text
-Retry Attribute               = partition.retry.count
-Maximum Retries               = #{PARTITION.RETRY.MAX}
-Penalize Retries              = true
-Fail on Non-numerical Overwrite = true
-Reuse Mode                    = Fail on Reuse
+Retry Count           = 기준값(InvokeHTTP: CONTROL.API.RETRY.MAX, PutHDFS: PARTITION.RETRY.MAX)
+Retried Relationships = InvokeHTTP: Retry, Failure / PutHDFS: failure
+Backoff Policy        = Penalize FlowFile
+Max Backoff Period    = 1 min
+Penalty Duration      = 5 sec (Scheduling 탭)
 ```
 
-Connection의 Penalty Duration으로 최소 backoff를 설정한다. 더 긴 지수 backoff가 필요하면 retry count별 `RouteOnAttribute`와 `ControlRate`/지연 queue를 사용한다. 재시도 loop마다 Retry Attribute를 다르게 둔다(`partition.retry.count`, `hdfs.retry.count`, `api.retry.count`). 같은 attribute를 쓰면 앞 loop의 횟수가 뒤 loop에 이어진다.
+재시도는 같은 FlowFile을 같은 Processor가 다시 처리하는 방식이다. penalty가 시도마다 두 배로 늘어 Max Backoff Period에서 멈춘다. 재시도를 다 쓰면 FlowFile은 해당 relationship의 Connection(`errors`)으로 간다. `RetryFlowFile`과 달리 재시도 횟수 attribute가 남지 않고 Processor도 늘지 않는다. 대신 오류 종류에 따라 재시도 여부를 나눌 수 없다. 그래서 다음 Processor는 재시도를 켜지 않는다.
+
+- 파티션 쿼리(PG-20 34): `ORA-01555`나 권한 오류처럼 같은 SCN으로 다시 해도 실패할 오류까지 재시도하면, 긴 쿼리를 그만큼 반복한 뒤에야 실패가 확정된다. 일시 오류로 run 하나가 실패하는 비용이 더 작다고 보고 재시도하지 않는다. 일시 오류 재시도가 꼭 필요하면 34의 failure를 `RouteOnAttribute`(오류 코드 분류)와 `RetryFlowFile`로 보내는 가이드 초안 방식을 이 Processor에만 쓴다. NiFi 2.4.0 PostgreSQL PoC는 원천이 짧은 쿼리라 Retry Count 3으로 시험했다.
+- Hive 게시(PG-50 55): 자동 재실행이 결과 불명 게시를 반복하기 때문이다(11.2).
 
 ---
 
@@ -1733,12 +1757,15 @@ API 쪽 구현과 동시성 테스트는 API 설계 9.5~9.6, 11장을 따른다.
 
 ## 18. NiFi 운영 설정
 
+- Canvas: Job PG 아래 자식 PG와 Port로 구성한다(2장). Job PG와 자식 PG 모두에 `PC_JOB_<JOB_NAME>`을 지정하고, Controller Service는 Job PG에 둔다
+- 배포: Trigger(PG-00 00)는 DISABLED로 배포하고 Job PG를 시작한 뒤 운영 전환 시점에 enable한다. 참조 빌더는 `poc/build_flow_v3.py`
 - Trigger, Coordinator: `Run Schedule=0 sec` 또는 입력 기반, `Concurrent Tasks=1`, `Execution=Primary Node`
 - Worker: `Execution=All Nodes`, 입력 Connection Round Robin
 - Control Receiver와 검증·게시 flow: `Execution=All Nodes`, `Concurrent Tasks=1`. 중복 방지는 API CAS가 담당
 - DB pool 상한: `노드 수 × worker concurrent tasks + control 여유`가 Oracle 승인 세션 수를 넘지 않게 설정
 - `InvokeHTTP` 동시 호출 수: `노드 수 × worker concurrent tasks`가 API 처리 용량과 관리 DB 연결 수 안에 들도록 API 인스턴스 수를 정한다(API 설계 9.10)
 - Processor `Yield Duration`: DB/HDFS/API failure 폭주 방지를 위해 10~30초부터 시험
+- relationship 재시도(Retry Count, Retried Relationships, Backoff)는 16장 기준으로 Processor마다 설정한다. Retry Count는 Parameter를 참조할 수 없으므로 배포 스크립트가 정수로 넣는다
 - Provenance: run/partition/chunk 상관 분석이 가능한 기간 유지. API 로그와 `X-Request-Id`, `run_id`로 대조
 - Bulletin: ERROR/WARN 수집을 모니터링 시스템에 연계
 - Parameter Context 변경 권한과 NiFi Policy를 운영자/개발자로 분리
@@ -1763,7 +1790,7 @@ API 쪽 구현과 동시성 테스트는 API 설계 9.5~9.6, 11장을 따른다.
 운영 승인 조건:
 
 ```text
-파티션 하나가 실패하면 검증 flow 호출(dispatch)과 PutHive3QL 호출 건수는 0이다.
+파티션 하나가 실패하면 검증 flow 호출(dispatch)과 Hive 게시 호출 건수는 0이다.
 중복 보고, 동시 완료, API 재기동 후에도 run당 STAGE_VALIDATING 진입과 INSERT OVERWRITE는 각각 1회다.
 NiFi 계정으로 load_run/load_partition/load_file/load_validation/load_dispatch를 변경할 수 없다.
 API 장애 중 진행된 run은 성공으로 판정되지 않고, 복구 후 정상 판정되거나 TIMED_OUT으로 끝난다.
@@ -1786,6 +1813,9 @@ PUBLISH_UNKNOWN은 사람 또는 별도 reconciliation 없이 자동 재실행�
 | FastAPI | Python 비동기 웹 프레임워크 | Load Control API 구현 프레임워크. `python -m load_control.server`가 uvicorn으로 실행한다. |
 | Kylo | NiFi 기반 데이터 레이크 관리 플랫폼 | AS-IS에서 Kylo의 `ImportSqoop` Processor를 사용한다. |
 | Sqoop | RDBMS와 Hadoop 간 대량 데이터 전송 도구 | TO-BE에서 제거하며 Mapper의 병렬 실행과 Job 완료 의미를 NiFi로 재구현한다. |
+| Job PG | Job 하나의 Flow를 담는 상위 Process Group | 자식 PG(PG-00~90)와 Controller Service를 담고 `PC_JOB_<JOB_NAME>`을 지정한다(2장). |
+| Input/Output Port | Process Group 사이에서 FlowFile을 주고받는 연결점 | `start-run`, `partitions`, `errors` 등으로 자식 PG를 연결한다. |
+| Relationship 재시도 | Processor 설정의 Retry Count·Retried Relationships·Backoff로 같은 FlowFile을 다시 처리하는 기능 | `RetryFlowFile` 대신 `InvokeHTTP`, `PutHDFS` 재시도에 쓴다(16장). |
 | Processor | NiFi Flow의 단일 처리 컴포넌트 | `ExecuteSQLRecord`, `PutHDFS`, `InvokeHTTP`, `HandleHttpRequest` 등이 해당한다. |
 | `InvokeHTTP` | HTTP 요청을 보내고 응답으로 분기하는 Processor | NiFi→API 보고와 상태 전이 요청에 사용한다. |
 | `HandleHttpRequest`/`HandleHttpResponse` | NiFi에서 HTTP 요청을 받고 응답하는 Processor 쌍 | PG-05가 API의 검증·재발행 호출을 받는다. |
@@ -1882,12 +1912,13 @@ PUBLISH_UNKNOWN은 사람 또는 별도 reconciliation 없이 자동 재실행�
 - `InvokeHTTP`: https://nifi.apache.org/components/org.apache.nifi.processors.standard.InvokeHTTP/
 - `HandleHttpRequest`: https://nifi.apache.org/components/org.apache.nifi.processors.standard.HandleHttpRequest/
 - `HandleHttpResponse`: https://nifi.apache.org/components/org.apache.nifi.processors.standard.HandleHttpResponse/
-- `AttributesToJSON`: https://nifi.apache.org/components/org.apache.nifi.processors.standard.AttributesToJSON/
+- `ReplaceText`: https://nifi.apache.org/components/org.apache.nifi.processors.standard.ReplaceText/
 - `JoltTransformJSON`: https://nifi.apache.org/components/org.apache.nifi.processors.jolt.JoltTransformJSON/
 - `SplitJson`: https://nifi.apache.org/components/org.apache.nifi.processors.standard.SplitJson/
 - FastAPI: https://fastapi.tiangolo.com/
 - PostgreSQL `NOTIFY`: https://www.postgresql.org/docs/current/sql-notify.html
 - PostgreSQL `SELECT ... FOR UPDATE SKIP LOCKED`: https://www.postgresql.org/docs/current/sql-select.html#SQL-FOR-UPDATE-SHARE
 - `PutHDFS`: https://nifi.apache.org/docs/nifi-docs/components/org.apache.nifi/nifi-hadoop-nar/1.28.0/org.apache.nifi.processors.hadoop.PutHDFS/
-- `RetryFlowFile`: https://nifi.apache.org/components/org.apache.nifi.processors.standard.RetryFlowFile/
+- Relationship 재시도(Retry Count, Backoff): https://nifi.apache.org/docs/nifi-docs/html/user-guide.html#settings-tab
+- `RetryFlowFile`(파티션 쿼리 일시 오류 재시도가 필요한 경우만): https://nifi.apache.org/components/org.apache.nifi.processors.standard.RetryFlowFile/
 - `LogMessage`: https://nifi.apache.org/components/org.apache.nifi.processors.standard.LogMessage/

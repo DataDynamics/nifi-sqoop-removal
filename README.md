@@ -134,18 +134,18 @@ flowchart TD
 | `PG-00 Trigger` | 스케줄 및 업무키 생성 | Primary Node |
 | `PG-05 Control Receiver` | API의 검증·재발행 호출 수신, `jobKey`별 Job PG로 전달 | All Nodes |
 | `PG-10 Run Coordinator` | API에 run 등록, SCN, source metrics, manifest 계산과 등록 | Primary Node |
-| `PG-20 Oracle Extract Workers` | claim, Oracle 병렬 조회, Parquet 변환, HDFS 기록, chunk 보고 | All Nodes |
+| `PG-20 Extract Worker` | claim, Oracle 병렬 조회, Parquet 변환, HDFS 기록, chunk 보고 | All Nodes |
 | `PG-40 Staging Validation` | 검증 시작 CAS, External table 생성 및 staging 검증 | All Nodes |
 | `PG-50 Publish` | API 게시 소유권 획득 및 `INSERT OVERWRITE` | All Nodes |
 | `PG-60 Target Validation` | 최종 테이블 사후 검증 | All Nodes |
-| `PG-90 Audit and Error` | NiFi 오류·관측 이벤트, 알림 | All Nodes |
+| `PG-90 Error and Event` | NiFi Processor 오류 정규화, 실패 보고 API 호출, 오류 이벤트 기록 | All Nodes |
 
 | 구성요소 | 역할 |
 |---|---|
 | Load Control API (`api` 프로세스) | 원장 기록, 불변식 검증, 파티션·run 완료 판정, 상태 전이 CAS |
 | Load Control API (`worker` 프로세스) | outbox dispatcher(검증·재발행 호출), sweeper(stale·timeout 정리) |
 
-가이드 초안의 `PG-30 Partition and Run Gate`(Wait/Notify)와 `PG-70 Recovery Monitor`는 API로 대체되어 없다. PG-40~60은 API가 NiFi LB로 호출하므로 All Nodes에서 실행하고, 중복 실행은 Primary Node 대신 API CAS로 막는다.
+각 PG는 Job PG 아래 자식 PG로 두고 Input/Output Port로 연결한다. 모든 PG의 실패는 `errors` Port로 PG-90에 모인다(가이드 2장). 가이드 초안의 `PG-30 Partition and Run Gate`(Wait/Notify)와 `PG-70 Recovery Monitor`는 API로 대체되어 없다. PG-40~60은 API가 NiFi LB로 호출하므로 All Nodes에서 실행하고, 중복 실행은 Primary Node 대신 API CAS로 막는다.
 
 Worker 입력 Connection만 Round Robin Load Balance를 적용한다. 실제 Oracle 동시 세션 수는 다음 식으로 제한한다.
 
@@ -215,7 +215,7 @@ error_class, error_code, message
 4. [Load Control API 구현](./load-control-api/README.md)
    - FastAPI 프로젝트(API 설계 12장 1~2단계): 실행, migration, 테스트 방법
 5. [가이드 검토 및 NiFi 2.4.0 PoC 결과](./poc/REVIEW.md)
-   - 이전 구조(PG-30 Wait/Notify) PoC와 API 연동 구조 PoC(정상, 0건 파티션, 중복 실행, HDFS 실패, API 중단, sweeper 재발행) 결과
+   - 이전 구조(PG-30 Wait/Notify) PoC, API 연동 구조 PoC(정상, 0건 파티션, 중복 실행, HDFS 실패, API 중단, sweeper 재발행), V3(자식 PG + Port, Processor 85→41개) 결과
 
 ## 구현 전 확인 항목
 

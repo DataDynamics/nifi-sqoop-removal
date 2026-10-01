@@ -52,6 +52,8 @@ async def claim(conn: AsyncConnection, run_id: UUID, partition_id: str,
 
     attempt = await partitions.claim(conn, run_id, partition_id, claim_token=req.claim_token,
                                      worker_node=req.worker_node)
+    if part.status == PartitionStatus.RETRY:
+        await dispatch.ack_reissue(conn, run_id, partition_id)  # 재발행 수신 확인(가이드 13.2)
     await runs.touch(conn, run_id)
     await events.record(conn, "PARTITION_STARTED", run, partition_id=partition_id,
                         details={"workerNode": req.worker_node, "attempt": attempt})

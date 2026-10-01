@@ -30,3 +30,13 @@ async def upsert_many(conn: AsyncConnection, run_id: UUID, stage: str, query_ver
             "actual_value": m.get("actual_value"), "tolerance": m.get("tolerance"),
             "result": m["result"], "details": json.dumps(m.get("details") or {}, ensure_ascii=False)}
            for m in metrics])
+
+
+async def list_by_stage(conn: AsyncConnection, run_id: UUID, stage: str) -> list[dict[str, Any]]:
+    rows = (await conn.execute(text("""
+        SELECT metric_name, expected_value, actual_value, result, query_version
+          FROM nifi_ops.load_validation
+         WHERE run_id = :run_id AND stage = :stage
+         ORDER BY metric_name, query_version
+    """), {"run_id": run_id, "stage": stage})).mappings().all()
+    return [dict(m) for m in rows]

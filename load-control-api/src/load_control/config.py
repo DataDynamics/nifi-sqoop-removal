@@ -42,6 +42,8 @@ class Settings(BaseSettings):
     dispatch_batch: int = 20
     sweeper_interval: timedelta = timedelta(minutes=1)
 
+    worker_metrics_port: int | None = 9100  # worker 프로세스 /metrics 포트, None이면 끔
+
     log_level: str = "INFO"
     log_json: bool = True
 

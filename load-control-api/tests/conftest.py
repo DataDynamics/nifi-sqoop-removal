@@ -97,6 +97,11 @@ class Db:
         assert len(rows) == 1, rows
         return rows[0]
 
+    async def execute(self, sql: str, **params: Any) -> int:
+        """쓰기용: commit한다. 영향 행 수를 돌려준다."""
+        async with self.engine.begin() as conn:
+            return (await conn.execute(text(sql), params)).rowcount
+
     async def scalar(self, sql: str, **params: Any) -> Any:
         async with self.engine.connect() as conn:
             return (await conn.execute(text(sql), params)).scalar()

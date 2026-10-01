@@ -161,3 +161,52 @@ async def fail(conn: AsyncConnection, run_id: UUID, *, expected: str, to: str, s
     """), {"run_id": run_id, "expected": expected, "to": to, "stage": stage, "code": code,
            "message": (message or "")[:2000] or None})
     return result.first() is not None
+
+
+# cas_status에서 함께 갱신할 수 있는 컬럼. 값 대신 SQL 표현식을 쓰려면 _NOW를 넘긴다.
+_CAS_COLUMNS = frozenset({
+    "staging_count", "target_count", "publish_token", "publish_started_at", "published_at",
+    "completed_at", "error_stage", "error_code", "error_message"})
+NOW = object()
+
+
+async def cas_status(conn: AsyncConnection, run_id: UUID, *, expected: str, to: str,
+                     **sets: Any) -> bool:
+    """WHERE status = expected 조건의 상태 전이(가이드 17장). 갱신됐으면 True."""
+    unknown = set(sets) - _CAS_COLUMNS
+    if unknown:
+        raise ValueError(f"cas_status: unsupported columns {unknown}")
+    clauses = ["status = :to", "heartbeat_at = clock_timestamp()", "version_no = version_no + 1"]
+    params: dict[str, Any] = {"run_id": run_id, "expected": expected, "to": to}
+    for col, value in sets.items():
+        if value is NOW:
+            clauses.append(f"{col} = clock_timestamp()")
+        else:
+            clauses.append(f"{col} = :{col}")
+            params[col] = value
+    result = await conn.execute(text(f"""
+        UPDATE nifi_ops.load_run SET {", ".join(clauses)}
+         WHERE run_id = :run_id AND status = :expected
+        RETURNING run_id
+    """), params)
+    return result.first() is not None
+
+
+async def get_publish_token(conn: AsyncConnection, run_id: UUID) -> UUID | None:
+    row = (await conn.execute(text("SELECT publish_token FROM nifi_ops.load_run WHERE run_id = :run_id"),
+                              {"run_id": run_id})).first()
+    return row[0] if row else None
+
+
+async def list_runs(conn: AsyncConnection, *, job_key: str | None, business_key: str | None,
+                    status: str | None, limit: int) -> list[RunRow]:
+    rows = (await conn.execute(text(f"""
+        SELECT {_COLUMNS} FROM nifi_ops.load_run
+         WHERE (CAST(:job_key AS varchar) IS NULL OR job_key = :job_key)
+           AND (CAST(:business_key AS varchar) IS NULL OR business_key = :business_key)
+           AND (CAST(:status AS varchar) IS NULL OR status = :status)
+         ORDER BY started_at DESC
+         LIMIT :limit
+    """), {"job_key": job_key, "business_key": business_key, "status": status,
+           "limit": limit})).mappings().all()
+    return [_row(m) for m in rows]

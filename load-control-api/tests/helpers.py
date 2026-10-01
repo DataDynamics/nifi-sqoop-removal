@@ -87,3 +87,19 @@ async def report(client: httpx.AsyncClient, run: Run, pid: str, token: str, inde
                  rows: int) -> httpx.Response:
     return await client.post(f"/v1/runs/{run.run_id}/partitions/{pid}/chunks",
                              json=chunk_body(run, pid, token, index, count, rows))
+
+
+async def complete_run(client: httpx.AsyncClient, counts: list[int] | None = None) -> tuple[Run, str]:
+    """모든 파티션을 보고해 run을 EXTRACTED_VALIDATED로 만들고 (run, VALIDATE_RUN dispatch id)를 돌려준다."""
+    counts = counts or [3, 4]
+    run = await start_run(client, counts)
+    for i, c in enumerate(counts):
+        if c == 0:
+            continue
+        pid = f"{i:04d}"
+        token = await claim(client, run, pid)
+        r = await report(client, run, pid, token, 0, 1, c)
+        assert r.status_code == 200, r.text
+    detail = (await client.get(f"/v1/runs/{run.run_id}")).json()
+    assert detail["status"] == "EXTRACTED_VALIDATED", detail
+    return run, detail["dispatches"][0]["dispatchId"]

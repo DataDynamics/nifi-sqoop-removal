@@ -11,7 +11,7 @@ from load_control.config import Settings, get_settings
 from load_control.db import FOREIGN_KEY_VIOLATION, UNIQUE_VIOLATION, constraint_name, make_engine, sqlstate
 from load_control.errors import ApiError
 from load_control.logging import RequestContextMiddleware, configure_logging
-from load_control.routers import health, partitions, runs
+from load_control.routers import health, partitions, runs, validation
 
 log = structlog.get_logger(__name__)
 
@@ -68,5 +68,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(health.router)
     app.include_router(runs.router)
     app.include_router(partitions.router)
+    app.include_router(validation.router)
     return app
 

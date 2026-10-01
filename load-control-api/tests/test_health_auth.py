@@ -38,3 +38,12 @@ async def test_operator_can_read_but_not_write(app: FastAPI, client: httpx.Async
         assert (await op.get(f"/v1/runs/{run.run_id}")).status_code == 200
         r = await op.post(f"/v1/runs/{run.run_id}/manifest", json={})
         assert r.status_code == 403
+
+
+async def test_error_details_with_reserved_names(client: httpx.AsyncClient) -> None:
+    """details에 status 같은 키가 있어도 오류 응답이 만들어진다(회귀 테스트)."""
+    run = await create_run(client)
+    r = await client.post(f"/v1/runs/{run.run_id}/fail", json={
+        "expectedStatus": "EXTRACTING", "failStatus": "FAILED_EXTRACT", "errorStage": "X", "errorCode": "X"})
+    assert r.status_code == 409
+    assert r.json()["details"] == {"runStatus": "CREATED"}

@@ -11,12 +11,13 @@ from load_control.config import Settings, get_settings
 from load_control.db import FOREIGN_KEY_VIOLATION, UNIQUE_VIOLATION, constraint_name, make_engine, sqlstate
 from load_control.errors import ApiError
 from load_control.logging import RequestContextMiddleware, configure_logging
-from load_control.routers import health, partitions, runs, validation
+from load_control.routers import health, ops, partitions, runs, validation
 
 log = structlog.get_logger(__name__)
 
 
-def _error(request: Request, status: int, code: str, message: str, **details: object) -> JSONResponse:
+def _error(request: Request, status: int, code: str, message: str,
+           details: dict[str, object] | None = None) -> JSONResponse:
     body: dict[str, object] = {"code": code, "message": message,
                                "requestId": getattr(request.state, "request_id", None)}
     if details:
@@ -44,19 +45,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.exception_handler(ApiError)
     async def api_error(request: Request, exc: ApiError) -> JSONResponse:
-        return _error(request, exc.status, exc.code, exc.message, **exc.details)
+        return _error(request, exc.status, exc.code, exc.message, exc.details)
 
     @app.exception_handler(IntegrityError)
     async def integrity_error(request: Request, exc: IntegrityError) -> JSONResponse:
         state, constraint = sqlstate(exc), constraint_name(exc)
         if state == UNIQUE_VIOLATION:
             return _error(request, 409, "UNIQUE_VIOLATION", "unique constraint violated",
-                          constraint=constraint)
+                          {"constraint": constraint})
         if state == FOREIGN_KEY_VIOLATION:
             return _error(request, 422, "REFERENCE_NOT_FOUND", "referenced row not found",
-                          constraint=constraint)
+                          {"constraint": constraint})
         log.error("integrity_error", sqlstate=state, constraint=constraint)
-        return _error(request, 422, "CONSTRAINT_VIOLATION", "constraint violated", constraint=constraint)
+        return _error(request, 422, "CONSTRAINT_VIOLATION", "constraint violated", {"constraint": constraint})
 
     @app.exception_handler(DBAPIError)
     async def db_error(request: Request, exc: DBAPIError) -> JSONResponse:
@@ -69,5 +70,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(runs.router)
     app.include_router(partitions.router)
     app.include_router(validation.router)
+    app.include_router(ops.router)
     return app
 

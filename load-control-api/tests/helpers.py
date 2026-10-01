@@ -103,3 +103,31 @@ async def complete_run(client: httpx.AsyncClient, counts: list[int] | None = Non
     detail = (await client.get(f"/v1/runs/{run.run_id}")).json()
     assert detail["status"] == "EXTRACTED_VALIDATED", detail
     return run, detail["dispatches"][0]["dispatchId"]
+
+
+def metrics(*items: tuple[str, str, str]) -> list[dict[str, str]]:
+    return [{"metricName": n, "expectedValue": e, "actualValue": e if r == "PASS" else "x", "result": r}
+            for n, e, r in items]
+
+
+async def to_staging_validated(client: httpx.AsyncClient) -> Run:
+    run, dispatch_id = await complete_run(client, [3, 4])
+    r = await client.post(f"/v1/runs/{run.run_id}/validation/start", json={"dispatchId": dispatch_id})
+    assert r.json()["started"] is True, r.text
+    r = await client.post(f"/v1/runs/{run.run_id}/validations", json={
+        "stage": "STAGING", "metrics": metrics(("STAGE_COUNT", "7", "PASS"), ("DUP_PK_COUNT", "0", "PASS"))})
+    assert r.status_code == 200, r.text
+    r = await client.post(f"/v1/runs/{run.run_id}/stage-validated")
+    assert r.json()["stageValidated"] is True, r.text
+    return run
+
+
+async def to_published(client: httpx.AsyncClient) -> tuple[Run, str]:
+    run = await to_staging_validated(client)
+    token = str(uuid.uuid4())
+    r = await client.post(f"/v1/runs/{run.run_id}/publish/claim", json={"publishToken": token})
+    assert r.json()["claimed"] is True, r.text
+    r = await client.post(f"/v1/runs/{run.run_id}/publish/result",
+                          json={"publishToken": token, "outcome": "PUBLISHED"})
+    assert r.json()["runStatus"] == "PUBLISHED", r.text
+    return run, token

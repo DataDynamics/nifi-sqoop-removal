@@ -16,6 +16,7 @@ from load_control.schemas.runs import (
     RunDetail,
     RunFailRequest,
     RunFailResponse,
+    RunListItem,
 )
 
 
@@ -96,3 +97,13 @@ async def get_run_detail(conn: AsyncConnection, run_id: UUID) -> RunDetail:
             partition_id=d.partition_id, status=d.status, attempt_count=d.attempt_count,
             sent_at=d.sent_at, acked_at=d.acked_at) for d in disp],
     )
+
+
+async def list_runs(conn: AsyncConnection, *, job_key: str | None, business_key: str | None,
+                    status: str | None, limit: int) -> list[RunListItem]:
+    rows = await runs.list_runs(conn, job_key=job_key, business_key=business_key, status=status,
+                                limit=limit)
+    return [RunListItem(run_id=str(r.run_id), job_key=r.job_key, business_key=r.business_key,
+                        status=RunStatus(r.status), source_count=r.source_count,
+                        extracted_count=r.extracted_count, started_at=r.started_at,
+                        completed_at=r.completed_at, error_code=r.error_code) for r in rows]

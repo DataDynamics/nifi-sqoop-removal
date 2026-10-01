@@ -84,6 +84,13 @@ async def client(app: FastAPI) -> AsyncIterator[httpx.AsyncClient]:
         yield c
 
 
+@pytest_asyncio.fixture
+async def operator(app: FastAPI) -> AsyncIterator[httpx.AsyncClient]:
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test",
+                                 headers={"Authorization": f"Bearer {OPERATOR_TOKEN}"}) as c:
+        yield c
+
+
 class Db:
     def __init__(self, engine: AsyncEngine) -> None:
         self.engine = engine

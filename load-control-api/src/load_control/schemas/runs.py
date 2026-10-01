@@ -120,3 +120,15 @@ class RunDetail(ApiModel):
     partition_counts: dict[str, int]
     partitions: list[PartitionSummary]
     dispatches: list[DispatchSummary]
+
+
+class RunListItem(ApiModel):
+    run_id: str
+    job_key: str
+    business_key: str
+    status: RunStatus
+    source_count: int | None
+    extracted_count: int
+    started_at: datetime
+    completed_at: datetime | None
+    error_code: str | None

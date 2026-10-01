@@ -249,7 +249,7 @@ flowchart LR
 
 가이드 초안의 PG-30 Partition and Run Gate(Wait/Notify)와 PG-70 Recovery Monitor는 없다. 완료 판정은 API가 하고, 검증 flow는 API의 호출을 PG-05가 받아 시작한다(9장). 복구는 API sweeper가 담당한다(13장).
 
-참조 구현은 `poc/build_flow_v3.py`다. 이 빌더는 Job이 하나뿐이라 PG-05를 Job PG 안에 두었다. 운영에서는 위 구조처럼 root로 옮긴다.
+참조 구현은 `poc/build_flow_v3.py`(PostgreSQL 원천, NiFi 2.4.0에서 검증)와 `poc/build_flow_v4.py`(같은 구조의 Oracle 원천, 미검증)다. 두 빌더는 Job이 하나뿐이라 PG-05를 Job PG 안에 두었다. 운영에서는 위 구조처럼 root로 옮긴다.
 
 ### 2.1 구현 규칙
 

@@ -1,0 +1,46 @@
+{
+ "names": {
+  "process_group": "SQOOP_REPLACEMENT_POC_V4",
+  "common_context": "PC_SQOOP_REPLACEMENT_COMMON_V4",
+  "job_context": "PC_JOB_ORACLE_INSP_DTL_DAILY_V4"
+ },
+ "common_params": {
+  "CONTROL.API.URL": "http://127.0.0.1:8080/v1",
+  "CONTROL.API.AUTHORIZATION": "Bearer <nifi-token>",
+  "CONTROL.API.TIMEOUT": "30 secs",
+  "CONTROL.API.RETRY.MAX": "5",
+  "CONTROL.LISTEN.PORT": "9443",
+  "META.JDBC.URL": "jdbc:postgresql://meta:5432/nifiops",
+  "META.JDBC.USER": "nifi_runtime",
+  "META.JDBC.PASSWORD": "<secret>",
+  "META.JDBC.DRIVER.PATH": "/opt/nifi/jdbc/postgresql-42.7.3.jar",
+  "SRC.JDBC.URL": "jdbc:oracle:thin:@//oracle-host:1521/ORCLPDB1",
+  "SRC.JDBC.USER": "NIFI_READER",
+  "SRC.JDBC.PASSWORD": "<secret>",
+  "SRC.JDBC.DRIVER.PATH": "/opt/nifi/jdbc/ojdbc11.jar",
+  "ORACLE.POOL.MAX": "8",
+  "ORACLE.NUMBER.DEFAULT.PRECISION": "38",
+  "ORACLE.NUMBER.DEFAULT.SCALE": "10",
+  "HADOOP.CONF.FILES": "/etc/hadoop/conf/core-site.xml,/etc/hadoop/conf/hdfs-site.xml",
+  "HDFS.STAGE.ROOT": "/data/nifi/stage",
+  "HDFS.PERMISSIONS.UMASK": "027",
+  "EXTRACT.FETCH.SIZE": "5000",
+  "EXTRACT.ROWS.PER.FILE": "500000",
+  "EXTRACT.QUERY.TIMEOUT": "60 min",
+  "PARTITION.RETRY.MAX": "3"
+ },
+ "job_params": {
+  "JOB.KEY": "ORACLE_INSP_DTL_DAILY",
+  "BUSINESS.KEY": "2026-09-28",
+  "SRC.OWNER": "APP",
+  "SRC.TABLE": "INSP_DTL",
+  "SRC.COLUMNS": "INSP_DTL_SEQ, BASE_DT, ITEM_CD, CAST(AMOUNT AS NUMBER(18,2)) AS AMOUNT, REG_TS, NOTE",
+  "SRC.SPLIT.COLUMN": "INSP_DTL_SEQ",
+  "SRC.BASE.WHERE": "BASE_DT = TO_DATE('${load.business.key}', 'YYYY-MM-DD')",
+  "DQ.AMOUNT.COLUMN": "AMOUNT",
+  "DQ.TIMESTAMP.COLUMN": "REG_TS",
+  "PARTITION.COUNT": "8",
+  "HIVE.STAGE.TABLE.PREFIX": "TMP_INSP_DTL_",
+  "ALLOW.EMPTY.SOURCE": "false"
+ }
+}

@@ -6,6 +6,7 @@
 > |---|---|---|---|
 > | V1 | Load Control API 없음. NiFi가 `PutSQL`로 원장을 직접 기록하고 PG-30 Wait/Notify로 완료 판정. 하나의 PG에 평면 배치 | `poc/build_flow_v1.py` | 1~5장 |
 > | V3 | Load Control API 연동. 원장 기록과 완료 판정은 API, NiFi는 데이터 처리. Job PG 아래 자식 PG와 Port로 구성 | `poc/build_flow_v3.py` | 6장 |
+> | V4 | V3와 같은 구조에서 원천만 Oracle로 바꾼 버전(SCN 고정, `AS OF SCN`). **Oracle 실행 시험은 하지 않았다** | `poc/build_flow_v4.py` | 7장 |
 >
 > 현재 가이드는 V3 구조를 따른다.
 
@@ -148,3 +149,42 @@ python3 poc/build_flow_v3.py http://<nifi-host>:<port>/nifi-api my-config.json
 # 3. 다시 만들 때(같은 config를 주면 그 names의 PG와 Parameter Context를 지운다)
 python3 poc/teardown_flow.py http://<nifi-host>:<port>/nifi-api my-config.json
 ```
+
+## 7. V4: Oracle 원천 빌더 (2026-10-01, 미검증)
+
+`poc/build_flow_v4.py`는 V3(PostgreSQL 원천)와 같은 구조·API 계약에서 원천만 Oracle로 바꾼 빌더다. 설정 예시는 `poc/config.v4.example.json`. Oracle 환경이 없어 **실행 시험은 하지 않았다.**
+
+### 7.1 V3 대비 변경점
+
+| 위치 | 변경 |
+|---|---|
+| Controller Service | `CS_DBCP_SRC`: `oracle.jdbc.OracleDriver`, `#{SRC.JDBC.DRIVER.PATH}`(ojdbc), 검사 쿼리 `SELECT 1 FROM DUAL`, 최대 연결 `#{ORACLE.POOL.MAX}`. 관리 DB(`CS_DBCP_META`)는 PostgreSQL 그대로이며 드라이버 경로를 `#{META.JDBC.DRIVER.PATH}`로 분리 |
+| PG-10 | 14 SCN 조회(`V$DATABASE`), 15 SCN 추출을 추가(Processor 8 → 10, 번호는 가이드 7.2와 같은 11~20). 16 원천 지표+manifest SQL을 Oracle 문법(`AS OF SCN`, `CONNECT BY`, `TO_CHAR`, 문자열 boolean)으로 작성하고 SCN·`MIN_TS`/`MAX_TS`도 반환. SCN이 숫자가 아니면 `INVALID_SCN`이 들어가 SQL 오류로 실패. 17 Jolt는 대문자 컬럼 키 |
+| PG-20 | 33에 SCN 숫자 검사 추가. 34는 `AS OF SCN ${load.snapshot.scn}`, 재시도 없음(가이드 16장), autocommit 기본값, 정밀도 없는 `NUMBER`를 위해 Default Decimal Precision/Scale을 `#{ORACLE.NUMBER.DEFAULT.PRECISION}`/`#{ORACLE.NUMBER.DEFAULT.SCALE}`로 지정 |
+| PG-05 | 09에서 재발행 본문의 `snapshotScn`, `isNullPartition`도 추출 |
+| Parameter | 추가: `META.JDBC.DRIVER.PATH`, `SRC.JDBC.DRIVER.PATH`, `ORACLE.POOL.MAX`, `ORACLE.NUMBER.DEFAULT.PRECISION`, `ORACLE.NUMBER.DEFAULT.SCALE`, `DQ.TIMESTAMP.COLUMN`. 제거: `JDBC.DRIVER.PATH` |
+| 이름 | `SQOOP_REPLACEMENT_POC_V4`, `PC_SQOOP_REPLACEMENT_COMMON_V4`, `PC_JOB_ORACLE_INSP_DTL_DAILY_V4` |
+
+NULL split 파티션(`SPLIT.NULL.POLICY=SEPARATE`)은 만들지 않는다. split 컬럼에 NULL이 있으면 API가 manifest를 거부한다.
+
+### 7.2 수행한 점검 (NiFi에 생성하지 않음)
+
+빌더의 쓰기 요청을 가로채고 읽기 요청(Processor 타입·정의)만 실제 NiFi 2.4.0에서 받는 dry-run으로 확인했다.
+
+| 항목 | 결과 |
+|---|---|
+| 구성 | PG 7개(상위 1 + 자식 6), Processor 43개(V3 41 + SCN 2), Connection 75개, Port 13개, Label 7개 |
+| 연결 | 모든 연결이 해당 Processor에 실제로 있는 relationship을 사용 |
+| COMMENT | 43개 모두 있음 |
+| EL | 모든 속성의 `${`·`}` 짝이 맞음 |
+| Parameter | 빌더가 참조하는 Parameter가 `config.v4.example.json`에 모두 있음 |
+
+### 7.3 Oracle 환경에서 확인할 것
+
+1. 조회 계정 권한: 대상 테이블 `SELECT`·`FLASHBACK`, `V$DATABASE` 조회(없으면 14를 `DBMS_FLASHBACK.GET_SYSTEM_CHANGE_NUMBER`로 변경)
+2. 16 SQL의 실행 계획: 파티션마다 상관 서브쿼리가 원천을 다시 읽으므로 split 컬럼·업무 조건 인덱스 확인. 느리면 `GROUP BY`/`WIDTH_BUCKET` 방식으로 변경(가이드 7.3)
+3. `ExecuteSQLRecord` 타입 매핑: 정밀도 없는 `NUMBER`, `DATE`(시각 포함), `TIMESTAMP`가 Parquet와 Hive DDL에서 의도한 타입·값인지. 특히 JVM 시간대에 따른 timestamp 변환(가이드 4장)
+4. JSON writer가 `TO_CHAR` 문자열과 Oracle 대문자 컬럼명을 그대로 내보내는지, API가 manifest를 받아들이는지
+5. `UNDO_RETENTION`이 run 최대 소요시간보다 긴지(`ORA-01555` → `FAILED_SNAPSHOT_EXPIRED`)
+6. V3에서 수행한 시나리오(정상, 중복 실행, HDFS 실패, API 중단, 재발행) 재수행
+

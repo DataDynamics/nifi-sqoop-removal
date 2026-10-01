@@ -12,4 +12,4 @@ PartitionIdPath = Annotated[str, Path(pattern=PARTITION_ID_PATTERN)]
 
 async def run_tx[T](request: Request, fn: Callable[[AsyncConnection], Awaitable[T]]) -> T:
     return await in_tx(request.app.state.engine, fn,
-                       attempts=request.app.state.settings.db_tx_attempts)
+                       attempts=request.app.state.settings.database.tx_attempts)

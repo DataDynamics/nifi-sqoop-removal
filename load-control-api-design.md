@@ -232,9 +232,9 @@ stateDiagram-v2
 | `PENDING` | 전송 대기. `next_attempt_at`이 지나면 dispatcher가 가져간다 |
 | `SENT` | NiFi `HandleHttpRequest`가 2xx로 응답함. FlowFile은 NiFi에 들어갔지만 처리 시작은 미확인 |
 | `ACKED` | 검증 flow가 `/validation/start`로 실제 시작을 알림. 전달 완료 |
-| `DEAD` | `LCA_DISPATCH_MAX_ATTEMPTS` 초과. ERROR 알림 후 운영자가 재전송 API로 처리 |
+| `DEAD` | `dispatch.max_attempts` 초과. ERROR 알림 후 운영자가 재전송 API로 처리 |
 
-`SENT`와 `ACKED`를 나누는 이유: NiFi가 202를 응답한 직후 노드가 죽으면 FlowFile이 유실될 수 있다. `LCA_DISPATCH_ACK_TIMEOUT` 안에 `ACKED`가 되지 않으면 다시 `PENDING`으로 돌려 재전송한다.
+`SENT`와 `ACKED`를 나누는 이유: NiFi가 202를 응답한 직후 노드가 죽으면 FlowFile이 유실될 수 있다. `dispatch.ack_timeout` 안에 `ACKED`가 되지 않으면 다시 `PENDING`으로 돌려 재전송한다.
 
 ### 4.3 dispatcher 규칙
 
@@ -258,7 +258,7 @@ RETURNING d.dispatch_id, d.run_id, d.dispatch_type, d.partition_id, d.attempt_co
 ```
 
 - 전송 성공(2xx): `WHERE status = 'PENDING'` 조건으로 `SENT`, `sent_at`을 기록한다. 이미 `ACKED`이면 바꾸지 않는다(9.8).
-- 실패(연결 오류, 5xx, timeout): `next_attempt_at = now + min(base × 2^attempt, max)`. `attempt_count`가 `LCA_DISPATCH_MAX_ATTEMPTS`에 도달하면 `DEAD`.
+- 실패(연결 오류, 5xx, timeout): `next_attempt_at = now + min(base × 2^attempt, max)`. `attempt_count`가 `dispatch.max_attempts`에 도달하면 `DEAD`.
 - 4xx: 설정 오류로 보고 바로 `DEAD` 처리하고 알림.
 - 전송 요청 헤더에 `X-Run-Id`, `X-Dispatch-Id`를 넣어 NiFi 로그와 상관 분석이 가능하게 한다.
 
@@ -394,7 +394,7 @@ outbox는 최소 1회 전달만 보장하므로, 같은 run에 대한 검증 요
 
 검증 flow는 이 응답에서 검증에 필요한 값을 받아 attribute로 쓴다(가이드 10.2의 40U). 이미 시작된 run이면 `started=false`와 현재 `runStatus`만 돌려준다.
 
-API→NiFi 호출(dispatch) 본문은 다음과 같다. URL은 `{LCA_NIFI_RECEIVER_URL}/validate/{jobKey}` 또는 `/reissue/{jobKey}`이며, NiFi PG-05가 `jobKey`로 Job Process Group에 전달한다(가이드 9.5).
+API→NiFi 호출(dispatch) 본문은 다음과 같다. URL은 `{nifi.receiver_url}/validate/{jobKey}` 또는 `/reissue/{jobKey}`이며, NiFi PG-05가 `jobKey`로 Job Process Group에 전달한다(가이드 9.5).
 
 ```json
 // VALIDATE_RUN
@@ -444,17 +444,17 @@ run이 이미 실패했거나 종료된 상태에서 온 chunk 보고는 409가 
 
 ## 7. Sweeper (가이드 PG-70 대체)
 
-API의 worker 프로세스(9.2)가 `sweeper_interval`마다 실행한다. 여러 worker가 동시에 돌지 않도록 tick마다 `pg_try_advisory_xact_lock`을 얻은 쪽만 실행한다(9.8).
+API의 worker 프로세스(9.2)가 `recovery.sweeper_interval`마다 실행한다. 여러 worker가 동시에 돌지 않도록 tick마다 `pg_try_advisory_xact_lock`을 얻은 쪽만 실행한다(9.8).
 
 | 대상 | 조건 | 동작 |
 |---|---|---|
-| 파티션 `RUNNING` | `heartbeat_at < now - LCA_RECOVERY_STALE` | 정책 `LCA_RECOVERY_MODE`에 따름: `FAIL`이면 해당 run의 미완료 파티션과 run을 `TIMED_OUT`. `REISSUE`이면 claim 초기화 후 `RETRY`, 이전 chunk 기록 무효화, `REISSUE_PARTITION` dispatch. `attempt_count >= LCA_RECOVERY_MAX_ATTEMPTS`이면 `FAIL`과 같게 처리 |
-| run `CREATED`, `EXTRACTING` | `started_at + LCA_RUN_TIMEOUT < now` | `TIMED_OUT`, 알림 |
-| dispatch `SENT` | `sent_at + LCA_DISPATCH_ACK_TIMEOUT < now` AND (검증 호출이면 run이 아직 `EXTRACTED_VALIDATED`, 재발행이면 파티션이 아직 `RETRY`) | `PENDING`으로 되돌려 재전송 |
-| run `STAGE_VALIDATING`, `PUBLISHED` | `heartbeat_at < now - LCA_VALIDATION_STALE` | `RUN_STALE_ALERT` ERROR 이벤트(같은 run에는 stale 기간마다 1회). 자동 전이하지 않음 |
-| run `PUBLISHING` | `publish_started_at + LCA_PUBLISH_STALE < now` | `PUBLISH_UNKNOWN`, ERROR 알림. 자동 재실행 금지 |
+| 파티션 `RUNNING` | `heartbeat_at < now - recovery.stale` | 정책 `recovery.mode`에 따름: `FAIL`이면 해당 run의 미완료 파티션과 run을 `TIMED_OUT`. `REISSUE`이면 claim 초기화 후 `RETRY`, 이전 chunk 기록 무효화, `REISSUE_PARTITION` dispatch. `attempt_count >= recovery.max_attempts`이면 `FAIL`과 같게 처리 |
+| run `CREATED`, `EXTRACTING` | `started_at + recovery.run_timeout < now` | `TIMED_OUT`, 알림 |
+| dispatch `SENT` | `sent_at + dispatch.ack_timeout < now` AND (검증 호출이면 run이 아직 `EXTRACTED_VALIDATED`, 재발행이면 파티션이 아직 `RETRY`) | `PENDING`으로 되돌려 재전송 |
+| run `STAGE_VALIDATING`, `PUBLISHED` | `heartbeat_at < now - recovery.validation_stale` | `RUN_STALE_ALERT` ERROR 이벤트(같은 run에는 stale 기간마다 1회). 자동 전이하지 않음 |
+| run `PUBLISHING` | `publish_started_at + recovery.publish_stale < now` | `PUBLISH_UNKNOWN`, ERROR 알림. 자동 재실행 금지 |
 
-stale 기준은 가이드 13장과 같다. heartbeat는 claim과 chunk 보고 때만 갱신되고 Oracle 쿼리가 실행되는 동안에는 갱신되지 않으므로, `LCA_RECOVERY_STALE`은 NiFi `EXTRACT.QUERY.TIMEOUT`(= `LCA_EXTRACT_QUERY_TIMEOUT`)보다 커야 한다. 설정이 이 조건을 어기면 API와 worker가 시작하지 않는다. 그래서 파티션 조건은 heartbeat 하나로 충분하다. 재발행 후 `started_at`은 첫 시작 시각으로 남으므로 조건에 쓰지 않는다.
+stale 기준은 가이드 13장과 같다. heartbeat는 claim과 chunk 보고 때만 갱신되고 Oracle 쿼리가 실행되는 동안에는 갱신되지 않으므로, `recovery.stale`은 NiFi `EXTRACT.QUERY.TIMEOUT`(= `recovery.extract_query_timeout`)보다 커야 한다. 설정이 이 조건을 어기면 API와 worker가 시작하지 않는다. 그래서 파티션 조건은 heartbeat 하나로 충분하다. 재발행 후 `started_at`은 첫 시작 시각으로 남으므로 조건에 쓰지 않는다.
 
 구현에서 정한 세부 규칙은 다음과 같다.
 
@@ -463,7 +463,7 @@ stale 기준은 가이드 13장과 같다. heartbeat는 claim과 chunk 보고 �
 - 재발행 dispatch에는 별도 ACK 엔드포인트가 없다. `RETRY` 파티션이 claim되면 그 파티션의 `REISSUE_PARTITION` dispatch를 `ACKED`로 바꾼다.
 - 늦게 살아난 이전 Worker의 chunk 보고는 claim token이 초기화되어 409 `CLAIM_MISMATCH`, 실패 보고는 409 `PARTITION_STATUS_MISMATCH`를 받는다.
 
-1단계 운영은 `LCA_RECOVERY_MODE=FAIL`을 권장한다. stale 파티션이 생기면 run 전체를 실패시키고 새 `run_id`로 재실행한다. 동일 SCN 재발행(`REISSUE`)은 NiFi 쪽 수신 지점(가이드 13장)과 Oracle UNDO 보존 시간 확인이 끝난 뒤 켠다.
+1단계 운영은 `recovery.mode=FAIL`을 권장한다. stale 파티션이 생기면 run 전체를 실패시키고 새 `run_id`로 재실행한다. 동일 SCN 재발행(`REISSUE`)은 NiFi 쪽 수신 지점(가이드 13장)과 Oracle UNDO 보존 시간 확인이 끝난 뒤 켠다.
 
 ## 8. NiFi 연동 요약
 
@@ -496,7 +496,7 @@ NiFi 쪽 공통 규칙은 다음과 같다.
 |---|---|---|
 | 런타임 | Python 3.12 | |
 | Web | FastAPI, Uvicorn(`uvicorn[standard]`), Gunicorn | Gunicorn + `UvicornWorker`로 멀티 프로세스 |
-| 모델·설정 | Pydantic v2, `pydantic-settings` | 요청 검증, 환경변수 설정 |
+| 모델·설정 | Pydantic v2, `pydantic-settings[yaml]` | 요청 검증, `config.yaml` 설정 |
 | DB | SQLAlchemy 2.0 async Core + `asyncpg` | ORM 대신 `text()` SQL로 CAS·잠금을 명시적으로 작성 |
 | Migration | Alembic(async 템플릿) | 가이드 4.1 DDL을 baseline으로 관리 |
 | HTTP client | `httpx.AsyncClient` | API→NiFi dispatch, mTLS 지원 |
@@ -530,6 +530,7 @@ dispatcher와 sweeper를 HTTP 프로세스와 분리하는 이유는 다음과 �
 load-control-api/
 ├── pyproject.toml
 ├── alembic.ini
+├── config.example.yaml
 ├── alembic/
 │   ├── env.py
 │   └── versions/
@@ -539,7 +540,7 @@ load-control-api/
 │   ├── main.py            # create_app() factory, lifespan, router 등록, 예외 처리기
 │   ├── domain.py          # RunStatus, PartitionStatus, 허용 실패 전이
 │   ├── metrics.py         # Prometheus 메트릭
-│   ├── config.py          # Settings
+│   ├── config.py          # Settings (config.yaml 로드)
 │   ├── db.py              # engine, 트랜잭션 헬퍼(재시도 포함)
 │   ├── security.py        # 인증 의존성(role: nifi, operator)
 │   ├── errors.py          # ApiError 계층
@@ -569,48 +570,49 @@ load-control-api/
 
 ### 9.4 설정과 요청 모델
 
-```python
-# config.py
-from datetime import timedelta
-from typing import Literal
-from pydantic import AnyHttpUrl, SecretStr
-from pydantic_settings import BaseSettings, SettingsConfigDict
+설정은 `config.yaml` 하나로 관리한다. 전체 예시와 각 항목 설명은 [`load-control-api/config.example.yaml`](./load-control-api/config.example.yaml)에 있다.
 
-
-class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="LCA_", env_file=".env")
-
-    database_url: SecretStr          # postgresql+asyncpg://load_control_api@meta:5432/nifiops
-    listen_dsn: SecretStr            # postgresql://... (LISTEN 전용, asyncpg 직접 연결)
-    db_pool_size: int = 10
-    db_max_overflow: int = 5
-    token_digests: dict[str, list[str]] = {}   # {"nifi": [sha256...], "operator": [...]}, JSON 환경변수
-
-    nifi_receiver_url: AnyHttpUrl    # NiFi LB의 PG-05 수신 주소, 예: https://nifi-lb.internal:9443
-    nifi_client_cert: str | None = None   # mTLS client cert/key 경로
-    nifi_client_key: str | None = None
-    nifi_ca_bundle: str | None = None
-    nifi_timeout_seconds: float = 10.0
-
-    run_timeout: timedelta = timedelta(hours=6)
-    extract_query_timeout: timedelta = timedelta(minutes=60)
-    recovery_stale: timedelta = timedelta(minutes=90)
-    recovery_mode: Literal["FAIL", "REISSUE"] = "FAIL"
-    recovery_max_attempts: int = 3   # REISSUE 모드에서 초과 시 run TIMED_OUT
-    validation_stale: timedelta = timedelta(hours=2)
-    publish_stale: timedelta = timedelta(hours=2)
-
-    dispatch_max_attempts: int = 20
-    dispatch_backoff_min: timedelta = timedelta(seconds=5)
-    dispatch_backoff_max: timedelta = timedelta(minutes=5)
-    dispatch_ack_timeout: timedelta = timedelta(minutes=10)
-    dispatch_lease: timedelta = timedelta(seconds=60)
-    dispatch_poll_interval: timedelta = timedelta(seconds=5)
-    dispatch_batch: int = 20
-    sweeper_interval: timedelta = timedelta(minutes=1)
+```yaml
+database:
+  url: postgresql+asyncpg://load_control_api:***@meta:5432/nifiops   # API 런타임 계정
+  migration_url: postgresql+asyncpg://nifi_ops_migrator:***@meta:5432/nifiops  # alembic 전용
+  listen_dsn: postgresql://load_control_api:***@meta:5432/nifiops     # worker LISTEN 전용
+  pool_size: 10
+auth:
+  token_digests:
+    nifi: ["<sha256-hex>"]
+    operator: ["<sha256-hex>"]
+nifi:
+  receiver_url: https://nifi-lb.internal:9443
+recovery:
+  extract_query_timeout: PT60M
+  stale: PT90M
+  mode: FAIL
+dispatch:
+  ack_timeout: PT10M
+logging:
+  format: json
 ```
 
-`timedelta`는 환경변수에서 ISO 8601(`LCA_RUN_TIMEOUT=PT6H`) 또는 초 단위 숫자로 받는다. 비밀값은 `SecretStr`로 두어 로그에 찍히지 않게 한다.
+| 섹션 | 내용 |
+|---|---|
+| `database` | DB URL(런타임, migration, LISTEN), pool, 트랜잭션 재시도 횟수 |
+| `auth` | role별 Bearer 토큰 SHA-256 digest |
+| `nifi` | worker → NiFi PG-05 호출 주소, mTLS 인증서, timeout |
+| `recovery` | sweeper 기준: run timeout, stale, 재발행 모드, 정체 경보 |
+| `dispatch` | outbox 전달: 최대 시도, backoff, ACK timeout, lease, 폴링 주기 |
+| `worker` | worker `/metrics` 포트 |
+| `logging` | 로그 수준, 형식(json/console) |
+
+로드 규칙은 다음과 같다(`config.py`, `pydantic-settings`의 `YamlConfigSettingsSource`).
+
+- 파일 위치는 `LCA_CONFIG` 환경변수, 없으면 현재 디렉터리의 `config.yaml`이다. 파일이 없으면 API, worker, alembic 모두 시작하지 않는다.
+- 우선순위는 환경변수 > `config.yaml` > 기본값이다. 환경변수 덮어쓰기는 비밀값 주입용이며 섹션 구분자는 `__`이다(예: `LCA_DATABASE__URL`). 비밀값을 파일에 두지 않으려면 YAML에서 해당 키를 빼고 환경변수나 secret 저장소로 주입한다.
+- 섹션마다 `extra="forbid"`라서 모르는 키(오타)가 있으면 시작을 거부한다.
+- 기간은 ISO 8601(`PT90M`, `PT6H`) 또는 초 단위 숫자로 쓴다.
+- `recovery.stale <= recovery.extract_query_timeout`이면 검증 오류로 시작을 거부한다.
+- 비밀값(DB URL)은 `SecretStr`이라 로그와 `repr`에 찍히지 않는다.
+- `config.yaml`은 git에 올리지 않는다(`.gitignore`). 저장소에는 `config.example.yaml`만 둔다.
 
 ```python
 # schemas/partitions.py
@@ -669,9 +671,9 @@ RETRYABLE_SQLSTATE = {"40P01", "40001"}  # deadlock_detected, serialization_fail
 
 def make_engine(settings) -> AsyncEngine:
     return create_async_engine(
-        settings.database_url.get_secret_value(),
-        pool_size=settings.db_pool_size,
-        max_overflow=settings.db_max_overflow,
+        settings.database.url.get_secret_value(),
+        pool_size=settings.database.pool_size,
+        max_overflow=settings.database.max_overflow,
         pool_pre_ping=True,
     )
 
@@ -796,7 +798,7 @@ bearer = HTTPBearer(auto_error=True)
 def require_role(role: str):
     async def dep(request: Request, cred: HTTPAuthorizationCredentials = Depends(bearer)) -> None:
         digest = hashlib.sha256(cred.credentials.encode()).hexdigest()
-        allowed = request.app.state.settings.token_digests.get(role, ())
+        allowed = request.app.state.settings.auth.token_digests.get(role, ())
         if not any(hmac.compare_digest(digest, d) for d in allowed):
             raise HTTPException(status_code=403, detail="FORBIDDEN")
     return dep
@@ -839,21 +841,21 @@ import httpx
 
 async def run_dispatcher(settings, engine, client: httpx.AsyncClient) -> None:
     wake = asyncio.Event()
-    listener = await asyncpg.connect(settings.listen_dsn.get_secret_value())
+    listener = await asyncpg.connect(settings.database.listen_dsn.get_secret_value())
     await listener.add_listener("load_dispatch", lambda *_: wake.set())
     while True:
         try:
-            await asyncio.wait_for(wake.wait(), settings.dispatch_poll_interval.total_seconds())
+            await asyncio.wait_for(wake.wait(), settings.dispatch.poll_interval.total_seconds())
         except TimeoutError:
             pass
         wake.clear()
-        while batch := await dispatch.lease_due(engine, settings.dispatch_batch, settings.dispatch_lease):
+        while batch := await dispatch.lease_due(engine, settings.dispatch.batch, settings.dispatch.lease):
             await asyncio.gather(*(send_one(settings, engine, client, d) for d in batch))
 
 
 async def send_one(settings, engine, client, d) -> None:
     action = "validate" if d.dispatch_type == "VALIDATE_RUN" else "reissue"
-    url = f"{str(settings.nifi_receiver_url).rstrip('/')}/{action}/{d.job_key}"
+    url = f"{str(settings.nifi.receiver_url).rstrip('/')}/{action}/{d.job_key}"
     body = await dispatch.build_body(engine, d)   # 5.3 dispatch 본문
     headers = {"X-Run-Id": str(d.run_id), "X-Dispatch-Id": str(d.dispatch_id)}
     try:
@@ -872,7 +874,7 @@ async def send_one(settings, engine, client, d) -> None:
 - listener 연결이 끊기면 다시 연결하고 바로 한 번 폴링한다(연결 감시 루프는 생략).
 - `httpx.AsyncClient`는 프로세스당 하나를 만들고 `cert=(client_cert, client_key)`, `verify=ca_bundle`, `timeout=nifi_timeout_seconds`로 mTLS를 설정한다.
 - `mark_sent`는 `WHERE status = 'PENDING'` 조건으로만 갱신한다. NiFi가 202를 응답하자마자 `/validation/start`를 호출해 이미 `ACKED`가 됐을 수 있기 때문이다. 이 조건이 없으면 `ACKED`가 `SENT`로 덮여 ACK timeout 후 불필요한 재전송이 생긴다.
-- `schedule_retry`는 `attempt_count >= dispatch_max_attempts`이면 `DEAD`로 바꾸고 `DISPATCH_DEAD` ERROR 이벤트를 남긴다.
+- `schedule_retry`는 `attempt_count >= dispatch.max_attempts`이면 `DEAD`로 바꾸고 `DISPATCH_DEAD` ERROR 이벤트를 남긴다.
 
 sweeper는 tick마다 한 트랜잭션에서 `pg_try_advisory_xact_lock(hashtext('load_control_sweeper'))`을 먼저 얻는다. 잠금을 못 얻으면 다른 worker가 실행 중이므로 건너뛴다. 7장의 규칙은 각각 조건부 `UPDATE ... RETURNING` 한 문장으로 구현하고, 반환된 행마다 `load_event`를 기록한다.
 
@@ -892,7 +894,7 @@ sweeper는 tick마다 한 트랜잭션에서 `pg_try_advisory_xact_lock(hashtext
 | Gunicorn | `-w`는 CPU 코어 수 기준, `--timeout 60`, `--graceful-timeout 30` |
 | DB 연결 수 | `api 인스턴스 × gunicorn worker × (pool_size + max_overflow) + worker 인스턴스 × pool + listener` ≤ 관리 DB 승인 연결 수 |
 | 종료 | SIGTERM 시 진행 중 요청을 끝내고 종료. 중간에 끊겨도 트랜잭션 rollback과 NiFi 재시도로 복구 |
-| 설정 주입 | `LCA_*` 환경변수, 비밀값은 조직 표준 secret 저장소 |
+| 설정 주입 | `config.yaml`을 `/etc/load-control/config.yaml`로 마운트(`LCA_CONFIG`). 비밀값은 조직 표준 secret 저장소에서 `LCA_DATABASE__URL` 같은 환경변수로 덮어쓴다 |
 
 ### 9.11 로그와 메트릭
 
@@ -951,7 +953,7 @@ sweeper는 tick마다 한 트랜잭션에서 `pg_try_advisory_xact_lock(hashtext
 | manifest 합계 ≠ source count | 422, run `FAILED_MANIFEST` |
 | 전부 0건 파티션 + `ALLOW.EMPTY.SOURCE=true` | manifest 응답 시점에 run 완료, dispatch 1행 |
 | NiFi 수신 측 5xx | backoff 재시도, 최대 횟수 초과 시 `DEAD`와 알림 |
-| 202 응답 후 `/validation/start` 미도착 | `LCA_DISPATCH_ACK_TIMEOUT` 후 재전송 |
+| 202 응답 후 `/validation/start` 미도착 | `dispatch.ack_timeout` 후 재전송 |
 | `/validation/start` 2회 | 첫 번째만 `started=true` |
 | worker 2개에서 dispatcher 동시 실행 | 같은 dispatch를 한 번만 전송 |
 | 전송 중 worker 종료 | lease 만료 후 다른 worker가 재전송 |
@@ -986,6 +988,6 @@ API 전체 중단 중 시작된 run은 성공으로 판정되지 않고 TIMED_OU
 3. **PG-10, PG-20 전환**: PoC 환경(NiFi 2.4.0 + PostgreSQL)에서 PoC와 같은 시나리오(105,000건, 8파티션, 0건 파티션, 배수 경계, 중복 실행, HDFS 실패 주입)를 다시 실행한다. 이 단계에서는 PG-30을 남겨 두고 API 판정 결과와 PG-30 판정 결과를 비교할 수 있다.
 4. **outbox와 검증 수신** (API 구현 완료, NiFi 남음): `load_dispatch`, dispatcher, `/validation/start`, PG-05·PG-40 입구. 이후 PG-30과 DMC Controller Service를 삭제한다.
 5. **PG-50, PG-60 연동** (API 구현 완료, NiFi 남음): publish claim·result, validations, stage-validated, success, 운영자 엔드포인트.
-6. **Sweeper** (API 구현 완료): `LCA_RECOVERY_MODE=FAIL`로 시작. 노드 종료, API 재기동, NiFi 재기동, 보고 유실을 주입해 검증한다.
+6. **Sweeper** (API 구현 완료): `recovery.mode=FAIL`로 시작. 노드 종료, API 재기동, NiFi 재기동, 보고 유실을 주입해 검증한다.
 7. **권한 회수**: NiFi 계정의 업무 테이블 쓰기 권한 회수(6장, 가이드 4.1).
 8. **재발행(선택)** (API 구현 완료, NiFi 남음): `REISSUE_PARTITION`과 PG-05 `/reissue/{jobKey}` 수신 경로.

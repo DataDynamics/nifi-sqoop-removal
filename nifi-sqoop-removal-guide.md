@@ -290,7 +290,7 @@ Concurrent Tasks는 정수 스케줄링 설정이라 Parameter(`#{...}`)나 Expr
 | `FAILED.RETENTION.DAYS` | `14` | N | 실패 staging 보존 |
 | `SUCCESS.RETENTION.DAYS` | `3` | N | 성공 staging 보존 |
 
-run timeout, stale 판정, dispatch 재시도 같은 제어 설정은 NiFi Parameter가 아니라 API 설정(`LCA_*` 환경변수, API 설계 9.4)이다. `EXTRACT.QUERY.TIMEOUT`은 NiFi와 API 양쪽에 같은 값을 둔다. API는 이 값으로 stale 여부를 판단한다.
+run timeout, stale 판정, dispatch 재시도 같은 제어 설정은 NiFi Parameter가 아니라 API 설정(`config.yaml`, API 설계 9.4)이다. `EXTRACT.QUERY.TIMEOUT`은 NiFi와 API 양쪽에 같은 값을 둔다. API는 이 값으로 stale 여부를 판단한다.
 
 ### 3.2 `PC_JOB_<JOB_NAME>`
 
@@ -1223,7 +1223,7 @@ flowchart LR
 | 10 | `RouteOnAttribute` | All Nodes, 1 | Job별 `${load.job.key:equals('ORACLE_INSP_DTL_DAILY'):and(${control.action:equals('validate')})}` 등 | Job PG Output Port, unmatched→PG-90 ERROR |
 
 - 검증은 수십 분 걸릴 수 있으므로 08에서 먼저 202를 응답하고 HTTP 연결을 붙잡지 않는다. API는 2xx를 받으면 dispatch를 `SENT`로 바꾸고, 검증 flow가 `/validation/start`를 호출해야 `ACKED`가 된다. 202 응답 직후 노드가 죽어 FlowFile이 사라지면 API가 ACK timeout 뒤 다시 보낸다.
-- `HandleHttpRequest`는 모든 노드에서 동작한다. API는 NiFi LB 주소(`LCA_NIFI_RECEIVER_URL`)로 호출하며, 어느 노드가 받든 Job PG의 첫 단계 CAS가 중복 실행을 막는다. 그래서 PG-40~60은 All Nodes로 스케줄한다(2장).
+- `HandleHttpRequest`는 모든 노드에서 동작한다. API는 NiFi LB 주소(`nifi.receiver_url`)로 호출하며, 어느 노드가 받든 Job PG의 첫 단계 CAS가 중복 실행을 막는다. 그래서 PG-40~60은 All Nodes로 스케줄한다(2장).
 - 새 Job을 추가하면 10에 route 두 개(validate, reissue)와 Output Port를 추가한다. 등록되지 않은 `jobKey`는 ERROR로 남기고, API의 dispatch는 ACK timeout 뒤 재전송된다. 계속 실패하면 `DEAD`가 되어 알림이 간다.
 - 05의 TLS client 인증으로 API만 호출할 수 있게 한다. 방화벽으로 수신 포트를 API 서버 대역에만 연다.
 
@@ -1434,19 +1434,19 @@ API는 64에서 저장된 TARGET 지표가 모두 PASS이고 `status='PUBLISHED'
 
 | 대상 | 조건 | 동작 |
 |---|---|---|
-| 파티션 `RUNNING` | `heartbeat_at < now - LCA_RECOVERY_STALE` | `LCA_RECOVERY_MODE=FAIL`: run `TIMED_OUT`. `REISSUE`: claim 초기화 후 `RETRY`, 이전 chunk 기록 무효화, `REISSUE_PARTITION` dispatch. 시도 횟수가 `LCA_RECOVERY_MAX_ATTEMPTS`에 도달하면 run `TIMED_OUT` |
-| run `CREATED`, `EXTRACTING` | `started_at + LCA_RUN_TIMEOUT < now` | `TIMED_OUT`, 알림 |
+| 파티션 `RUNNING` | `heartbeat_at < now - recovery.stale` | `recovery.mode=FAIL`: run `TIMED_OUT`. `REISSUE`: claim 초기화 후 `RETRY`, 이전 chunk 기록 무효화, `REISSUE_PARTITION` dispatch. 시도 횟수가 `recovery.max_attempts`에 도달하면 run `TIMED_OUT` |
+| run `CREATED`, `EXTRACTING` | `started_at + recovery.run_timeout < now` | `TIMED_OUT`, 알림 |
 | dispatch `SENT` | ACK timeout 경과, run이 아직 `EXTRACTED_VALIDATED` | `PENDING`으로 되돌려 재전송 |
-| run `STAGE_VALIDATING`, `PUBLISHED` | heartbeat가 `LCA_VALIDATION_STALE`보다 오래됨 | ERROR 알림. 자동 전이하지 않음 |
-| run `PUBLISHING` | `publish_started_at + LCA_PUBLISH_STALE < now` | `PUBLISH_UNKNOWN`, ERROR 알림. 자동 재실행 금지 |
+| run `STAGE_VALIDATING`, `PUBLISHED` | heartbeat가 `recovery.validation_stale`보다 오래됨 | ERROR 알림. 자동 전이하지 않음 |
+| run `PUBLISHING` | `publish_started_at + recovery.publish_stale < now` | `PUBLISH_UNKNOWN`, ERROR 알림. 자동 재실행 금지 |
 
-- `LCA_RECOVERY_STALE`은 `EXTRACT.QUERY.TIMEOUT` + 파티션당 chunk 기록·보고 소요시간 + 여유보다 크게 잡는다. heartbeat는 claim과 chunk 보고에서만 갱신되고 파티션 쿼리 실행 중에는 갱신되지 않는다(8.5). 이 값이 query timeout(60분)보다 짧으면 정상 실행 중인 파티션을 stale로 판정하므로, API는 `LCA_RECOVERY_STALE <= LCA_EXTRACT_QUERY_TIMEOUT`이면 시작하지 않는다.
-- 1단계 운영은 `LCA_RECOVERY_MODE=FAIL`이다. stale 파티션이 생기면 run 전체를 실패시키고 새 `run_id`로 재실행한다.
+- `recovery.stale`은 `EXTRACT.QUERY.TIMEOUT` + 파티션당 chunk 기록·보고 소요시간 + 여유보다 크게 잡는다. heartbeat는 claim과 chunk 보고에서만 갱신되고 파티션 쿼리 실행 중에는 갱신되지 않는다(8.5). 이 값이 query timeout(60분)보다 짧으면 정상 실행 중인 파티션을 stale로 판정하므로, API는 `recovery.stale <= recovery.extract_query_timeout`이면 시작하지 않는다.
+- 1단계 운영은 `recovery.mode=FAIL`이다. stale 파티션이 생기면 run 전체를 실패시키고 새 `run_id`로 재실행한다.
 - `ORA-01555`는 Worker가 `fail`로 보고하며, API가 run을 `FAILED_SNAPSHOT_EXPIRED`로 바꾼다. 같은 run의 일부 파티션만 새 SCN으로 읽지 않는다.
 
 ### 13.2 재발행 수신 (선택)
 
-`LCA_RECOVERY_MODE=REISSUE`일 때만 사용한다. API는 stale 파티션의 claim을 CAS로 초기화한 뒤 `REISSUE_PARTITION` dispatch를 만들고, PG-05를 거쳐 Job PG의 `reissue-in`으로 전달한다. 요청 본문에는 Worker 실행에 필요한 값이 모두 들어 있다.
+`recovery.mode=REISSUE`일 때만 사용한다. API는 stale 파티션의 claim을 CAS로 초기화한 뒤 `REISSUE_PARTITION` dispatch를 만들고, PG-05를 거쳐 Job PG의 `reissue-in`으로 전달한다. 요청 본문에는 Worker 실행에 필요한 값이 모두 들어 있다.
 
 ```json
 { "runId": "...", "dispatchId": "...", "partitionId": "0003",
@@ -1461,7 +1461,7 @@ API는 64에서 저장된 TARGET 지표가 모두 PASS이고 `status='PUBLISHED'
 | 71 | `RouteOnAttribute` | All Nodes, 1 | SCN·경계·건수 숫자 정규식 검증 | valid→72, unmatched→PG-90 ERROR |
 | 72 | `UpdateAttribute` + Output Port | All Nodes, 1 | `event.name=RECOVERY_REISSUED`, `event.level=WARN` | success→PG-20 입력(Round Robin) |
 
-재발행된 FlowFile은 PG-20의 20에서 새 claim token으로 claim한다. 이 claim이 재발행 수신 확인(ACK)이 되며, ACK 없이 `LCA_DISPATCH_ACK_TIMEOUT`이 지나면 API가 재발행 요청을 다시 보낸다. API는 `RETRY` 상태 파티션만 claim을 허용하므로 이전 Worker가 늦게 살아나도 이전 token의 chunk 보고는 409 `CLAIM_MISMATCH`로 거부된다. API는 재발행 전에 이전 시도의 chunk 기록을 집계에서 빼므로, 새 Worker의 보고만으로 파티션을 판정한다. 같은 `run_id + partition_id`와 같은 SCN, 같은 결정적 파일명을 쓰므로 PutHDFS `replace`로 이전 파일을 덮어쓴다. 재발행은 Oracle UNDO 보존 시간이 run 최대 시간보다 길다는 것을 확인한 뒤 켠다.
+재발행된 FlowFile은 PG-20의 20에서 새 claim token으로 claim한다. 이 claim이 재발행 수신 확인(ACK)이 되며, ACK 없이 `dispatch.ack_timeout`이 지나면 API가 재발행 요청을 다시 보낸다. API는 `RETRY` 상태 파티션만 claim을 허용하므로 이전 Worker가 늦게 살아나도 이전 token의 chunk 보고는 409 `CLAIM_MISMATCH`로 거부된다. API는 재발행 전에 이전 시도의 chunk 기록을 집계에서 빼므로, 새 Worker의 보고만으로 파티션을 판정한다. 같은 `run_id + partition_id`와 같은 SCN, 같은 결정적 파일명을 쓰므로 PutHDFS `replace`로 이전 파일을 덮어쓴다. 재발행은 Oracle UNDO 보존 시간이 run 최대 시간보다 길다는 것을 확인한 뒤 켠다.
 
 ---
 
@@ -1756,7 +1756,7 @@ API 쪽 구현과 동시성 테스트는 API 설계 9.5~9.6, 11장을 따른다.
 7. 비운영 target에서 `INSERT OVERWRITE`와 `PUBLISH_UNKNOWN` 경로를 시험한다.
 8. Target validation과 최종 상태를 연결한다.
 9. 장애를 주입한다: NiFi 노드 종료, NiFi 재기동, API 인스턴스 종료, API worker 종료, 관리 DB 연결 차단, HDFS 오류, `ORA-01555`, 검증 호출 수신 실패.
-10. API sweeper(`LCA_RECOVERY_MODE=FAIL`)와 보존/정리 flow를 활성화하고, NiFi 계정의 원장 쓰기 권한을 회수한다.
+10. API sweeper(`recovery.mode=FAIL`)와 보존/정리 flow를 활성화하고, NiFi 계정의 원장 쓰기 권한을 회수한다.
 
 운영 승인 조건:
 

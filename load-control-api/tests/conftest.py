@@ -51,14 +51,19 @@ def migrated_url(database_url: str) -> str:
 @pytest.fixture
 def settings(migrated_url: str) -> Settings:
     return Settings(
-        database_url=migrated_url,  # type: ignore[arg-type]
-        token_digests={"nifi": [token_digest(NIFI_TOKEN)],
-                       "operator": [token_digest(OPERATOR_TOKEN)]},
-        db_pool_size=20,
-        db_max_overflow=20,
-        log_json=False,
-        log_level="WARNING",
+        database={"url": migrated_url, "pool_size": 20, "max_overflow": 20},  # type: ignore[arg-type]
+        auth={"token_digests": {"nifi": [token_digest(NIFI_TOKEN)],  # type: ignore[arg-type]
+                                "operator": [token_digest(OPERATOR_TOKEN)]}},
+        logging={"level": "WARNING", "format": "console"},  # type: ignore[arg-type]
     )
+
+
+def override(settings: Settings, **sections: dict[str, Any]) -> Settings:
+    """섹션 일부 값을 바꾼 새 Settings. 검증을 다시 거친다."""
+    data = settings.model_dump()
+    for name, values in sections.items():
+        data[name] = {**data[name], **values}
+    return Settings(**data)
 
 
 @pytest_asyncio.fixture

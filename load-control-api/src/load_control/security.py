@@ -28,7 +28,7 @@ def require_role(*roles: str) -> Callable[..., Awaitable[str]]:
             raise HTTPException(status_code=401, detail="UNAUTHENTICATED",
                                 headers={"WWW-Authenticate": "Bearer"})
         digest = token_digest(cred.credentials)
-        configured: dict[str, list[str]] = request.app.state.settings.token_digests
+        configured: dict[str, list[str]] = request.app.state.settings.auth.token_digests
         for role in roles:
             if any(hmac.compare_digest(digest, d.lower()) for d in configured.get(role, ())):
                 request.state.role = role

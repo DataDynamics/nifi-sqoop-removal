@@ -29,7 +29,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     """앱 factory. 실행: uvicorn --factory load_control.main:create_app
     또는 gunicorn 'load_control.main:create_app()' -k uvicorn.workers.UvicornWorker"""
     settings = settings or get_settings()
-    configure_logging(settings.log_level, settings.log_json)
+    configure_logging(settings.logging.level, settings.logging.format == "json")
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:

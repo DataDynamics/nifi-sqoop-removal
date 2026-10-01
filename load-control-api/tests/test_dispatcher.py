@@ -13,7 +13,7 @@ from load_control.config import Settings
 from load_control.db import in_tx
 from load_control.repositories import dispatch
 from load_control.worker.dispatcher import Dispatcher, backoff
-from tests.conftest import Db
+from tests.conftest import Db, override
 from tests.helpers import claim, complete_run, start_run
 
 NIFI = "https://nifi.test:9443"
@@ -22,12 +22,13 @@ VALIDATE = f"{NIFI}/validate/ORACLE_INSP_DTL_DAILY"
 
 @pytest.fixture
 def worker_settings(settings: Settings, migrated_url: str) -> Settings:
-    return settings.model_copy(update={
-        "nifi_receiver_url": NIFI, "dispatch_max_attempts": 3,
-        "dispatch_backoff_min": timedelta(seconds=5), "dispatch_backoff_max": timedelta(minutes=1),
-        "dispatch_poll_interval": timedelta(seconds=60),
-        "listen_dsn": SecretStr(migrated_url.replace("+asyncpg", "")),
-    })
+    return override(
+        settings,
+        nifi={"receiver_url": NIFI},
+        dispatch={"max_attempts": 3, "backoff_min": timedelta(seconds=5),
+                  "backoff_max": timedelta(minutes=1), "poll_interval": timedelta(seconds=60)},
+        database={"listen_dsn": SecretStr(migrated_url.replace("+asyncpg", ""))},
+    )
 
 
 async def make_dispatcher(worker_settings: Settings, engine: AsyncEngine) -> Dispatcher:

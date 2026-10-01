@@ -19,7 +19,7 @@ API 설계 12장 전환 순서 중 API 쪽 작업을 모두 구현했다. NiFi F
 ```text
 src/load_control/
 ├── main.py           # create_app() factory, 예외 처리기, router 등록
-├── config.py         # Settings (LCA_* 환경변수)
+├── config.py         # Settings (config.yaml 로드)
 ├── db.py             # engine, in_tx (deadlock 재시도), SQLSTATE 헬퍼
 ├── security.py       # Bearer 토큰 role 인증 (digest 비교)
 ├── errors.py         # ApiError → JSON 오류 응답
@@ -35,12 +35,21 @@ alembic/versions/0001_nifi_ops_baseline.py   # 가이드 4.1 DDL
 tests/                                       # 실제 PostgreSQL 대상 통합·동시성 테스트
 ```
 
+## 설정
+
+설정은 `config.yaml` 하나로 관리한다. 항목 설명은 [`config.example.yaml`](./config.example.yaml)에 있다.
+
+- 파일 위치: `LCA_CONFIG` 환경변수, 없으면 현재 디렉터리의 `config.yaml`. 파일이 없으면 시작하지 않는다.
+- 우선순위: 환경변수 > `config.yaml` > 기본값. 비밀값은 `LCA_DATABASE__URL`처럼 환경변수로 덮어쓸 수 있다(섹션 구분자 `__`).
+- 모르는 키(오타)나 잘못된 값이 있으면 시작하지 않는다.
+- 기간 값은 ISO 8601(`PT90M`) 또는 초 단위 숫자.
+
 ## 개발 환경
 
 ```bash
 uv venv -p 3.12 .venv
 uv pip install -p .venv/bin/python -e ".[dev]"
-cp .env.example .env   # 값 채우기
+cp config.example.yaml config.yaml   # 값 채우기 (config.yaml은 git에 올리지 않음)
 ```
 
 토큰 digest 생성:
@@ -52,7 +61,7 @@ cp .env.example .env   # 값 채우기
 ## Migration
 
 ```bash
-export LCA_MIGRATION_DATABASE_URL=postgresql+asyncpg://<ddl-user>@<host>:5432/<db>
+# config.yaml의 database.migration_url(없으면 database.url)을 쓴다
 .venv/bin/alembic upgrade head
 ```
 
@@ -73,13 +82,13 @@ gunicorn 'load_control.main:create_app()' -k uvicorn.workers.UvicornWorker -w 4 
 python -m load_control.worker
 ```
 
-worker는 `LCA_NIFI_RECEIVER_URL`(NiFi LB의 PG-05 주소)이 없으면 시작하지 않는다. `LCA_LISTEN_DSN`이 없으면 NOTIFY 없이 `LCA_DISPATCH_POLL_INTERVAL`마다 폴링만 한다. SIGTERM을 받으면 진행 중인 작업을 끝내고 종료한다. 여러 개를 띄워도 lease와 advisory lock 때문에 같은 dispatch를 두 번 보내거나 같은 정리를 두 번 하지 않는다.
+worker는 `nifi.receiver_url`(NiFi LB의 PG-05 주소)이 없으면 시작하지 않는다. `database.listen_dsn`이 없으면 NOTIFY 없이 `dispatch.poll_interval`마다 폴링만 한다. SIGTERM을 받으면 진행 중인 작업을 끝내고 종료한다. 여러 개를 띄워도 lease와 advisory lock 때문에 같은 dispatch를 두 번 보내거나 같은 정리를 두 번 하지 않는다.
 
-`LCA_RECOVERY_STALE`은 `LCA_EXTRACT_QUERY_TIMEOUT`보다 커야 하며, 그렇지 않으면 API와 worker 모두 시작하지 않는다.
+`recovery.stale`은 `recovery.extract_query_timeout`보다 커야 하며, 그렇지 않으면 API와 worker 모두 시작하지 않는다.
 
 - `GET /healthz`: 프로세스 생존(DB 미확인)
 - `GET /readyz`: DB `SELECT 1`
-- `GET /metrics`: Prometheus(API). worker는 `LCA_WORKER_METRICS_PORT`(기본 9100)에서 dispatch backlog, 활성 run 수, sweeper 처리 건수를 노출한다.
+- `GET /metrics`: Prometheus(API). worker는 `worker.metrics_port`(기본 9100)에서 dispatch backlog, 활성 run 수, sweeper 처리 건수를 노출한다.
 - API `GET /metrics`: Gunicorn 멀티 프로세스에서 프로세스 합계가 필요하면 `PROMETHEUS_MULTIPROC_DIR`을 설정하고 multiprocess collector로 바꾼다.
 - OpenAPI 문서: `/docs`, `/openapi.json`
 

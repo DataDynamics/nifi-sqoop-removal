@@ -1,7 +1,6 @@
 """Alembic async 환경. ORM 모델이 없으므로 autogenerate는 쓰지 않고 SQL을 직접 작성한다(API 설계 9.9)."""
 
 import asyncio
-import os
 from logging.config import fileConfig
 
 from alembic import context
@@ -16,12 +15,14 @@ VERSION_TABLE_SCHEMA = "nifi_ops"
 
 
 def database_url() -> str:
-    url = (config.attributes.get("database_url")
-           or os.environ.get("LCA_MIGRATION_DATABASE_URL")
-           or os.environ.get("LCA_DATABASE_URL"))
-    if not url:
-        raise RuntimeError("LCA_MIGRATION_DATABASE_URL 또는 LCA_DATABASE_URL을 설정하세요")
-    return str(url)
+    """테스트가 넘긴 URL, 없으면 config.yaml의 database.migration_url(없으면 database.url)."""
+    url = config.attributes.get("database_url")
+    if url:
+        return str(url)
+    from load_control.config import Settings
+
+    db = Settings.load().database
+    return (db.migration_url or db.url).get_secret_value()
 
 
 def do_run_migrations(connection: Connection) -> None:

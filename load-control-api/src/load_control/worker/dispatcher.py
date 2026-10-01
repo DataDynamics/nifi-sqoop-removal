@@ -20,22 +20,22 @@ log = structlog.get_logger(__name__)
 
 def backoff(settings: Settings, attempt: int) -> timedelta:
     """attempt(1부터)에 따른 지수 backoff. min × 2^(attempt-1), 상한 max."""
-    delay: timedelta = settings.dispatch_backoff_min * (1 << min(max(attempt - 1, 0), 30))
-    return min(delay, settings.dispatch_backoff_max)
+    delay: timedelta = settings.dispatch.backoff_min * (1 << min(max(attempt - 1, 0), 30))
+    return min(delay, settings.dispatch.backoff_max)
 
 
 def make_client(settings: Settings) -> httpx.AsyncClient:
-    cert = ((settings.nifi_client_cert, settings.nifi_client_key)
-            if settings.nifi_client_cert and settings.nifi_client_key else None)
-    verify: bool | str = settings.nifi_ca_bundle or True
-    return httpx.AsyncClient(cert=cert, verify=verify, timeout=settings.nifi_timeout_seconds)
+    cert = ((settings.nifi.client_cert, settings.nifi.client_key)
+            if settings.nifi.client_cert and settings.nifi.client_key else None)
+    verify: bool | str = settings.nifi.ca_bundle or True
+    return httpx.AsyncClient(cert=cert, verify=verify, timeout=settings.nifi.timeout_seconds)
 
 
 def target_url(settings: Settings, d: LeasedDispatch) -> str:
-    if settings.nifi_receiver_url is None:
+    if settings.nifi.receiver_url is None:
         raise RuntimeError("LCA_NIFI_RECEIVER_URL이 설정되지 않았습니다")
     action = "validate" if d.dispatch_type == "VALIDATE_RUN" else "reissue"
-    return f"{str(settings.nifi_receiver_url).rstrip('/')}/{action}/{d.job_key}"
+    return f"{str(settings.nifi.receiver_url).rstrip('/')}/{action}/{d.job_key}"
 
 
 async def wait_first(*events: asyncio.Event) -> None:
@@ -60,7 +60,7 @@ class Dispatcher:
         sent = 0
         while True:
             batch = await in_tx(self.engine, lambda conn: dispatch.lease_due(
-                conn, batch=self.settings.dispatch_batch, lease=self.settings.dispatch_lease))
+                conn, batch=self.settings.dispatch.batch, lease=self.settings.dispatch.lease))
             if not batch:
                 return sent
             await asyncio.gather(*(self.send_one(d) for d in batch))
@@ -91,7 +91,7 @@ class Dispatcher:
             await self._retry(d, r.status_code, r.text)
 
     async def _retry(self, d: LeasedDispatch, status: int | None, error: str) -> None:
-        if d.attempt_count >= self.settings.dispatch_max_attempts:
+        if d.attempt_count >= self.settings.dispatch.max_attempts:
             await self._dead(d, status, f"max attempts reached: {error}")
             return
         delay = backoff(self.settings, d.attempt_count)
@@ -118,7 +118,7 @@ class Dispatcher:
     async def run(self, stop: asyncio.Event) -> None:
         """LISTEN으로 즉시 깨어나고, 알림을 놓쳐도 poll 주기마다 확인한다."""
         listener_task = asyncio.create_task(self._listen(stop))
-        poll = self.settings.dispatch_poll_interval.total_seconds()
+        poll = self.settings.dispatch.poll_interval.total_seconds()
         try:
             while not stop.is_set():
                 try:
@@ -134,10 +134,10 @@ class Dispatcher:
                 await listener_task
 
     async def _listen(self, stop: asyncio.Event) -> None:
-        if self.settings.listen_dsn is None:
+        if self.settings.database.listen_dsn is None:
             log.warning("listen_disabled", reason="LCA_LISTEN_DSN not set; polling only")
             return
-        dsn = self.settings.listen_dsn.get_secret_value()
+        dsn = self.settings.database.listen_dsn.get_secret_value()
         while not stop.is_set():
             conn: asyncpg.Connection | None = None
             try:

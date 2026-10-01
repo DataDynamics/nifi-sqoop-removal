@@ -13,9 +13,9 @@ FOREIGN_KEY_VIOLATION = "23503"
 
 def make_engine(settings: Settings) -> AsyncEngine:
     return create_async_engine(
-        settings.database_url.get_secret_value(),
-        pool_size=settings.db_pool_size,
-        max_overflow=settings.db_max_overflow,
+        settings.database.url.get_secret_value(),
+        pool_size=settings.database.pool_size,
+        max_overflow=settings.database.max_overflow,
         pool_pre_ping=True,
     )
 

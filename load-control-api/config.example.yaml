@@ -1,0 +1,55 @@
+# Load Control API 설정 예시. 복사해서 config.yaml로 쓴다(config.yaml은 git에 올리지 않는다).
+#   파일 위치: LCA_CONFIG 환경변수, 없으면 현재 디렉터리의 config.yaml
+#   환경변수가 같은 항목을 덮어쓴다(비밀값 주입용). 섹션 구분자는 '__'. 예: LCA_DATABASE__URL
+#   모르는 키가 있으면 시작하지 않는다.
+#   기간 값은 ISO 8601(PT90M, PT6H) 또는 초 단위 숫자로 쓴다.
+
+database:
+  url: postgresql+asyncpg://load_control_api:CHANGE_ME@meta:5432/nifiops   # API 런타임 계정(DDL 권한 없음)
+  migration_url: postgresql+asyncpg://nifi_ops_migrator:CHANGE_ME@meta:5432/nifiops  # alembic 전용. 없으면 url
+  listen_dsn: postgresql://load_control_api:CHANGE_ME@meta:5432/nifiops     # worker LISTEN 전용. 없으면 폴링만
+  pool_size: 10
+  max_overflow: 5
+  tx_attempts: 3          # deadlock·serialization 실패 시 트랜잭션 재실행 횟수
+
+auth:
+  # role별 Bearer 토큰 SHA-256 digest. 생성: python -m load_control.security '<token>'
+  # 토큰 교체 기간에는 이전·신규 digest를 함께 둔다.
+  token_digests:
+    nifi:
+      - "<sha256-hex>"
+    operator:
+      - "<sha256-hex>"
+
+nifi:                     # worker → NiFi PG-05 호출
+  receiver_url: https://nifi-lb.internal:9443
+  client_cert: /etc/load-control/tls/client.crt
+  client_key: /etc/load-control/tls/client.key
+  ca_bundle: /etc/load-control/tls/nifi-ca.pem
+  timeout_seconds: 10
+
+recovery:                 # sweeper 기준(가이드 13.1)
+  run_timeout: PT6H
+  extract_query_timeout: PT60M   # NiFi EXTRACT.QUERY.TIMEOUT과 같은 값
+  stale: PT90M                   # extract_query_timeout보다 커야 한다
+  mode: FAIL                     # FAIL 또는 REISSUE
+  max_attempts: 3                # REISSUE 모드 최대 시도
+  validation_stale: PT2H
+  publish_stale: PT2H
+  sweeper_interval: PT1M
+
+dispatch:                 # outbox 전달(API 설계 4장)
+  max_attempts: 20
+  backoff_min: PT5S
+  backoff_max: PT5M
+  ack_timeout: PT10M
+  lease: PT60S
+  poll_interval: PT5S
+  batch: 20
+
+worker:
+  metrics_port: 9100      # null이면 끔
+
+logging:
+  level: INFO             # DEBUG, INFO, WARNING, ERROR
+  format: json            # json 또는 console

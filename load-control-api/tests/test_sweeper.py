@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from load_control.config import Settings
 from load_control.repositories.sweeper import LOCK_KEY
 from load_control.worker.sweeper import refresh_gauges, sweep_once
-from tests.conftest import Db
+from tests.conftest import Db, override
 from tests.helpers import claim, complete_run, create_run, report, start_run, to_staging_validated
 
 
@@ -28,8 +28,9 @@ async def run_status(db: Db, run_id: str) -> str:
 
 def test_stale_must_exceed_query_timeout(migrated_url: str) -> None:
     with pytest.raises(ValidationError):
-        Settings(database_url=migrated_url, recovery_stale=timedelta(minutes=15),  # type: ignore[arg-type]
-                 extract_query_timeout=timedelta(minutes=60))
+        Settings(database={"url": migrated_url},  # type: ignore[arg-type]
+                 recovery={"stale": timedelta(minutes=15),  # type: ignore[arg-type]
+                           "extract_query_timeout": timedelta(minutes=60)})
 
 
 async def test_fresh_partitions_untouched(client: httpx.AsyncClient, engine: AsyncEngine, db: Db,
@@ -62,7 +63,7 @@ async def test_stale_partition_fails_run(client: httpx.AsyncClient, engine: Asyn
 
 async def test_reissue_mode(client: httpx.AsyncClient, engine: AsyncEngine, db: Db,
                             settings: Settings) -> None:
-    s = settings.model_copy(update={"recovery_mode": "REISSUE"})
+    s = override(settings, recovery={"mode": "REISSUE"})
     run = await start_run(client, [3, 4])
     t0 = await claim(client, run, "0000")
     old = await claim(client, run, "0001")
@@ -95,7 +96,7 @@ async def test_reissue_mode(client: httpx.AsyncClient, engine: AsyncEngine, db: 
 
 async def test_reissue_attempts_exhausted(client: httpx.AsyncClient, engine: AsyncEngine, db: Db,
                                           settings: Settings) -> None:
-    s = settings.model_copy(update={"recovery_mode": "REISSUE", "recovery_max_attempts": 1})
+    s = override(settings, recovery={"mode": "REISSUE", "max_attempts": 1})
     run = await start_run(client, [3])
     await claim(client, run, "0000")
     await age_partition(db, run.run_id, "0000")

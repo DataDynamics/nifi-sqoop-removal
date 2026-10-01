@@ -38,11 +38,11 @@ async def run_worker(settings: Settings, stop: asyncio.Event) -> None:
 
 def main() -> None:
     settings = get_settings()
-    configure_logging(settings.log_level, settings.log_json)
-    if settings.nifi_receiver_url is None:
+    configure_logging(settings.logging.level, settings.logging.format == "json")
+    if settings.nifi.receiver_url is None:
         raise SystemExit("LCA_NIFI_RECEIVER_URL을 설정하세요")
-    if settings.worker_metrics_port:
-        start_http_server(settings.worker_metrics_port)
+    if settings.worker.metrics_port:
+        start_http_server(settings.worker.metrics_port)
 
     async def runner() -> None:
         stop = asyncio.Event()

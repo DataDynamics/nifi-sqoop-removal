@@ -32,5 +32,23 @@
   "PARTITION.COUNT": "8",
   "HIVE.STAGE.TABLE.PREFIX": "TMP_INSP_DTL_",
   "ALLOW.EMPTY.SOURCE": "false"
+ },
+ "tls": {
+  "_comment": "기본 off. NiFi에 TLS가 없으면 그대로 둔다. api_client는 NiFi→API(InvokeHTTP), receiver는 API→NiFi PG-05(HandleHttpRequest).",
+  "api_client": {
+   "enabled": false,
+   "_comment": "enabled면 CONTROL.API.URL을 https로. NiFi InvokeHTTP는 인증서 검증을 끌 수 없으므로 자체 서명 API 인증서는 truststore에 넣는다. truststore가 없으면 JVM 기본 truststore 사용. API가 mTLS를 요구하면 keystore도 지정",
+   "truststore": "/path/to/api-truststore.p12",
+   "truststore_type": "PKCS12",
+   "truststore_password": "<secret>"
+  },
+  "receiver": {
+   "enabled": false,
+   "_comment": "enabled면 API config.yaml의 nifi.receiver_url을 https로, nifi.tls.enabled: true로. 자체 서명이면 nifi.tls.verify: false 가능. client_auth: No Authentication | Want Authentication | Need Authentication(truststore 필요)",
+   "keystore": "/path/to/nifi-receiver-keystore.p12",
+   "keystore_type": "PKCS12",
+   "keystore_password": "<secret>",
+   "client_auth": "No Authentication"
+  }
  }
 }

@@ -31,7 +31,8 @@ def test_example_config_is_valid() -> None:
     s = Settings.load(EXAMPLE)
     assert s.database.pool_size == 10
     assert s.recovery.stale == timedelta(minutes=90)
-    assert str(s.nifi.receiver_url) == "https://nifi-lb.internal:9443/"
+    assert str(s.nifi.receiver_url) == "http://nifi-lb.internal:9443/"
+    assert s.nifi.tls.enabled is False and s.server.tls.enabled is False
     assert set(s.auth.token_digests) == {"nifi", "operator"}
 
 

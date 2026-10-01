@@ -110,15 +110,17 @@ def test_uvicorn_options(settings: Settings) -> None:
     assert opts["host"] == "127.0.0.1" and opts["port"] == 9000 and opts["workers"] == 3
     assert opts["root_path"] == "/lca" and opts["log_config"] is None and opts["access_log"] is False
     assert "ssl_certfile" not in opts
-    tls = override(settings, server={"ssl_certfile": "c.pem", "ssl_keyfile": "k.pem",
-                                     "ssl_ca_certs": "ca.pem", "ssl_client_cert_required": True})
+    tls = override(settings, server={"tls": {"enabled": True, "certfile": "c.pem", "keyfile": "k.pem",
+                                             "ca_certs": "ca.pem", "client_cert_required": True}})
     opts = uvicorn_options(tls)
     assert opts["ssl_certfile"] == "c.pem" and opts["ssl_cert_reqs"] == ssl.CERT_REQUIRED
 
 
 @pytest.mark.parametrize("section", [
-    {"server": {"ssl_certfile": "c.pem"}},                                    # key 없음
-    {"server": {"ssl_certfile": "c", "ssl_keyfile": "k", "ssl_client_cert_required": True}},  # CA 없음
+    {"server": {"tls": {"enabled": True, "certfile": "c.pem"}}},                               # key 없음
+    {"server": {"tls": {"enabled": True, "certfile": "c", "keyfile": "k",
+                        "client_cert_required": True}}},                                       # CA 없음
+    {"server": {"tls": {"enabled": False, "client_cert_required": True}}},  # TLS off인데 mTLS
     {"server": {"port": 70000}},
     {"logging": {"stdout": False}},                                           # 출력 없음
     {"logging": {"loggers": {"x": "VERBOSE"}}},

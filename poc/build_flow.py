@@ -17,7 +17,12 @@ NiFi는 데이터 처리만 하고, 상태 기록과 완료 판정은 Load Contr
 - HDFS: PutHDFS + core-site.xml(fs.defaultFS=file:///) 로컬 파일시스템
 - 관리 DB: NiFi는 load_event만 기록한다(PG-90). 원장 쓰기는 모두 API 호출이다.
 - PG-05는 운영에서는 root 수준의 공통 PG지만 PoC에서는 Job이 하나뿐이라 같은 PG 안에 둔다.
-- PoC는 NiFi↔API를 평문 HTTP로 연결한다. 운영에서는 InvokeHTTP/HandleHttpRequest에 SSL Context Service(mTLS)를 붙인다.
+- TLS는 config.json의 "tls" 섹션으로 켜고 끈다(기본 off).
+  - tls.api_client: NiFi → API(InvokeHTTP). enabled면 CONTROL.API.URL이 https여야 한다. truststore를 주면
+    SSL Context Service를 만들고, 없으면 JVM 기본 truststore를 쓴다. NiFi InvokeHTTP에는 인증서 검증을
+    끄는 옵션이 없으므로 자체 서명 인증서는 truststore에 넣는다.
+  - tls.receiver: API → NiFi PG-05(HandleHttpRequest). enabled면 keystore로 TLS를 연다. API worker 쪽
+    nifi.tls.enabled도 true로, receiver_url은 https로 맞춘다(자체 서명이면 worker의 nifi.tls.verify: false 가능).
 
 가이드 초안 구조(PG-30 Wait/Notify, PutSQL로 원장 직접 기록)는 git 이력(커밋 28d7e7e~ec5f074)의 이전 버전에 있다.
 
@@ -75,6 +80,39 @@ def param_ctx(name, params, inherited=None):
     return call("POST", "/parameter-contexts", {"revision": REV, "component": comp})["id"]
 
 
+# ---------------------------------------------------------------- TLS 옵션
+TLS = CFG.get("tls", {})
+API_TLS = TLS.get("api_client", {})
+RX_TLS = TLS.get("receiver", {})
+_api_url = CFG["common_params"]["CONTROL.API.URL"]
+if bool(API_TLS.get("enabled")) != _api_url.startswith("https://"):
+    raise SystemExit(f"tls.api_client.enabled={bool(API_TLS.get('enabled'))} does not match CONTROL.API.URL={_api_url}")
+if "verify" in API_TLS:
+    raise SystemExit("tls.api_client.verify is not supported: NiFi InvokeHTTP always verifies the server "
+                     "certificate. Put a self-signed API certificate into tls.api_client.truststore instead.")
+if RX_TLS.get("enabled") and not RX_TLS.get("keystore"):
+    raise SystemExit("tls.receiver.enabled needs tls.receiver.keystore")
+RX_CLIENT_AUTH = RX_TLS.get("client_auth", "No Authentication")  # Want/Need Authentication이면 truststore 필요
+if RX_TLS.get("enabled") and RX_CLIENT_AUTH != "No Authentication" and not RX_TLS.get("truststore"):
+    raise SystemExit("tls.receiver.client_auth requires tls.receiver.truststore")
+
+# 키 저장소 암호는 Sensitive Parameter로 넣는다(이름이 PASSWORD로 끝나면 sensitive).
+for prefix, conf in (("TLS.API", API_TLS), ("TLS.RECEIVER", RX_TLS)):
+    if conf.get("enabled"):
+        for kind in ("keystore", "truststore"):
+            if conf.get(kind):
+                CFG["common_params"][f"{prefix}.{kind.upper()}.PASSWORD"] = conf.get(f"{kind}_password", "")
+
+
+def ssl_props(prefix, conf):
+    props = {"SSL Protocol": "TLS"}
+    for kind, label in (("keystore", "Keystore"), ("truststore", "Truststore")):
+        if conf.get(kind):
+            props.update({f"{label} Filename": conf[kind], f"{label} Type": conf.get(f"{kind}_type", "PKCS12"),
+                          f"{label} Password": f"#{{{prefix}.{kind.upper()}.PASSWORD}}"})
+    return props
+
+
 root = call("GET", "/flow/process-groups/root")["processGroupFlow"]["id"]
 for pg in call("GET", f"/flow/process-groups/{root}")["processGroupFlow"]["flow"]["processGroups"]:
     if pg["component"]["name"] == PG_NAME:
@@ -118,6 +156,12 @@ SRC = cs("CS_DBCP_SRC", "HikariCPConnectionPool", hikari("SRC"))
 JARR = cs("CS_JSON_WRITER_ARRAY", "JsonRecordSetWriter", {"output-grouping": "output-array"})
 PARQ = cs("CS_PARQUET_WRITER", "ParquetRecordSetWriter", {"compression-type": "SNAPPY"})
 HTTPCTX = cs("CS_HTTP_CONTEXT_MAP", "StandardHttpContextMap", {"Request Expiration": "1 min"})
+# NiFi → API TLS: truststore(또는 mTLS keystore)가 있을 때만 SSL Context Service를 만든다.
+API_SSL = (cs("CS_SSL_API_CLIENT", "StandardSSLContextService", ssl_props("TLS.API", API_TLS))
+           if API_TLS.get("enabled") and (API_TLS.get("truststore") or API_TLS.get("keystore")) else None)
+# API → NiFi PG-05 TLS: HandleHttpRequest는 RestrictedSSLContextService만 받는다.
+RX_SSL = (cs("CS_SSL_RECEIVER", "StandardRestrictedSSLContextService", ssl_props("TLS.RECEIVER", RX_TLS))
+          if RX_TLS.get("enabled") else None)
 
 # ---------------------------------------------------------------- Processors
 procs = {}
@@ -190,6 +234,8 @@ def invoke(key, name, path, col, row, attr_response=True, tasks=1):
         "X-Request-Id": "${UUID()}",
         "X-Run-Id": "${load.run.id}",
     }
+    if API_SSL:
+        props["SSL Context Service"] = API_SSL
     if attr_response:
         props["Response Body Attribute Name"] = "api.response"
         props["Response Body Attribute Size"] = "16384"
@@ -427,7 +473,8 @@ p("R05", "05_Listen_Control", "HandleHttpRequest", {
     "Listening Port": "#{CONTROL.LISTEN.PORT}", "HTTP Context Map": HTTPCTX,
     "Allowed Paths": "/(validate|reissue)/[A-Z0-9_]{1,200}",
     "Allow GET": "false", "Allow POST": "true", "Allow PUT": "false", "Allow DELETE": "false",
-    "Allow HEAD": "false", "Allow OPTIONS": "false"}, 0, 11)
+    "Allow HEAD": "false", "Allow OPTIONS": "false",
+    **({"SSL Context Service": RX_SSL, "Client Authentication": RX_CLIENT_AUTH} if RX_SSL else {})}, 0, 11)
 route("R06", "06_Validate_Request", {
     "valid": "${http.method:equals('POST'):and(${http.headers.X-Dispatch-Id:matches("
              "'^[0-9a-fA-F-]{36}$')}):and(${http.headers.X-Run-Id:matches('^[0-9a-fA-F-]{36}$')})}"}, 1, 11)

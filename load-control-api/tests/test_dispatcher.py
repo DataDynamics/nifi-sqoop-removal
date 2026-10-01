@@ -16,7 +16,7 @@ from load_control.worker.dispatcher import Dispatcher, backoff
 from tests.conftest import Db, override
 from tests.helpers import claim, complete_run, start_run
 
-NIFI = "https://nifi.test:9443"
+NIFI = "http://nifi.test:9443"
 VALIDATE = f"{NIFI}/validate/ORACLE_INSP_DTL_DAILY"
 
 

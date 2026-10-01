@@ -118,3 +118,25 @@ python3 poc/build_flow.py http://<nifi-host>:<port>/nifi-api my-config.json
 python3 poc/teardown_flow.py http://<nifi-host>:<port>/nifi-api
 ```
 
+
+## 7. TLS on/off 검증 (2026-10-01, NiFi 2.4.0)
+
+설정:
+
+- API → NiFi: `config.yaml`의 `nifi.tls`(`enabled`, `verify`, `ca_bundle`, `client_cert`/`client_key`). `enabled: false`면 `receiver_url`은 `http://`이어야 한다.
+- API 서버: `server.tls`(`enabled`, `certfile`, `keyfile`, `ca_certs`, `client_cert_required`).
+- PoC 빌더: `config.json`의 `tls.api_client`(InvokeHTTP용 truststore → `CS_SSL_API_CLIENT`), `tls.receiver`(HandleHttpRequest용 keystore → `CS_SSL_RECEIVER`). 둘 다 기본 off.
+
+결과:
+
+| 시나리오 | 결과 |
+|---|---|
+| TLS 모두 off(기존 구성 회귀) | run `STAGE_VALIDATING`, dispatch `ACKED` |
+| API https(자체 서명) + NiFi truststore, NiFi 수신 https(자체 서명) + worker `verify: false` | run `STAGE_VALIDATING`, dispatch `ACKED`, worker 시작 시 `nifi_tls_verification_disabled` WARNING |
+| curl로 NiFi 수신 포트 확인 | 검증 on: exit 60(인증서 거부), `-k`: 400(TLS 통과, 잘못된 경로), 평문 http: 연결 실패 |
+
+확인한 제약:
+
+- NiFi `InvokeHTTP`는 인증서 검증을 건너뛰는 옵션이 없다(SSL Context Service만 받는다). API가 https면 자체 서명 인증서라도 truststore에 넣어야 한다. 빌더는 `tls.api_client`에 `verify` 키가 있으면 거부한다.
+- 검증 skip은 API(worker) → NiFi 방향에서만 가능하다(`nifi.tls.verify: false`). 운영에서는 `ca_bundle`로 검증하는 것을 권장한다.
+- 단위 테스트 `tests/test_tls.py`가 자체 서명 + skip, 검증 실패 재시도, CA 검증, mTLS를 실제 HTTPS 서버로 확인한다.

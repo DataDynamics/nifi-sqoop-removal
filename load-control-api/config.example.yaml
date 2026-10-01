@@ -14,11 +14,12 @@ server:                   # API HTTP 서버(python -m load_control.server)
   timeout_keep_alive: 5   # 초
   timeout_graceful_shutdown: 30      # SIGTERM 후 진행 중 요청을 기다리는 초
   limit_concurrency: null # 프로세스당 동시 연결 상한(초과 시 503). null이면 제한 없음
-  # 앱에서 TLS를 직접 종료할 때만 설정한다. 보통은 LB/ingress에서 mTLS를 종료한다.
-  ssl_certfile: null
-  ssl_keyfile: null
-  ssl_ca_certs: null      # 클라이언트 인증서 검증용 CA
-  ssl_client_cert_required: false    # true면 mTLS
+  tls:                    # API가 TLS를 직접 종료할 때만 켠다. 보통은 LB/ingress에서 종료한다
+    enabled: false
+    certfile: null        # 서버 인증서(PEM)
+    keyfile: null         # 서버 개인키(PEM)
+    ca_certs: null        # 클라이언트 인증서 검증용 CA(mTLS)
+    client_cert_required: false   # true면 mTLS
 
 database:
   url: postgresql+asyncpg://load_control_api:CHANGE_ME@meta:5432/nifiops   # API 런타임 계정(DDL 권한 없음)
@@ -38,11 +39,14 @@ auth:
       - "<sha256-hex>"
 
 nifi:                     # worker → NiFi PG-05 호출
-  receiver_url: https://nifi-lb.internal:9443
-  client_cert: /etc/load-control/tls/client.crt
-  client_key: /etc/load-control/tls/client.key
-  ca_bundle: /etc/load-control/tls/nifi-ca.pem
+  receiver_url: http://nifi-lb.internal:9443   # tls.enabled가 false면 http://, true면 https://
   timeout_seconds: 10
+  tls:
+    enabled: false        # NiFi PG-05(HandleHttpRequest)에 TLS가 없으면 false
+    verify: true          # false면 NiFi 서버 인증서 검증을 건너뛴다(자체 서명 인증서용, 운영 비권장)
+    ca_bundle: null       # NiFi 서버 인증서를 검증할 CA(PEM). null이면 시스템 기본 CA
+    client_cert: null     # NiFi가 클라이언트 인증서(mTLS)를 요구할 때(PEM)
+    client_key: null
 
 recovery:                 # sweeper 기준(가이드 13.1)
   run_timeout: PT6H

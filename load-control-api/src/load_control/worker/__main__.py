@@ -32,9 +32,14 @@ async def run_worker(settings: Settings, stop: asyncio.Event) -> None:
             asyncio.create_task(Dispatcher(settings, engine, client).run(stop), name="dispatcher"),
             asyncio.create_task(run_sweeper(engine, settings, stop), name="sweeper"),
         ]
+        tls = settings.nifi.tls
         log.info("worker_started", version=__version__, tasks=[t.get_name() for t in tasks],
                  receiverUrl=str(settings.nifi.receiver_url), recoveryMode=settings.recovery.mode,
-                 listen=settings.database.listen_dsn is not None)
+                 listen=settings.database.listen_dsn is not None, nifiTls=tls.enabled,
+                 nifiTlsVerify=tls.verify if tls.enabled else None, nifiMtls=bool(tls.client_cert))
+        if tls.enabled and not tls.verify:
+            log.warning("nifi_tls_verification_disabled",
+                        detail="nifi.tls.verify is false; NiFi server certificate is not checked")
         await asyncio.gather(*tasks)
     finally:
         await client.aclose()

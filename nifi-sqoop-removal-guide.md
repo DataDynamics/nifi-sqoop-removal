@@ -331,8 +331,8 @@ JDBC type 주요 값은 `NUMERIC=2`, `BIGINT=-5`, `VARCHAR=12`, `DATE=91`, `TIME
 | `CS_PARQUET_WRITER` | `ParquetRecordSetWriter` | Schema=`Inherit Record Schema`, compression=`SNAPPY` |
 | `CS_PARQUET_READER` | `ParquetReader` | ValidateRecord에서 기록 결과 schema를 다시 읽음 |
 | `CS_SCHEMA_REGISTRY` | 조직 표준 Schema Registry | target Avro schema를 버전으로 고정 |
-| `CS_SSL_CLIENT` | `StandardRestrictedSSLContextService` | NiFi→API `InvokeHTTP` mTLS. truststore에 API 서버 CA, keystore에 NiFi client 인증서 |
-| `CS_SSL_SERVER` | `StandardRestrictedSSLContextService` | API→NiFi `HandleHttpRequest` 수신 TLS. Client Auth=Required로 API client 인증서 검증 |
+| `CS_SSL_API_CLIENT` (선택) | `StandardSSLContextService` | NiFi→API `InvokeHTTP` TLS. API가 https일 때만 만든다. truststore에 API 서버 인증서/CA, mTLS면 keystore에 NiFi client 인증서. InvokeHTTP는 인증서 검증을 끌 수 없으므로 자체 서명 인증서도 truststore에 넣는다 |
+| `CS_SSL_RECEIVER` (선택) | `StandardRestrictedSSLContextService` | API→NiFi `HandleHttpRequest` 수신 TLS. NiFi에 TLS를 적용할 때만 만든다. 없으면 PG-05는 http로 받는다. Client Auth=REQUIRED면 truststore로 API client 인증서 검증 |
 | `CS_HTTP_CONTEXT_MAP` | `StandardHttpContextMap` | `HandleHttpRequest`/`HandleHttpResponse` 요청 연결 보관, Request Expiration 1 min |
 
 가이드 초안의 `CS_DMC_SERVER`(`MapCacheServer`)와 `CS_DMC_CLIENT`(`MapCacheClientService`)는 Wait/Notify를 쓰지 않으므로 두지 않는다.
@@ -1152,7 +1152,7 @@ PoC에서 PG-30이 실패 후 0.1초 만에 run 실패를 확정하던 동작은
 |---|---|
 | HTTP Method | `POST` (조회는 `GET`) |
 | HTTP URL | `#{CONTROL.API.URL}/runs/${load.run.id}/...` |
-| SSL Context Service | `CS_SSL_CLIENT` |
+| SSL Context Service | `CS_SSL_API_CLIENT`(API가 https일 때만. http면 비운다) |
 | Connection Timeout | `5 sec` |
 | Socket Read Timeout | `#{CONTROL.API.TIMEOUT}` |
 | Request Content-Type | `application/json` |
@@ -1217,7 +1217,7 @@ flowchart LR
 
 | ID | Processor | Scheduling | 주요 Properties | Relationship |
 |---|---|---|---|---|
-| 05 | `HandleHttpRequest` | All Nodes, 1 | Listening Port=`#{CONTROL.LISTEN.PORT}`, SSL Context Service=`CS_SSL_SERVER`, Client Authentication=`REQUIRED`, HTTP Context Map=`CS_HTTP_CONTEXT_MAP`, Allowed Paths=`/(validate\|reissue)/[A-Z0-9_]{1,200}`, Allow GET/PUT/DELETE/HEAD/OPTIONS=false | success→06 |
+| 05 | `HandleHttpRequest` | All Nodes, 1 | Listening Port=`#{CONTROL.LISTEN.PORT}`, SSL Context Service=`CS_SSL_RECEIVER`(TLS 사용 시만), Client Authentication=`REQUIRED`(mTLS 사용 시만), HTTP Context Map=`CS_HTTP_CONTEXT_MAP`, Allowed Paths=`/(validate\|reissue)/[A-Z0-9_]{1,200}`, Allow GET/PUT/DELETE/HEAD/OPTIONS=false | success→06 |
 | 06 | `RouteOnAttribute` | All Nodes, 1 | `http.method`=POST, `http.headers.X-Run-Id`와 `X-Dispatch-Id`가 UUID 형식 | valid→08, unmatched→07 |
 | 07 | `HandleHttpResponse` | All Nodes, 1 | HTTP Status Code=400 | success→PG-90 WARN |
 | 08 | `HandleHttpResponse` | All Nodes, 1 | HTTP Status Code=202 | success→09 |
@@ -1227,7 +1227,7 @@ flowchart LR
 - 검증은 수십 분 걸릴 수 있으므로 08에서 먼저 202를 응답하고 HTTP 연결을 붙잡지 않는다. API는 2xx를 받으면 dispatch를 `SENT`로 바꾸고, 검증 flow가 `/validation/start`를 호출해야 `ACKED`가 된다. 202 응답 직후 노드가 죽어 FlowFile이 사라지면 API가 ACK timeout 뒤 다시 보낸다.
 - `HandleHttpRequest`는 모든 노드에서 동작한다. API는 NiFi LB 주소(`nifi.receiver_url`)로 호출하며, 어느 노드가 받든 Job PG의 첫 단계 CAS가 중복 실행을 막는다. 그래서 PG-40~60은 All Nodes로 스케줄한다(2장).
 - 새 Job을 추가하면 10에 route 두 개(validate, reissue)와 Output Port를 추가한다. 등록되지 않은 `jobKey`는 ERROR로 남기고, API의 dispatch는 ACK timeout 뒤 재전송된다. 계속 실패하면 `DEAD`가 되어 알림이 간다.
-- 05의 TLS client 인증으로 API만 호출할 수 있게 한다. 방화벽으로 수신 포트를 API 서버 대역에만 연다.
+- TLS는 선택이다. TLS를 끄면 05는 http로 받고 API의 `nifi.tls.enabled: false`, `receiver_url: http://...`로 맞춘다. TLS를 켜면 `CS_SSL_RECEIVER`를 지정하고 API는 `nifi.tls.enabled: true`로 호출한다. 자체 서명 인증서면 API 쪽에서 `nifi.tls.verify: false`로 검증을 건너뛸 수 있다(운영 비권장). mTLS(Client Authentication=REQUIRED)를 쓰면 API만 호출할 수 있다. 어느 경우든 방화벽으로 수신 포트를 API 서버 대역에만 연다. 방화벽으로 수신 포트를 API 서버 대역에만 연다.
 
 ---
 

@@ -2,6 +2,7 @@
 
 import asyncio
 import contextlib
+import ssl
 from datetime import timedelta
 
 import asyncpg
@@ -24,12 +25,30 @@ def backoff(settings: Settings, attempt: int) -> timedelta:
     return min(delay, settings.dispatch.backoff_max)
 
 
+def nifi_ssl_context(settings: Settings) -> ssl.SSLContext | None:
+    """nifi.tls 설정으로 SSLContext를 만든다. TLS off면 None(평문 HTTP).
+
+    - verify: false → 체인·호스트 이름 검증을 끈다(자체 서명 인증서용, 운영 비권장)
+    - ca_bundle → NiFi 서버 인증서를 이 CA로 검증, 없으면 시스템 기본 CA
+    - client_cert/client_key → NiFi가 mTLS를 요구할 때 제출할 인증서
+    """
+    tls = settings.nifi.tls
+    if not tls.enabled:
+        return None
+    ctx = ssl.create_default_context(cafile=tls.ca_bundle)
+    if not tls.verify:
+        ctx.check_hostname = False  # verify_mode보다 먼저 꺼야 한다
+        ctx.verify_mode = ssl.CERT_NONE
+    if tls.client_cert and tls.client_key:
+        ctx.load_cert_chain(tls.client_cert, tls.client_key)
+    return ctx
+
+
 def make_client(settings: Settings) -> httpx.AsyncClient:
-    """NiFi 호출용 HTTP 클라이언트. 설정이 있으면 mTLS를 쓴다."""
-    cert = ((settings.nifi.client_cert, settings.nifi.client_key)
-            if settings.nifi.client_cert and settings.nifi.client_key else None)
-    verify: bool | str = settings.nifi.ca_bundle or True
-    return httpx.AsyncClient(cert=cert, verify=verify, timeout=settings.nifi.timeout_seconds)
+    """NiFi 호출용 HTTP 클라이언트. TLS on이면 nifi_ssl_context를 쓴다."""
+    ctx = nifi_ssl_context(settings)
+    return httpx.AsyncClient(verify=ctx if ctx is not None else True,
+                             timeout=settings.nifi.timeout_seconds)
 
 
 def target_url(settings: Settings, d: LeasedDispatch) -> str:

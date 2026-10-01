@@ -44,9 +44,9 @@ def uvicorn_options(settings: Settings) -> dict[str, object]:
         "access_log": False,
         "server_header": False,
     }
-    if s.ssl_certfile:
-        options.update(ssl_certfile=s.ssl_certfile, ssl_keyfile=s.ssl_keyfile, ssl_ca_certs=s.ssl_ca_certs,
-                       ssl_cert_reqs=ssl.CERT_REQUIRED if s.ssl_client_cert_required else ssl.CERT_NONE)
+    if s.tls.enabled:
+        options.update(ssl_certfile=s.tls.certfile, ssl_keyfile=s.tls.keyfile, ssl_ca_certs=s.tls.ca_certs,
+                       ssl_cert_reqs=ssl.CERT_REQUIRED if s.tls.client_cert_required else ssl.CERT_NONE)
     return options
 
 
@@ -60,7 +60,7 @@ def main(argv: list[str] | None = None) -> None:
     configure_logging(settings.logging)
     s = settings.server
     log.info("server_starting", version=__version__, host=s.host, port=s.port, workers=s.workers,
-             tls=bool(s.ssl_certfile), mtls=s.ssl_client_cert_required, rootPath=s.root_path or None)
+             tls=s.tls.enabled, mtls=s.tls.client_cert_required, rootPath=s.root_path or None)
     uvicorn.run("load_control.main:create_app", factory=True, **uvicorn_options(settings))  # type: ignore[arg-type]
 
 

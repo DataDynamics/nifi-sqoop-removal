@@ -36,6 +36,28 @@ class Section(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class ServerTlsSettings(Section):
+    """API 서버가 TLS를 직접 종료할지. 보통은 LB/ingress에서 종료하므로 기본은 off(API 설계 9.7)."""
+
+    enabled: bool = False
+    certfile: str | None = None  # 서버 인증서(PEM)
+    keyfile: str | None = None  # 서버 개인키(PEM)
+    ca_certs: str | None = None  # 클라이언트 인증서를 검증할 CA(mTLS)
+    client_cert_required: bool = False  # true면 mTLS(클라이언트 인증서 필수)
+
+    @model_validator(mode="after")
+    def _check(self) -> "ServerTlsSettings":
+        if not self.enabled:
+            if self.client_cert_required:
+                raise ValueError("server.tls.client_cert_required needs server.tls.enabled: true")
+            return self
+        if not (self.certfile and self.keyfile):
+            raise ValueError("server.tls.enabled needs server.tls.certfile and server.tls.keyfile")
+        if self.client_cert_required and not self.ca_certs:
+            raise ValueError("server.tls.client_cert_required needs server.tls.ca_certs")
+        return self
+
+
 class ServerSettings(Section):
     """API HTTP 서버(uvicorn) 설정. `python -m load_control.server`가 읽는다."""
 
@@ -48,20 +70,7 @@ class ServerSettings(Section):
     timeout_keep_alive: int = Field(default=5, ge=1)  # 초
     timeout_graceful_shutdown: int = Field(default=30, ge=1)  # SIGTERM 후 진행 중 요청을 기다리는 초
     limit_concurrency: int | None = Field(default=None, ge=1)  # 프로세스당 동시 연결 상한, 초과 시 503
-    # TLS를 앱에서 직접 종료할 때만 설정한다. 보통은 LB/ingress에서 mTLS를 종료한다(API 설계 9.7).
-    ssl_certfile: str | None = None
-    ssl_keyfile: str | None = None
-    ssl_ca_certs: str | None = None  # 클라이언트 인증서 검증용 CA
-    ssl_client_cert_required: bool = False  # true면 mTLS(클라이언트 인증서 필수)
-
-    @model_validator(mode="after")
-    def _check_tls(self) -> "ServerSettings":
-        if bool(self.ssl_certfile) != bool(self.ssl_keyfile):
-            raise ValueError("server.ssl_certfile and server.ssl_keyfile must be set together")
-        if self.ssl_client_cert_required and not (self.ssl_certfile and self.ssl_ca_certs):
-            raise ValueError(
-                "server.ssl_client_cert_required needs ssl_certfile, ssl_keyfile and ssl_ca_certs")
-        return self
+    tls: ServerTlsSettings = Field(default_factory=ServerTlsSettings)
 
 
 class DatabaseSettings(Section):
@@ -82,14 +91,42 @@ class AuthSettings(Section):
     token_digests: dict[Literal["nifi", "operator"], list[str]] = Field(default_factory=dict)
 
 
+class NifiTlsSettings(Section):
+    """worker → NiFi 호출의 TLS. NiFi PG-05가 TLS를 쓰지 않으면 enabled: false(기본)."""
+
+    enabled: bool = False
+    # false면 NiFi 서버 인증서 검증(체인·호스트 이름)을 건너뛴다. 자체 서명 인증서를 쓰는 개발·PoC용이며,
+    # 중간자 공격을 막지 못하므로 운영에서는 ca_bundle로 검증한다.
+    verify: bool = True
+    ca_bundle: str | None = None  # NiFi 서버 인증서를 검증할 CA(PEM). 없으면 시스템 기본 CA
+    client_cert: str | None = None  # NiFi가 클라이언트 인증서(mTLS)를 요구할 때(PEM)
+    client_key: str | None = None
+
+    @model_validator(mode="after")
+    def _check(self) -> "NifiTlsSettings":
+        if bool(self.client_cert) != bool(self.client_key):
+            raise ValueError("nifi.tls.client_cert and nifi.tls.client_key must be set together")
+        if not self.enabled and (self.ca_bundle or self.client_cert):
+            raise ValueError("nifi.tls.ca_bundle/client_cert are set but nifi.tls.enabled is false")
+        return self
+
+
 class NifiSettings(Section):
     """worker가 NiFi PG-05 Control Receiver를 호출할 때 쓰는 설정."""
 
-    receiver_url: AnyHttpUrl | None = None  # worker 전용: NiFi LB의 PG-05 수신 주소
-    client_cert: str | None = None
-    client_key: str | None = None
-    ca_bundle: str | None = None
+    receiver_url: AnyHttpUrl | None = None  # worker 전용: NiFi LB의 PG-05 주소. TLS off면 http, on이면 https
     timeout_seconds: float = Field(default=10.0, gt=0)
+    tls: NifiTlsSettings = Field(default_factory=NifiTlsSettings)
+
+    @model_validator(mode="after")
+    def _check_scheme(self) -> "NifiSettings":
+        # 설정 실수(https 주소인데 TLS off 등)를 시작 단계에서 막는다.
+        if self.receiver_url is not None:
+            expected = "https" if self.tls.enabled else "http"
+            if self.receiver_url.scheme != expected:
+                raise ValueError(f"nifi.receiver_url must use {expected}:// when nifi.tls.enabled is "
+                                 f"{str(self.tls.enabled).lower()}")
+        return self
 
 
 class RecoverySettings(Section):

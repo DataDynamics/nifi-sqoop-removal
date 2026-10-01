@@ -47,10 +47,10 @@ tests/                                       # 실제 PostgreSQL 대상 통합·
 
 | 섹션 | 내용 |
 |---|---|
-| `server` | API bind address(`host`), `port`, 프로세스 수(`workers`), 프록시 헤더, graceful shutdown, 선택적 TLS/mTLS |
+| `server` | API bind address(`host`), `port`, 프로세스 수(`workers`), 프록시 헤더, graceful shutdown, 선택적 TLS/mTLS(`server.tls`) |
 | `database` | DB URL(런타임, migration, LISTEN), pool |
 | `auth` | role별 토큰 digest |
-| `nifi` | worker가 NiFi PG-05를 호출할 주소와 mTLS |
+| `nifi` | worker가 NiFi PG-05를 호출할 주소, `tls`(on/off, `verify: false`로 인증서 검증 skip, CA, mTLS) |
 | `recovery`, `dispatch` | sweeper·outbox 기준 |
 | `worker` | worker `/metrics` bind address와 port |
 | `logging` | 수준, 형식(json/console), 표준출력, 회전 파일, access 로그 on/off, logger별 수준 |

@@ -271,7 +271,7 @@ outbox는 최소 1회 전달만 보장하므로, 같은 run에 대한 검증 요
 ### 5.1 공통 규칙
 
 - Base path: `/v1`. 요청·응답은 JSON, UTF-8.
-- 인증: mTLS와 서비스 토큰(`Authorization: Bearer`). NiFi→API, API→NiFi 양방향에 적용한다(9.7, 10.2).
+- 인증: 서비스 토큰(`Authorization: Bearer`)이 기본이다. TLS/mTLS는 양방향 모두 선택이다. NiFi에 TLS가 없으면 끄고 쓸 수 있다(9.7, 10.2).
 - 모든 요청과 응답에 `X-Request-Id`를 남기고, API 로그에는 `runId`, `partitionId`, `chunkIndex`를 구조화 필드로 기록한다.
 - 식별자(`runId`, `claimToken` 등)는 UUID 형식, `partitionId`는 `^[0-9]{4}$|^NULL$`로 검증한다. 테이블명·컬럼명은 요청에서 받지 않는다.
 - 모든 상태 변경 호출은 멱등이다. 같은 요청을 다시 보내면 같은 결과를 돌려준다.
@@ -499,7 +499,7 @@ NiFi 쪽 공통 규칙은 다음과 같다.
 | 모델·설정 | Pydantic v2, `pydantic-settings[yaml]` | 요청 검증, `config.yaml` 설정 |
 | DB | SQLAlchemy 2.0 async Core + `asyncpg` | ORM 대신 `text()` SQL로 CAS·잠금을 명시적으로 작성 |
 | Migration | Alembic(async 템플릿) | 가이드 4.1 DDL을 baseline으로 관리 |
-| HTTP client | `httpx.AsyncClient` | API→NiFi dispatch, mTLS 지원 |
+| HTTP client | `httpx.AsyncClient` | API→NiFi dispatch. `nifi.tls`로 http/https, 인증서 검증 skip, CA, mTLS 선택 |
 | 이벤트 | PostgreSQL `LISTEN/NOTIFY`(asyncpg) | dispatcher 즉시 깨우기 |
 | 로그·메트릭 | `structlog`(JSON), `prometheus-client` | |
 | 테스트 | `pytest`, `pytest-asyncio`, `httpx.ASGITransport`, `testcontainers[postgres]`, `respx` | 실제 PostgreSQL로 동시성 테스트 |
@@ -584,7 +584,14 @@ auth:
     nifi: ["<sha256-hex>"]
     operator: ["<sha256-hex>"]
 nifi:
-  receiver_url: https://nifi-lb.internal:9443
+  receiver_url: http://nifi-lb.internal:9443   # tls.enabled가 true면 https://
+  timeout_seconds: 10
+  tls:
+    enabled: false        # NiFi PG-05에 TLS가 없으면 false
+    verify: true          # false면 NiFi 서버 인증서 검증 skip(자체 서명용, 운영 비권장)
+    ca_bundle: null       # 검증용 CA(PEM). null이면 시스템 기본 CA
+    client_cert: null     # mTLS일 때 클라이언트 인증서/키(PEM)
+    client_key: null
 recovery:
   extract_query_timeout: PT60M
   stale: PT90M
@@ -599,7 +606,7 @@ logging:
 |---|---|
 | `database` | DB URL(런타임, migration, LISTEN), pool, 트랜잭션 재시도 횟수 |
 | `auth` | role별 Bearer 토큰 SHA-256 digest |
-| `nifi` | worker → NiFi PG-05 호출 주소, mTLS 인증서, timeout |
+| `nifi` | worker → NiFi PG-05 호출 주소, timeout, `tls`(on/off, 인증서 검증 skip, CA, mTLS 인증서) |
 | `recovery` | sweeper 기준: run timeout, stale, 재발행 모드, 정체 경보 |
 | `dispatch` | outbox 전달: 최대 시도, backoff, ACK timeout, lease, 폴링 주기 |
 | `worker` | worker `/metrics` 포트 |
@@ -806,7 +813,7 @@ def require_role(role: str):
 ```
 
 - role은 `nifi`(NiFi 서비스 계정)와 `operator`(운영자 엔드포인트) 두 가지다. 설정에는 토큰 원문이 아니라 SHA-256 digest 목록을 둔다. 토큰을 교체할 때 이전·신규 토큰이 함께 통과하도록 하기 위해서다.
-- mTLS는 LB/ingress에서 종료하고 클라이언트 인증서를 검증한다. Bearer 토큰은 그 위에 추가하는 role 구분 수단이다.
+- TLS는 보통 LB/ingress에서 종료한다. API가 직접 종료하려면 `server.tls.enabled: true`로 켜고, `client_cert_required: true`면 mTLS다. Bearer 토큰은 TLS 사용 여부와 무관하게 role을 구분한다.
 
 ```python
 # errors.py / main.py
@@ -873,7 +880,7 @@ async def send_one(settings, engine, client, d) -> None:
 ```
 
 - listener 연결이 끊기면 다시 연결하고 바로 한 번 폴링한다(연결 감시 루프는 생략).
-- `httpx.AsyncClient`는 프로세스당 하나를 만들고 `cert=(client_cert, client_key)`, `verify=ca_bundle`, `timeout=nifi_timeout_seconds`로 mTLS를 설정한다.
+- `httpx.AsyncClient`는 프로세스당 하나를 만든다. `nifi.tls.enabled`가 false면 http로 호출하고, true면 `nifi_ssl_context()`가 만든 `ssl.SSLContext`를 `verify`로 넘긴다. `ca_bundle`로 CA를 지정하고, `verify: false`면 `check_hostname=False`, `CERT_NONE`으로 검증을 건너뛰며(시작 시 `nifi_tls_verification_disabled` WARNING), `client_cert`/`client_key`가 있으면 mTLS다.
 - `mark_sent`는 `WHERE status = 'PENDING'` 조건으로만 갱신한다. NiFi가 202를 응답하자마자 `/validation/start`를 호출해 이미 `ACKED`가 됐을 수 있기 때문이다. 이 조건이 없으면 `ACKED`가 `SENT`로 덮여 ACK timeout 후 불필요한 재전송이 생긴다.
 - `schedule_retry`는 `attempt_count >= dispatch.max_attempts`이면 `DEAD`로 바꾸고 `DISPATCH_DEAD` ERROR 이벤트를 남긴다.
 
@@ -948,8 +955,8 @@ logging:
 
 ### 10.2 보안
 
-- NiFi→API: mTLS 또는 Bearer 토큰. 토큰은 Sensitive Parameter로만 관리한다.
-- API→NiFi: PG-05의 `HandleHttpRequest`는 내부망에서만 접근 가능하게 방화벽으로 제한하고 mTLS(Client Authentication=REQUIRED)를 사용한다. mTLS를 못 쓰면 요청 헤더의 HMAC 서명이나 토큰을 `RouteOnAttribute`로 검증한다.
+- NiFi→API: Bearer 토큰(필수)과 선택적 TLS. 토큰은 Sensitive Parameter로만 관리한다. NiFi `InvokeHTTP`는 인증서 검증을 끌 수 없으므로 API가 https면 자체 서명 인증서라도 `CS_SSL_API_CLIENT` truststore에 넣어야 한다.
+- API→NiFi: PG-05의 `HandleHttpRequest`는 내부망에서만 접근 가능하게 방화벽으로 제한한다. TLS는 선택이다(`nifi.tls.enabled`). NiFi에 TLS가 없으면 http로 호출하고, 자체 서명 인증서면 `nifi.tls.verify: false`로 검증을 건너뛸 수 있다. 가능하면 mTLS(Client Authentication=REQUIRED)를 쓰고, 못 쓰면 요청 헤더의 HMAC 서명이나 토큰을 `RouteOnAttribute`로 검증한다.
 - API는 요청 값으로 SQL 식별자를 만들지 않는다. 모든 값은 bind parameter로만 사용한다.
 - 운영자 엔드포인트(재전송, `PUBLISH_UNKNOWN` 확정)는 별도 권한과 감사 로그를 둔다.
 

@@ -119,7 +119,8 @@ PG 간 연결은 상위 PG(`SQOOP_REPLACEMENT_POC_V3`)에 둔다. `partitions`(P
 | 동일 업무일자 중복 실행 | PG-90이 409 + `RUN_CREATE` 단계를 `DUPLICATE_ACTIVE_RUN`(WARN)으로 분류, API 응답 본문을 message로 기록. 기존 run 상태 변화 없음 |
 | 파티션 0004 HDFS 쓰기 실패 주입 | PutHDFS 내장 재시도 후 `errors` → PG-90이 파티션 실패 API 호출 → 0004 FAILED, run `FAILED_EXTRACT`, 검증 dispatch 0건, `_SUCCESS` 미생성 |
 
-API 중단 중 실행과 sweeper `REISSUE` 모드(파티션 재발행)는 V3로 아직 시험하지 않았다.
+| API 중단 중 실행 | API 서버를 내린 뒤 Trigger(22:20:11), 약 30초 뒤 재기동(22:20:40). `12_Create_Run`이 연결 거부를 받고 relationship 재시도(penalty 5→10→20초)로 대기하다 22:20:47 재시도에서 run 생성. 이후 `STAGE_VALIDATING`까지 진행, 데이터 일치, NiFi 오류 이벤트 없음 |
+| 파티션 재발행(sweeper `REISSUE` 모드) | API를 `mode=REISSUE`, `extract_query_timeout=PT10S`, `stale=PT20S`, `sweeper_interval=PT5S`로 띄우고 0004의 chunk 보고만 닫힌 포트로 보냄. claim 약 20초 뒤 sweeper가 0004를 `RETRY`로 초기화하고 `RECOVERY_REISSUED` 기록, `REISSUE_PARTITION` dispatch → PG-05 `/reissue` → PG-20 재 claim(attempt 2, dispatch `ACKED`) → 0004 SUCCESS → run `STAGE_VALIDATING`. 0004 파일 3개는 같은 이름으로 덮어써 Parquet 21개, 데이터 일치. 보고 경로를 되돌린 뒤 도착한 이전 시도의 chunk 보고 3건은 API가 409 `CLAIM_MISMATCH`로 거부했고, PG-90은 파티션 실패를 보고하지 않고 WARN 이벤트만 남김(run 상태 변화 없음) |
 
 ### 6.3 확인한 사항
 
@@ -129,6 +130,8 @@ API 중단 중 실행과 sweeper `REISSUE` 모드(파티션 재발행)는 V3로 
 | 12 | `InvokeHTTP`의 `Authorization` 동적 속성을 `Bearer #{CONTROL.API.TOKEN}`으로 쓰면 NiFi가 400으로 거부한다. Sensitive 속성은 Parameter 참조 외의 텍스트를 가질 수 없으므로 Parameter `CONTROL.API.AUTHORIZATION`에 `Bearer <token>` 전체를 두고 속성 값은 `#{CONTROL.API.AUTHORIZATION}`만 둔다(가이드 9.2) |
 | 13 | `InvokeHTTP`에 `Response Body Attribute Name`을 설정하면 4xx/5xx 응답 본문도 그 attribute(`api.response`)에 들어가고 `invokehttp.response.body`는 비어 있다. 오류 메시지는 두 값을 모두 확인한다 |
 | 14 | PutHDFS 실패는 오류 attribute가 없어 PG-90이 `NON_RETRYABLE`로 분류한다. 내장 재시도를 이미 소진한 뒤이므로 동작에는 영향이 없지만, 운영 분류가 필요하면 PG-20에서 `load.stage`를 더 세분한다 |
+| 15 | 처음에는 PG-90이 `DUPLICATE_ACTIVE_RUN`만 WARN으로 두어, 재발행 뒤 이전 시도의 409 `CLAIM_MISMATCH`가 ERROR `CHUNK_WRITE_FAILED`로 기록됐다. 409는 모두 정상 경합이므로 90에서 `error.level=WARN`, `error.event=<응답의 $.code>`로 정하도록 고쳤다(93·95가 상태 코드를 덮어쓰므로 미리 계산). 재시험에서 `CLAIM_MISMATCH` 3건이 WARN으로 남았다(가이드 14.2) |
+| 16 | 409 `CLAIM_MISMATCH` 응답이 `api.response`를 덮어쓰므로 PG-90의 `report_partition` 조건(`claimed=true`)이 성립하지 않는다. 그래서 이전 token으로 파티션 실패를 잘못 보고하지 않는다 |
 
 ### 6.4 재현 방법 (V3)
 

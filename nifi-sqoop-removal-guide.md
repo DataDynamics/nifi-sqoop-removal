@@ -1551,14 +1551,14 @@ flowchart LR
 
 | ID | Processor | Scheduling | 주요 Properties | Relationship |
 |---|---|---|---|---|
-| 90 | `UpdateAttribute` | All Nodes, 2~4 | `error.stage`, `error.code`, `error.class`, `error.message`, `load.fail.expected`, `load.fail.status`를 아래 규칙으로 계산 | success→91 |
+| 90 | `UpdateAttribute` | All Nodes, 2~4 | `error.stage`, `error.code`, `error.class`, `error.message`, `error.level`, `error.event`, `load.fail.expected`, `load.fail.status`를 아래 규칙으로 계산 | success→91 |
 | 91 | `RouteOnAttribute` | All Nodes, 2~4 | `report_run`, `report_partition`(아래 규칙) | report_run→92, report_partition→94, unmatched→96 |
 | 92 | `ReplaceText` | All Nodes, 2~4 | 본문 `{"expectedStatus":"${load.fail.expected}","failStatus":"${load.fail.status}","errorStage":"${error.stage}","errorCode":"${error.code}","message":"<escapeJson한 error.message>"}` | success→93 |
 | 93 | `InvokeHTTP` | All Nodes, 2~4 | `POST /runs/${load.run.id}/fail`, 9.2 공통 설정 | 모든 relationship→96 |
 | 94 | `ReplaceText` | All Nodes, 2~4 | 본문 `{"claimToken":"${partition.claim.token}","errorStage":"${error.stage}","errorClass":"${error.class}","errorCode":"${error.code}","message":"<escapeJson한 error.message>"}` | success→95 |
 | 95 | `InvokeHTTP` | All Nodes, 2~4 | `POST /runs/${load.run.id}/partitions/${partition.id}/fail`, 9.2 공통 설정 | 모든 relationship→96 |
 | 96 | `PutSQL` | All Nodes, 2~4 | `CS_DBCP_META`, `load_event` INSERT(14.3), Batch=1, Support Fragmented Transactions=false | success→97, failure/retry→98 |
-| 97 | `LogMessage` | All Nodes, 2~4 | Prefix=`SQOOP_REPLACEMENT`, Level=`${error.code:equals('DUPLICATE_ACTIVE_RUN'):ifElse('warn','error')}`, 구조화 JSON(14.5) | success→99 또는 auto-terminate |
+| 97 | `LogMessage` | All Nodes, 2~4 | Prefix=`SQOOP_REPLACEMENT`, Level=`${error.level:toLower()}`, 구조화 JSON(14.5) | success→99 또는 auto-terminate |
 | 98 | `PutFile` 또는 운영 Kafka Publisher (선택) | All Nodes, 1~2 | 복구 가능한 DLQ 경로 또는 topic | success→auto-terminate, failure→Bulletin |
 | 99 | 알림 Processor (선택) | All Nodes, 1 | ERROR 수준을 조직 알림으로 전달. API 이벤트 기반 알림이 있으면 두지 않는다 | auto-terminate |
 
@@ -1567,12 +1567,14 @@ flowchart LR
 | 속성 | 규칙 |
 |---|---|
 | `error.stage` | `${load.stage}`. 없으면 `CONTROL_RECEIVER` |
-| `error.code` | 상태 코드가 3xx~5xx이면 `HTTP_<code>`, 단 `load.stage=RUN_CREATE`이고 409이면 `DUPLICATE_ACTIVE_RUN` → `invokehttp.java.exception.class`가 있으면 `API_UNREACHABLE` → `executesql.error.message`에 `ORA-nnnnn`이 있으면 그 코드, 없으면 `SQL_ERROR` → 그 밖에는 `<stage>_FAILED` |
+| `error.code` | 409이면 응답 본문의 `$.code`(`DUPLICATE_ACTIVE_RUN`, `CLAIM_MISMATCH`, `CHUNK_CONFLICT` 등) → 그 밖의 3xx~5xx이면 `HTTP_<code>` → `invokehttp.java.exception.class`가 있으면 `API_UNREACHABLE` → `executesql.error.message`에 `ORA-nnnnn`이 있으면 그 코드, 없으면 `SQL_ERROR` → 그 밖에는 `<stage>_FAILED` |
+| `error.level` | 409이면 `WARN`(정상 경합, 9.3), 그 밖에는 `ERROR` |
+| `error.event` | 409이면 응답 본문의 `$.code`, 그 밖에는 `<stage>_FAILED` |
 | `error.class` | 연결 예외면 `TRANSIENT`, 4xx면 `VALIDATION`, 그 밖에는 `NON_RETRYABLE` |
 | `error.message` | 3xx~5xx이면 `invokehttp.response.body`, 없으면 `api.response`(9.3) → `executesql.error.message` → `invokehttp.java.exception.message` → 고정 문구 `processor routed failure; see bulletin and provenance` |
 | `load.fail.expected`, `load.fail.status` | 아래 표 |
 
-상태 코드는 3xx~5xx만 본다. 2xx는 앞 단계 API 호출이 성공한 흔적으로 FlowFile에 남아 있을 뿐이기 때문이다. PutHDFS처럼 오류 attribute를 남기지 않는 Processor의 실패는 `load.stage`로만 식별되므로(예: `CHUNK_WRITE_FAILED`), 상세 원인은 NiFi Bulletin과 Provenance에서 `run_id`, `partition_id`로 찾는다.
+상태 코드는 3xx~5xx만 본다. 2xx는 앞 단계 API 호출이 성공한 흔적으로 FlowFile에 남아 있을 뿐이기 때문이다. `error.level`과 `error.event`를 90에서 미리 정하는 이유는 93·95의 실패 보고 호출이 `invokehttp.status.code`를 덮어쓰기 때문이다. 재발행 뒤 이전 시도의 chunk 보고가 늦게 도착하면 API가 409 `CLAIM_MISMATCH`로 거부하는데, 이는 정상 경합이므로 WARN으로 남는다(NiFi 2.4.0 PoC에서 확인). PutHDFS처럼 오류 attribute를 남기지 않는 Processor의 실패는 `load.stage`로만 식별되므로(예: `CHUNK_WRITE_FAILED`), 상세 원인은 NiFi Bulletin과 Provenance에서 `run_id`, `partition_id`로 찾는다.
 
 **91 실패 보고 규칙.**
 
@@ -1599,9 +1601,7 @@ INSERT INTO nifi_ops.load_event (
     error_class, error_code, message
 ) VALUES (
     gen_random_uuid(),
-    CASE WHEN '${error.code}' = 'DUPLICATE_ACTIVE_RUN' THEN 'WARN' ELSE 'ERROR' END,
-    CASE WHEN '${error.code}' = 'DUPLICATE_ACTIVE_RUN' THEN 'DUPLICATE_ACTIVE_RUN'
-         ELSE '${error.stage}_FAILED' END,
+    '${error.level}', '${error.event}',
     CAST(NULLIF('${load.run.id}', '') AS uuid),
     COALESCE(NULLIF('${load.job.key}', ''), '#{JOB.KEY}'),
     NULLIF('${load.business.key}', ''), NULLIF('${partition.id}', ''),
@@ -1620,6 +1620,7 @@ INSERT INTO nifi_ops.load_event (
 |---|---|---|---|
 | INFO | `RUN_STARTED` | run 생성(active lock 획득) | API |
 | WARN | `DUPLICATE_ACTIVE_RUN` | 같은 업무키 활성 run 존재(409) | NiFi PG-90 |
+| WARN | `CLAIM_MISMATCH`, `CHUNK_CONFLICT` | 재발행 등으로 claim token이 바뀐 뒤 이전 시도의 보고(409) | NiFi PG-90 |
 | INFO | `MANIFEST_CREATED` | SCN·metric 저장, manifest 등록 | API |
 | ERROR | `MANIFEST_INVALID` | 불변식 위반, `FAILED_MANIFEST` | API |
 | INFO | `PARTITION_STARTED` | claim 성공 | API |
@@ -1643,7 +1644,7 @@ NiFi는 상태 전이 이벤트를 다시 기록하지 않는다. NiFi에서도 
 
 ```text
 Log Prefix  = SQOOP_REPLACEMENT
-Log Level   = ${error.code:equals('DUPLICATE_ACTIVE_RUN'):ifElse('warn','error')}
+Log Level   = ${error.level:toLower()}
 Log Message = {"stage":"${error.stage}","code":"${error.code}","class":"${error.class}",
  "run_id":"${load.run.id}","job_key":"${load.job.key}","business_key":"${load.business.key}",
  "partition_id":"${partition.id}","message":"<escapeJson한 error.message>"}

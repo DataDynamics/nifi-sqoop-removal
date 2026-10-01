@@ -172,13 +172,13 @@ COMMENTS = {
     "V45": "_SUCCESS marker를 빈 파일로 쓰기 위해 content를 비운다.",
     "V46": "run 경로에 _SUCCESS marker를 쓴다. 이 파일은 API가 run 완료를 확정한 뒤에만 생긴다. 운영에서는 이후 Hive staging 검증으로 이어진다.",
     # PG-90 Error and Event
-    "E90": "모든 PG의 오류를 정규화한다. load.stage와 Processor가 남긴 attribute(HTTP 상태, SQL 오류, 연결 예외)로 오류 단계·코드·분류·메시지를 만든다.",
+    "E90": "모든 PG의 오류를 정규화한다. load.stage와 Processor가 남긴 attribute(HTTP 상태, SQL 오류, 연결 예외)로 오류 단계·코드·분류·메시지와 이벤트 수준·이름을 만든다. 409(중복 실행, claim 불일치)는 정상 경합이므로 WARN이다.",
     "E91": "오류 단계에 따라 run 실패 보고, 파티션 실패 보고, 이벤트 기록만 중 하나로 나눈다.",
     "E92": "run 실패 보고 본문(CREATED → FAILED_MANIFEST, 오류 단계·코드·메시지)을 만든다.",
     "E93": "API에 run 실패를 보고한다(POST /runs/{id}/fail). 보고하지 않으면 활성 run lock이 남는다.",
     "E94": "파티션 실패 보고 본문(claimToken, 오류 단계·분류·코드·메시지)을 만든다.",
     "E95": "API에 파티션 실패를 보고한다(POST .../partitions/{pid}/fail). API가 파티션과 run을 실패 처리한다.",
-    "E96": "오류 이벤트를 관리 DB nifi_ops.load_event에 기록한다. 중복 실행은 WARN, 그 밖은 ERROR로 남긴다.",
+    "E96": "오류 이벤트를 관리 DB nifi_ops.load_event에 기록한다. 409 정상 경합은 WARN(이름은 API 오류 코드), 그 밖은 ERROR(<단계>_FAILED)로 남긴다.",
     "E97": "오류를 구조화 JSON으로 nifi-app.log에 남긴다(prefix SQOOP_REPLACEMENT).",
 }
 
@@ -448,17 +448,23 @@ port(G90, "errors", "in", 0, 0)
 # - SQL 실패: executesql.error.message
 # - 그 밖(PutHDFS, 형식 검증, Control Receiver 400): load.stage로 식별
 HTTP_ERR = "${invokehttp.status.code:matches('[3-5][0-9]{2}')}"
+# 409는 정상 경합(DUPLICATE_ACTIVE_RUN, CLAIM_MISMATCH, CHUNK_CONFLICT)이므로 API 오류 코드를 이름으로 쓰고 WARN으로 남긴다(가이드 9.3).
+# Response Body Attribute Name을 쓰면 4xx/5xx 본문도 api.response로 들어간다.
+BODY_CODE = "${invokehttp.response.body:replaceNull(${api.response}):jsonPath('$.code'):replaceEmpty('HTTP_409')}"
+STAGE_FAILED = "${load.stage:replaceNull('CONTROL_RECEIVER'):append('_FAILED')}"
 ua(G90, "E90", "90_Normalize_Error", {
     "error.stage": "${load.stage:replaceNull('CONTROL_RECEIVER')}",
-    "error.code": "${invokehttp.status.code:matches('[3-5][0-9]{2}'):ifElse("
-                  "${invokehttp.status.code:equals('409'):and(${load.stage:equals('RUN_CREATE')}):ifElse("
-                  "'DUPLICATE_ACTIVE_RUN', ${invokehttp.status.code:prepend('HTTP_')})},"
+    "error.code": "${invokehttp.status.code:equals('409'):ifElse(" + BODY_CODE + ","
+                  "${invokehttp.status.code:matches('[3-5][0-9]{2}'):ifElse(${invokehttp.status.code:prepend('HTTP_')},"
                   "${invokehttp.java.exception.class:isEmpty():not():ifElse('API_UNREACHABLE',"
-                  "${executesql.error.message:isEmpty():not():ifElse('SQL_ERROR',"
-                  "${load.stage:replaceNull('CONTROL_RECEIVER'):append('_FAILED')})})})}",
+                  "${executesql.error.message:find('ORA-[0-9]{5}'):ifElse("
+                  "${executesql.error.message:replaceAll('(?s)^.*?(ORA-[0-9]{5}).*$','$1')},"
+                  "${executesql.error.message:isEmpty():not():ifElse('SQL_ERROR'," + STAGE_FAILED + ")})})})})}",
+    # 실패 보고 호출(93, 95)이 invokehttp.status.code를 덮어쓰므로 이벤트 수준과 이름을 여기서 정해 둔다.
+    "error.level": "${invokehttp.status.code:equals('409'):ifElse('WARN','ERROR')}",
+    "error.event": "${invokehttp.status.code:equals('409'):ifElse(" + BODY_CODE + "," + STAGE_FAILED + ")}",
     "error.class": "${invokehttp.java.exception.class:isEmpty():not():ifElse('TRANSIENT',"
                    "${invokehttp.status.code:matches('4[0-9]{2}'):ifElse('VALIDATION','NON_RETRYABLE')})}",
-        # Response Body Attribute Name을 쓰면 4xx/5xx 본문도 api.response로 들어간다.
     "error.message": f"${{{HTTP_ERR[2:-1]}:ifElse(${{invokehttp.response.body:replaceNull(${{api.response}})}},"
                      "${executesql.error.message:replaceNull(${invokehttp.java.exception.message:replaceNull("
                      "'processor routed failure; see bulletin and provenance')})})}"},
@@ -497,14 +503,13 @@ p(G90, "E96", "96_Insert_Load_Event", "PutSQL", {
         "    partition_id, chunk_index, process_group, processor_name, node_id, row_count,\n"
         "    error_class, error_code, message)\n"
         "VALUES (gen_random_uuid(),\n"
-        "    CASE WHEN '${error.code}' = 'DUPLICATE_ACTIVE_RUN' THEN 'WARN' ELSE 'ERROR' END,\n"
-        "    CASE WHEN '${error.code}' = 'DUPLICATE_ACTIVE_RUN' THEN 'DUPLICATE_ACTIVE_RUN' ELSE '${error.stage}_FAILED' END,\n"
+        "    '${error.level}', '${error.event}',\n"
         "    CAST(NULLIF('${load.run.id}', '') AS uuid), COALESCE(NULLIF('${load.job.key}', ''), '#{JOB.KEY}'),\n"
         "    NULLIF('${load.business.key}', ''), NULLIF('${partition.id}', ''), CAST(NULLIF('${chunk.index}', '') AS integer),\n"
         "    '" + TOP_NAME + "', NULL, '${hostname(true)}', NULL,\n"
         "    NULLIF('${error.class}', ''), NULLIF('${error.code}', ''), NULLIF('" + SQL_MSG + "', ''))"}, 2, 2)
 p(G90, "E97", "97_LogMessage", "LogMessage", {
-    "log-level": "${error.code:equals('DUPLICATE_ACTIVE_RUN'):ifElse('warn','error')}",
+    "log-level": "${error.level:toLower()}",
     "log-prefix": "SQOOP_REPLACEMENT ",
     "log-message": "{\"stage\":\"${error.stage}\",\"code\":\"${error.code}\",\"class\":\"${error.class}\","
                    "\"run_id\":\"${load.run.id}\",\"job_key\":\"${load.job.key}\",\"business_key\":\"${load.business.key}\","

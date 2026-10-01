@@ -220,10 +220,12 @@ flowchart LR
 | 영역 | 실행 노드 | Concurrent Tasks |
 |---|---|---:|
 | Trigger, Coordinator, Gate, Publish, Recovery | Primary Node | 1 |
-| Oracle Extract, PutHDFS | All Nodes | 노드당 `${WORKER.CONCURRENT.TASKS}` |
+| Oracle Extract, PutHDFS | All Nodes | 노드당 `WORKER.CONCURRENT.TASKS` 기준값 |
 | Audit writer | All Nodes | 2~4 |
 
 Coordinator에서 Worker로 가는 Connection은 `Round Robin` Load Balance를 설정한다. 그 외 제어 Connection은 load balance를 사용하지 않는다.
+
+Concurrent Tasks는 정수 스케줄링 설정이라 Parameter(`#{...}`)나 Expression Language(`${...}`)를 참조할 수 없다. REST API에서도 정수 필드로 정의되어 있다. `WORKER.CONCURRENT.TASKS`는 환경별 기준값으로 관리하고, 배포 스크립트나 운영 절차에서 해당 Processor의 Concurrent Tasks에 정수로 입력한다.
 
 ---
 
@@ -247,7 +249,7 @@ Coordinator에서 Worker로 가는 Connection은 `Round Robin` Load Balance를 �
 | `HDFS.STAGE.ROOT` | `/data/nifi/stage` | N | staging root |
 | `HDFS.PERMISSIONS.UMASK` | `027` | N | PutHDFS 생성 파일/경로 umask |
 | `HDFS.REPLICATION` | 환경 기본값 또는 `3` | N | 필요 시 PutHDFS replication override |
-| `WORKER.CONCURRENT.TASKS` | `2` | N | 노드당 추출 병렬도 |
+| `WORKER.CONCURRENT.TASKS` | `2` | N | 노드당 추출 병렬도 기준값. Concurrent Tasks에는 참조할 수 없으므로 배포 시 정수로 입력 |
 | `ORACLE.POOL.MAX` | `8` | N | 전체 노드 정책과 맞춤 |
 | `EXTRACT.FETCH.SIZE` | `5000` | N | JDBC fetch size |
 | `EXTRACT.ROWS.PER.FILE` | `500000` | N | chunk 행 수, 부하 시험으로 조정 |
@@ -294,16 +296,25 @@ JDBC type 주요 값은 `NUMERIC=2`, `BIGINT=-5`, `VARCHAR=12`, `DATE=91`, `TIME
 |---|---|---|
 | `CS_DBCP_ORACLE` | `HikariCPConnectionPool` | URL/계정/ojdbc, Max Total=`${ORACLE.POOL.MAX}`, validation query=`SELECT 1 FROM DUAL` |
 | `CS_DBCP_META` | `HikariCPConnectionPool` | 관리 DB, Max Total 10~20, autocommit 정책 확인 |
-| `CS_HIVE3_DBCP` | 환경에 맞는 Hive3 Connection Pool | HiveServer2의 실제 인증 방식 적용 |
+| `CS_HIVE3_DBCP` | CFM 제공 Hive Connection Pool | HiveServer2의 실제 인증 방식 적용. Apache NiFi 2.x에는 Hive 구성요소가 없으므로 CFM 4.12.0 제공 이름을 확정 |
 | `CS_JSON_READER` | `JsonTreeReader` | Schema Access=`Infer Schema`는 제어 레코드에만 사용 |
 | `CS_JSON_WRITER_ARRAY` | `JsonRecordSetWriter` | Output Grouping=`Array`, pretty print=false |
 | `CS_JSON_WRITER_LINE` | `JsonRecordSetWriter` | Output Grouping=`One Line per Object` |
 | `CS_PARQUET_WRITER` | `ParquetRecordSetWriter` | Schema=`Inherit Record Schema`, compression=`SNAPPY` |
 | `CS_PARQUET_READER` | `ParquetReader` | ValidateRecord에서 기록 결과 schema를 다시 읽음 |
 | `CS_SCHEMA_REGISTRY` | 조직 표준 Schema Registry | target Avro schema를 버전으로 고정 |
-| `CS_DMC_CLIENT` | `DistributedMapCacheClientService` | 모든 NiFi 노드가 공유하는 외부/공용 cache endpoint |
+| `CS_DMC_SERVER` | `MapCacheServer` | Wait/Notify signal 저장소. NiFi 1.x의 `DistributedMapCacheServer` |
+| `CS_DMC_CLIENT` | `MapCacheClientService` | 모든 NiFi 노드가 같은 cache endpoint(host/port)를 가리킴. NiFi 1.x의 `DistributedMapCacheClientService` |
 
 운영 데이터에는 schema inference를 사용하지 않는다. Oracle JDBC schema를 상속하되, Oracle `NUMBER`, `DATE`, `TIMESTAMP`, CLOB 처리 결과가 Hive DDL과 일치하는지 사전 시험하고 필요하면 `ConvertRecord`를 추가해 명시적 schema로 변환한다.
+
+추출 `ExecuteSQLRecord`에는 `Use Avro Logical Types=true`를 명시한다. 기본값 `false`이면 DATE, TIMESTAMP, DECIMAL이 문자열로 기록되어 Hive DDL과 어긋난다.
+
+시간대가 없는 원천 `DATE`/`TIMESTAMP`는 JDBC가 NiFi JVM 기본 시간대로 해석한다. 그 결과 Parquet에는 UTC로 변환된 `TIMESTAMP_MILLIS (isAdjustedToUTC=true)`로 기록된다. NiFi 2.4.0 PoC에서 JVM 시간대가 KST일 때 원천 `2026-09-28 00:00:01`이 `2026-09-27T15:00:01Z`로 저장됐고, 마이크로초 이하 정밀도는 버려졌다. Hive가 이 값을 읽는 방식은 Hive 버전과 parquet timestamp 설정에 따라 다르며, 건수 검증으로는 이 차이를 잡을 수 없다. 따라서 다음을 지킨다.
+
+- NiFi JVM `-Duser.timezone`과 Hive parquet timestamp 해석 설정을 환경 표준으로 확정한다.
+- 대표 TIMESTAMP/DATE 컬럼의 `MIN`/`MAX`를 Source, Staging, Target DQ 지표에 포함해 문자열 값으로 비교한다.
+- 마이크로초 이상 정밀도가 업무상 필요한 컬럼은 추출 SQL에서 문자열로 변환하거나 명시적 schema로 정밀도를 확인한다.
 
 ### 4.1 PostgreSQL 관리 및 로그 스키마
 
@@ -600,8 +611,8 @@ AS $$
            SET status = 'RUNNING',
                claim_token = p_claim_token,
                worker_node = p_worker_node,
-               attempt_count = attempt_count + 1,
-               started_at = COALESCE(started_at, clock_timestamp()),
+               attempt_count = p.attempt_count + 1,
+               started_at = COALESCE(p.started_at, clock_timestamp()),
                heartbeat_at = clock_timestamp(),
                error_code = NULL,
                error_message = NULL
@@ -685,6 +696,8 @@ NiFi runtime에는 일반 운영 중 `DELETE`, `TRUNCATE`, `DROP` 권한을 부�
 
 SCN, partition bound, count는 숫자 정규식으로 검증한 뒤 SQL에 사용한다. table/column/where 문자열을 외부 FlowFile에서 받지 않는다.
 
+Parameter 참조는 Expression Language의 문자열 리터럴 안에서 치환되지 않는다. 예를 들어 `${load.partition.count:equals('#{PARTITION.COUNT}')}`는 문자 그대로의 `#{PARTITION.COUNT}`와 비교하므로 항상 false가 된다(NiFi 2.4.0 PoC에서 재현). Parameter 값과 비교할 때는 먼저 `UpdateAttribute`에서 `load.partition.planned=#{PARTITION.COUNT}`처럼 attribute로 옮긴 뒤 `${load.partition.count:equals(${load.partition.planned})}`로 비교한다.
+
 ---
 
 ## 6. PG-00 Trigger
@@ -731,8 +744,10 @@ flowchart TD
     H -->|empty blocked or null invalid| X
     H -->|valid| J[18_Update_Run_Snapshot<br/>PutSQL]
     J --> K[19_Query_Partition_Manifest<br/>ExecuteSQLRecord]
-    K --> KC[19A_Capture_Manifest_Count<br/>UpdateAttribute]
-    KC --> KU[19B_Update_Run_Partition_Count<br/>PutSQL]
+    K --> KC[19A_Capture_Manifest_Totals<br/>EvaluateJsonPath + UpdateAttribute]
+    KC --> KV{19B_Check_Manifest_Invariant<br/>RouteOnAttribute}
+    KV -->|invalid| X
+    KV -->|valid| KU[19C_Update_Run_Partition_Count<br/>PutSQL]
     KU --> L[20_Split_Manifest<br/>SplitRecord: 1 record]
     L -->|splits| M[21_Extract_Partition_Attrs<br/>EvaluateJsonPath]
     M --> N[22_Insert_Partition_Row<br/>PutSQL]
@@ -756,17 +771,20 @@ flowchart TD
 | 16 | `EvaluateJsonPath` | Primary, 1 | count/min/max/null/DQ 값을 attribute로 추출 | matched→17, failure/unmatched→PG-90 |
 | 17 | `RouteOnAttribute` | Primary, 1 | empty source, NULL 정책, min/max 유효성 | valid→18, invalid→PG-90 |
 | 18 | `PutSQL` | Primary, 1 | `CS_DBCP_META`, SCN/metrics 저장, status=`EXTRACTING`, Fragmented=false | success→19, retry/failure→PG-90 |
-| 19 | `ExecuteSQLRecord` | Primary, 1 | 동일 SCN manifest SQL, JSON writer, Max Rows=0, Output Batch=0 | success→19A, failure→PG-90 |
-| 19A | `UpdateAttribute` | Primary, 1 | `load.partition.count=${record.count}` | success→19B |
-| 19B | `PutSQL` | Primary, 1 | expected partition count 저장, Batch Size=1, Fragmented=false | success→20, retry/failure→PG-90 |
+| 19 | `ExecuteSQLRecord` | Primary, 1 | 동일 SCN manifest SQL(`MANIFEST_TOTAL` 포함), JSON writer, Max Rows=0, Output Batch=0 | success→19A, failure→PG-90 |
+| 19A | `EvaluateJsonPath` + `UpdateAttribute` | Primary, 1 | `load.manifest.total=$[0].MANIFEST_TOTAL`, `load.partition.count=${record.count}`, `load.partition.planned=#{PARTITION.COUNT}` | success→19B, failure/unmatched→PG-90 |
+| 19B | `RouteOnAttribute` | Primary, 1 | 7.4 불변식: manifest 합계 = source count, 파티션 수 = 계획 수 | valid→19C, unmatched→PG-90 `FAILED_MANIFEST` |
+| 19C | `PutSQL` | Primary, 1 | expected partition count 저장, Batch Size=1, Fragmented=false | success→20, retry/failure→PG-90 |
 | 20 | `SplitRecord` | Primary, 1 | Reader=`CS_JSON_READER`, Writer=`CS_JSON_WRITER_LINE`, Records Per Split=1 | splits→21, original→25, failure→PG-90 |
 | 21 | `EvaluateJsonPath` | Primary, 1 | partition id/lower/upper/expected/null flag 추출 | matched→22, failure/unmatched→PG-90 |
-| 22 | `PutSQL` | Primary, 1 | manifest INSERT, Batch Size≤partition 수, Fragmented=true | success→23, retry/failure→PG-90 |
+| 22 | `PutSQL` | Primary, 1 | manifest INSERT, Fragmented=true, **Penalty Duration=0 sec**, Transaction Timeout 설정 | success→23, retry/failure→PG-90 |
 | 23 | `UpdateAttribute` 또는 PG-90 port | Primary, 1 | `event.name=PARTITION_CREATED`, `event.level=DEBUG` | expected>0→Worker, expected=0→24 |
 | 24 | `PutSQL` + `Notify` | Primary, 1 | 0건 partition을 SUCCESS/actual=0 처리 후 run progress signal | success→terminate, failure→PG-90 |
 | 25 | `UpdateAttribute` + `ReplaceText` | Primary, 1 | control content=`{}`, 저장된 `load.partition.count` 유지 | success→PG-30 run-control |
 
-중복 Run lock INSERT 실패는 일반 DB 장애와 구분해야 한다. SQLState/벤더코드로 unique violation이면 `DUPLICATE_ACTIVE_RUN`으로 종료하고, 연결 장애만 제한 재시도한다.
+중복 Run lock INSERT 실패는 일반 DB 장애와 구분해야 한다. SQLState/벤더코드로 unique violation이면 `DUPLICATE_ACTIVE_RUN`으로 종료하고, 연결 장애만 제한 재시도한다. NiFi 2.x `PutSQL`은 failure FlowFile에 `error.sql.state`, `error.code`, `error.message`를 추가하므로 PostgreSQL에서는 `${error.sql.state:equals('23505')}`로 분기한다. 14.6의 공통 오류 `UpdateAttribute`가 이 attribute를 덮어쓰지 않도록 원본 값을 먼저 참조한다.
+
+22는 Penalty Duration을 반드시 `0 sec`로 설정한다. Fragmented=true인 `PutSQL`은 같은 `fragment.identifier`의 FlowFile이 일부만 poll되면 그 FlowFile들을 penalize해 queue로 되돌린다. penalized FlowFile은 다음 poll에서 제외되므로, 앞단 Processor가 split을 나눠 전달하면 FlowFile마다 penalty 만료 시각이 어긋난다. 그러면 매 poll이 일부만 보게 되어 manifest INSERT가 끝나지 않는 livelock이 발생한다. NiFi 2.4.0 PoC에서 8개 파티션이 22 앞에서 무기한 정지하는 현상이 재현됐고, Penalty Duration을 0으로 바꾸자 즉시 해소됐다. 또한 `Transaction Timeout`을 설정해, fragment가 끝내 모이지 않으면 failure(`FAILED_MANIFEST`)로 보낸다. fragment 의존 자체를 없애려면 split 전에 manifest 전체를 한 SQL 문장 또는 한 트랜잭션으로 INSERT하는 구조로 바꿀 수 있다.
 
 ### 7.3 Source metric SQL
 
@@ -807,6 +825,15 @@ AND range overlap count = 0
 AND range gap count = 0
 ```
 
+19 manifest SQL은 각 행에 `SUM(EXPECTED_ROW_COUNT) OVER () AS MANIFEST_TOTAL`을 함께 반환한다. 19A가 이 값과 실제 manifest 행 수를 attribute로 추출하고, 19B가 split 전에 다음 조건을 검사한다.
+
+```text
+valid = ${load.manifest.total:equals(${load.source.count})}
+        AND ${load.partition.count:equals(${load.partition.planned})}
+```
+
+`SPLIT.NULL.POLICY=SEPARATE`이면 NULL 파티션만큼 `load.partition.planned`에 1을 더한다. 경계는 `lower(i+1) = upper(i)`가 되도록 하나의 식으로 생성하므로 overlap/gap이 구조적으로 생기지 않는다. 경계를 다른 방식으로 만든다면 `LAG(upper_bound) OVER (ORDER BY partition_id) <> lower_bound`인 행 수도 함께 반환해 0인지 검사한다.
+
 불변식 불일치는 `FAILED_MANIFEST`이며 Worker를 시작하지 않는다. 0건 파티션을 24에서 성공 처리할 때도 `${load.run.id}`의 `partitions` counter를 1 증가시켜 Run Wait가 불필요하게 만료될 때까지 기다리지 않게 한다.
 
 ---
@@ -832,8 +859,9 @@ flowchart TD
     ER -->|ORA-01555 or permanent| FAIL
 
     G -->|index 0| DUP[29_Duplicate_First_Fragment]
-    DUP -->|original data| U[31_Set_Chunk_Attrs]
-    DUP -->|duplicate control| CTRL[30_Create_Partition_Control]
+    DUP -->|success| CI{29A_Route_Copy_Index<br/>RouteOnAttribute}
+    CI -->|other data| U[31_Set_Chunk_Attrs]
+    CI -->|copy.index equals 1| CTRL[30_Create_Partition_Control]
     G -->|other data| U
     U --> VAL[32_ValidateRecord<br/>ParquetReader and fixed schema]
     VAL -->|valid| H[33_PutHDFS]
@@ -853,16 +881,17 @@ PG-20의 Connection은 PG-10에서 들어오는 입력에만 Round Robin Load Ba
 
 | ID | Processor | Scheduling | 주요 Properties | Relationship |
 |---|---|---|---|---|
-| 20 | `UpdateAttribute` | All Nodes, `${WORKER.CONCURRENT.TASKS}` | `partition.claim.token=${UUID()}`, worker node와 시작시각 설정 | success→21 |
+| 20 | `UpdateAttribute` | All Nodes, worker concurrency | `partition.claim.token=${UUID()}`, worker node와 시작시각 설정 | success→21 |
 | 21 | `ExecuteSQLRecord` | All Nodes, worker concurrency | `CS_DBCP_META`, `claim_partition` 호출, JSON array writer, Max Rows=0 | success→22, failure→PG-90/제한 재시도 |
 | 22 | `EvaluateJsonPath` | All Nodes, worker concurrency | `partition.claimed=$[0].claimed` | matched→23, failure/unmatched→PG-90 |
 | 23 | `RouteOnAttribute` | All Nodes, worker concurrency | `${partition.claimed:equals('true')}` | true→24, false→중복 Worker 종료 |
 | 24 | `ReplaceText` | All Nodes, worker concurrency | Replacement Strategy=Entire text, partition 유형별 Oracle SQL 생성 | success→25, failure→PG-90 |
-| 25 | `ExecuteSQLRecord` | All Nodes, `${WORKER.CONCURRENT.TASKS}` | `CS_DBCP_ORACLE`, `CS_PARQUET_WRITER`, Fetch/Rows/Timeout은 아래 표 참조 | success→26, failure→27 |
+| 25 | `ExecuteSQLRecord` | All Nodes, worker concurrency | `CS_DBCP_ORACLE`, `CS_PARQUET_WRITER`, Fetch/Rows/Timeout은 아래 표 참조 | success→26, failure→27 |
 | 26 | `RouteOnAttribute` | All Nodes, worker concurrency | `${fragment.index:equals('0')}` | first→29, other→31 |
 | 27 | `RouteOnAttribute` | All Nodes, worker concurrency | Oracle vendor code/SQLState로 transient, ORA-01555, permanent 분류 | transient→28, non-retryable→PG-90 |
 | 28 | `RetryFlowFile` | All Nodes, worker concurrency | Retry Attribute=`partition.retry.count`, Maximum=`#{PARTITION.RETRY.MAX}`, Penalize=true | retry→24, exceeded/failure→PG-90 |
-| 29 | `DuplicateFlowFile` | All Nodes, worker concurrency | Copies=1; 첫 chunk에서 data와 control 분기 | original→31, duplicate→30 |
+| 29 | `DuplicateFlowFile` | All Nodes, worker concurrency | Number of Copies=1; 원본과 복제본이 모두 `success`로 나가며 `copy.index` attribute가 붙음 | success→29A |
+| 29A | `RouteOnAttribute` | All Nodes, worker concurrency | `control=${copy.index:equals('1')}` | control→30, unmatched→31 |
 | 30 | `ReplaceText` + `UpdateAttribute` | All Nodes, worker concurrency | content=`{}`, partition control 속성과 `fragment.count` 유지 | success→PG-30 partition-control |
 | 31 | `UpdateAttribute` | All Nodes, worker concurrency | chunk index/count, 결정적 filename, HDFS part path 설정 | success→32 |
 | 32 | `ValidateRecord` | All Nodes, worker concurrency | Reader=`CS_PARQUET_READER`, Writer=`CS_PARQUET_WRITER`, validation schema 고정 | valid→33, invalid/failure→PG-90 |
@@ -917,7 +946,8 @@ sql.args.3 = upper bound, NUMERIC(2)
 | Max Rows Per FlowFile | `#{EXTRACT.ROWS.PER.FILE}` |
 | Output Batch Size | `0` |
 | Max Wait Time | `#{EXTRACT.QUERY.TIMEOUT}` |
-| Concurrent Tasks | `#{WORKER.CONCURRENT.TASKS}` |
+| Use Avro Logical Types | `true` (DATE/TIMESTAMP/DECIMAL 타입 유지, 4장 참조) |
+| Concurrent Tasks | `WORKER.CONCURRENT.TASKS` 기준값을 정수로 입력 (Parameter 참조 불가) |
 | Execution | All Nodes |
 
 `Output Batch Size=0`이어야 한 ResultSet의 `fragment.count`, `fragment.index`, `fragment.identifier`가 완전하게 생성된다. 파티션 크기가 너무 커 session/repository 압력이 생기면 Output Batch를 켜기보다 논리 파티션 수를 늘린다.
@@ -1118,7 +1148,9 @@ LOCATION '${load.hdfs.path}'
 
 `load.stage.table`은 `${load.run.id}`에서 하이픈을 제거한 안전한 suffix만 사용하고 정규식으로 검증한다.
 
-42는 `PutHive3QL` 또는 설치 환경에서 권장되는 `PutClouderaHiveQL`을 사용한다. 43은 `SelectHive3QL` 계열 Processor가 제공되면 사용하고, 환경 표준이 Hive JDBC라면 `ExecuteSQLRecord + CS_HIVE3_DBCP`로 대체한다.
+Apache NiFi 2.x에는 Hive 번들이 없다. NiFi 2.4.0 배포본의 Processor 목록에서 `PutHive3QL`/`SelectHive3QL`이 없음을 확인했다. 이 문서의 `PutHive3QL`, `SelectHive3QL`, `PutClouderaHiveQL`, `CS_HIVE3_DBCP`는 CFM이 제공하는 Hive 구성요소를 가리키는 자리표시자다. 구현 전에 CFM 4.12.0 supported processors 목록(21장)에서 실제 Processor와 Controller Service 이름, 지원 속성(Query Timeout, Rollback On Failure 등)을 확정한다. 제공 구성요소가 없다면 Hive JDBC driver와 `ExecuteSQL`/`ExecuteSQLRecord`로 DDL·DML을 실행할 수 있는지 사전 시험한 뒤 대체한다.
+
+42는 확정된 Hive 실행 Processor를 사용한다. 43은 Hive 조회 Processor가 제공되면 사용하고, 환경 표준이 Hive JDBC라면 `ExecuteSQLRecord + CS_HIVE3_DBCP`로 대체한다.
 
 필수 stage 지표:
 
@@ -1128,9 +1160,13 @@ SELECT COUNT(*) AS STAGE_COUNT,
        COUNT(*) - COUNT(DISTINCT <BUSINESS_PK>) AS DUP_PK_COUNT,
        MIN(INSP_DTL_SEQ) AS MIN_SEQ,
        MAX(INSP_DTL_SEQ) AS MAX_SEQ,
-       SUM(<BUSINESS_AMOUNT>) AS AMOUNT_SUM
+       SUM(<BUSINESS_AMOUNT>) AS AMOUNT_SUM,
+       CAST(MIN(<BUSINESS_TIMESTAMP>) AS STRING) AS MIN_TS,
+       CAST(MAX(<BUSINESS_TIMESTAMP>) AS STRING) AS MAX_TS
   FROM #{HIVE.STAGE.DB}.${load.stage.table}
 ```
+
+`MIN_TS`/`MAX_TS`는 동일 의미로 계산한 원천 값과 문자열로 비교한다. 시간대 해석이 어긋나면 count는 같아도 이 지표가 불일치한다.
 
 46은 `nifi_ops.load_validation`에 지표별 PASS/FAIL을 저장하고, 모두 PASS일 때만 `STAGING_VALIDATED`로 CAS 갱신한다.
 
@@ -1451,13 +1487,15 @@ event.name      = PARTITION_FAILED 또는 RUN_FAILED
 
 | 사용처 | Support Fragmented Transactions | Batch Size |
 |---|---:|---:|
-| 22 manifest 전체 INSERT | `true` | 전체 partition 수 이하의 적정값; 한 트랜잭션으로 manifest 생성 |
+| 22 manifest 전체 INSERT | `true` | 기본 DBCP/Hikari에서는 fragmented 모드가 Batch Size 제한을 받지 않음; Penalty Duration=`0 sec` 필수 |
 | Worker claim/update | `false` | 1 |
 | File audit upsert | `false` | 1 또는 소규모 batch |
 | Partition/Run 상태 CAS | `false` | 1 |
 | Validation/Event INSERT | `false` | 처리량에 맞춤 |
 
 Worker 이후의 FlowFile에는 Oracle query가 새로 설정한 fragment 속성도 있으므로, Worker 영역의 `PutSQL`에서는 항상 `Support Fragmented Transactions=false`를 명시한다.
+
+Fragmented=true인 `PutSQL`은 일부 fragment만 poll되면 FlowFile을 penalize해 되돌리므로 Penalty Duration이 0보다 크면 livelock이 생길 수 있다(7.2의 22 참조). Fragmented=true를 쓰는 모든 `PutSQL`은 Penalty Duration=`0 sec`와 Transaction Timeout을 함께 설정한다.
 
 ---
 

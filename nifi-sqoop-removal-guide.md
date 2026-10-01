@@ -262,7 +262,7 @@ Concurrent Tasks는 정수 스케줄링 설정이라 Parameter(`#{...}`)나 Expr
 | Parameter | 예시 | Sensitive | 용도 |
 |---|---|---:|---|
 | `CONTROL.API.URL` | `https://load-control.internal:8443/v1` | N | Load Control API base URL |
-| `CONTROL.API.TOKEN` | 미표시 | Y | API Bearer 토큰(role=`nifi`) |
+| `CONTROL.API.AUTHORIZATION` | 미표시(`Bearer <token>`) | Y | API 인증 헤더 값 전체(role=`nifi`). Sensitive 속성은 Parameter 참조 하나만 값으로 가질 수 있어 `Bearer `까지 Parameter에 넣는다(9.2) |
 | `CONTROL.API.TIMEOUT` | `30 sec` | N | `InvokeHTTP` Socket Read Timeout |
 | `CONTROL.API.RETRY.MAX` | `5` | N | API 호출 재시도 횟수. penalty와 곱해 API 재기동 시간보다 길게 |
 | `CONTROL.LISTEN.PORT` | `9443` | N | API→NiFi 호출 수신 포트(PG-05). 모든 Job이 공유 |
@@ -972,7 +972,7 @@ PG-20의 Connection은 PG-10에서 들어오는 입력에만 Round Robin Load Ba
 
 | ID | Processor | Scheduling | 주요 Properties | Relationship |
 |---|---|---|---|---|
-| 20 | `UpdateAttribute` + `AttributesToJSON` | All Nodes, worker concurrency | `partition.claim.token=${UUID()}`, `claimToken=${partition.claim.token}`, `workerNode=${hostname(true)}`; Destination=flowfile-content, Attributes List=`claimToken,workerNode` | success→21 |
+| 20 | `UpdateAttribute` ×2 + `AttributesToJSON` | All Nodes, worker concurrency | 20: `partition.claim.token=${UUID()}`. 20B: `claimToken=${partition.claim.token}`, `workerNode=${hostname(true)}`. 이어서 Destination=flowfile-content, Attributes List=`claimToken,workerNode` | success→21 |
 | 21 | `InvokeHTTP` | All Nodes, worker concurrency | 9.2 공통 설정, URL=`#{CONTROL.API.URL}/runs/${load.run.id}/partitions/${partition.id}/claim`, `Response Body Attribute Name=api.response` | Original→23, No Retry→PG-90, Retry/Failure→21R |
 | 23 | `RouteOnAttribute` | All Nodes, worker concurrency | `owner=${api.response:jsonPath('$.claimed'):equals('true')}` | owner→24, unmatched→종료(DEBUG) |
 | 24 | `ReplaceText` | All Nodes, worker concurrency | Replacement Strategy=Entire text, partition 유형별 Oracle SQL 생성 | success→25, failure→29 |
@@ -988,6 +988,8 @@ PG-20의 Connection은 PG-10에서 들어오는 입력에만 Round Robin Load Ba
 | 34C | `RetryFlowFile` | All Nodes, worker concurrency | Retry Attribute=`api.retry.count`, Maximum=`#{CONTROL.API.RETRY.MAX}`, Penalize=true | retry→34B, exceeded→PG-90 ERROR |
 | 34D | `RouteOnAttribute` | All Nodes, worker concurrency | `${api.response:jsonPath('$.validationScheduled'):equals('true')}`이면 INFO `EXTRACT_VALIDATED` 로그 | 모두 종료 |
 | 35 | `RetryFlowFile` | All Nodes, worker concurrency | HDFS 전용 retry attribute, 최대 횟수와 penalty 설정 | retry→33, exceeded/failure→29 |
+
+20은 token 생성(20)과 본문용 복사(20B)를 반드시 두 `UpdateAttribute`로 나눈다. `UpdateAttribute`는 모든 속성을 **들어온** attribute 기준으로 평가하므로, 같은 processor 안에서 방금 만든 `partition.claim.token`을 참조하면 빈 값이 된다. API PoC에서 이 때문에 모든 claim이 422(`claimToken` UUID 형식 오류)를 받는 것을 재현했다. 다른 단계도 같은 processor 안에서 만든 attribute를 다시 참조하지 않는다.
 
 20은 content를 claim 요청 JSON으로 바꾼다. 파티션 정보는 PG-10의 24에서 만든 `partition.*` attribute에 있고 24가 content를 Oracle SQL로 덮어쓰므로, manifest 레코드 content는 이후에 쓰지 않는다.
 
@@ -1158,7 +1160,7 @@ PoC에서 PG-30이 실패 후 0.1초 만에 run 실패를 확정하던 동작은
 | Response Body Attribute Name | `api.response` (응답이 작은 호출). PG-10 21만 비움 |
 | Response Body Attribute Size | `4096` |
 | Response Generation Required | `false` |
-| 동적 속성 `Authorization` | `Bearer #{CONTROL.API.TOKEN}` — **Sensitive 동적 속성**으로 추가해야 Sensitive Parameter를 참조할 수 있다 |
+| 동적 속성 `Authorization` | `#{CONTROL.API.AUTHORIZATION}` — **Sensitive 동적 속성**으로 추가해야 Sensitive Parameter를 참조할 수 있다. Sensitive 속성은 Parameter 참조 외의 텍스트를 가질 수 없으므로 `Bearer #{...}`처럼 쓰면 NiFi가 400으로 거부한다(NiFi 2.4.0에서 확인). Parameter 값을 `Bearer <token>` 전체로 둔다 |
 | 동적 속성 `X-Request-Id` | `${UUID()}` |
 | 동적 속성 `X-Run-Id` | `${load.run.id}` |
 
@@ -1740,7 +1742,7 @@ API 쪽 구현과 동시성 테스트는 API 설계 9.5~9.6, 11장을 따른다.
 - Provenance: run/partition/chunk 상관 분석이 가능한 기간 유지. API 로그와 `X-Request-Id`, `run_id`로 대조
 - Bulletin: ERROR/WARN 수집을 모니터링 시스템에 연계
 - Parameter Context 변경 권한과 NiFi Policy를 운영자/개발자로 분리
-- 민감 Parameter(`CONTROL.API.TOKEN`, DB 암호)는 버전관리 flow JSON에 평문으로 포함하지 않음. `InvokeHTTP`의 `Authorization`은 Sensitive 동적 속성으로 설정
+- 민감 Parameter(`CONTROL.API.AUTHORIZATION`, DB 암호)는 버전관리 flow JSON에 평문으로 포함하지 않음. `InvokeHTTP`의 `Authorization`은 Sensitive 동적 속성으로 설정
 - flow definition은 NiFi Registry 또는 조직 표준 Git 배포 절차로 승격. Load Control API와 API 계약(엔드포인트, 필드)을 함께 버전 관리한다
 
 ---

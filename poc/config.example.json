@@ -1,7 +1,12 @@
 {
  "common_params": {
+  "CONTROL.API.URL": "http://127.0.0.1:8080/v1",
+  "CONTROL.API.AUTHORIZATION": "Bearer <nifi-token>",
+  "CONTROL.API.TIMEOUT": "30 secs",
+  "CONTROL.API.RETRY.MAX": "5",
+  "CONTROL.LISTEN.PORT": "9443",
   "META.JDBC.URL": "jdbc:postgresql://localhost:5432/nifiops",
-  "META.JDBC.USER": "nifi_ops",
+  "META.JDBC.USER": "nifi_runtime",
   "META.JDBC.PASSWORD": "<secret>",
   "SRC.JDBC.URL": "jdbc:postgresql://localhost:5432/srcdb",
   "SRC.JDBC.USER": "nifi_reader",
@@ -13,10 +18,7 @@
   "EXTRACT.FETCH.SIZE": "5000",
   "EXTRACT.ROWS.PER.FILE": "5000",
   "EXTRACT.QUERY.TIMEOUT": "60 min",
-  "PARTITION.RETRY.MAX": "3",
-  "PARTITION.WAIT.TIMEOUT": "10 min",
-  "RUN.WAIT.TIMEOUT": "30 min",
-  "GATE.POLL.MAX": "30"
+  "PARTITION.RETRY.MAX": "3"
  },
  "job_params": {
   "JOB.KEY": "PG_INSP_DTL_DAILY",
@@ -27,6 +29,8 @@
   "SRC.SPLIT.COLUMN": "insp_dtl_seq",
   "SRC.BASE.WHERE": "base_dt = DATE '${load.business.key}'",
   "DQ.AMOUNT.COLUMN": "amount",
-  "PARTITION.COUNT": "8"
+  "PARTITION.COUNT": "8",
+  "HIVE.STAGE.TABLE.PREFIX": "TMP_INSP_DTL_",
+  "ALLOW.EMPTY.SOURCE": "false"
  }
 }

@@ -215,7 +215,7 @@ error_class, error_code, message
 4. [Load Control API 구현](./load-control-api/README.md)
    - FastAPI 프로젝트(API 설계 12장 1~2단계): 실행, migration, 테스트 방법
 5. [가이드 검토 및 NiFi 2.4.0 PoC 결과](./poc/REVIEW.md)
-   - API 도입 이전 구조(PG-30 Wait/Notify)로 수행한 PoC 기록
+   - 이전 구조(PG-30 Wait/Notify) PoC와 API 연동 구조 PoC(정상, 0건 파티션, 중복 실행, HDFS 실패, API 중단, sweeper 재발행) 결과
 
 ## 구현 전 확인 항목
 

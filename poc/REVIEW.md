@@ -1,6 +1,6 @@
 # nifi-sqoop-removal-guide.md 검토 및 NiFi 2.4.0 PoC 결과
 
-> 이 PoC는 Load Control API 도입 이전 구조(PG-30 Wait/Notify, NiFi `PutSQL`로 원장 직접 기록)로 수행했다. 현재 설계는 완료 판정과 원장 기록을 Load Control API(FastAPI)가 맡는다([API 설계](../load-control-api-design.md)). `poc/build_flow.py`는 이전 구조 그대로이며, API 구조로의 재검증은 API 설계 12장 3단계에서 수행한다. 아래 결과 중 Oracle 추출, Parquet 타입, PutHDFS, 경로, PostgreSQL 원천 관련 항목은 현재 설계에도 그대로 유효하다.
+> 1~5장은 Load Control API 도입 이전 구조(PG-30 Wait/Notify, NiFi `PutSQL`로 원장 직접 기록)로 수행한 PoC 기록이다. 현재 구조(Load Control API 연동)로 다시 수행한 결과는 6장에 있다. `poc/build_flow.py`는 현재 구조로 바뀌었고, 이전 빌더는 git 이력(커밋 `ec5f074` 이전)에 있다.
 
 - 검토일: 2026-10-01
 - 실행 환경: Apache NiFi 2.4.0 (단일 노드, `http://10.0.1.50:10001`), PostgreSQL 16
@@ -67,4 +67,54 @@ python3 poc/build_flow.py http://10.0.1.50:10001/nifi-api poc/config.example.jso
 | 3장 5. PUBLISH_UNKNOWN 판별 | 11.2 #55A, 판별 기준 |
 | 3장 6. PostgreSQL 원천 | 1장 "Oracle 이외 원천 (PostgreSQL)" |
 
-PoC Flow(`poc/build_flow.py`)에는 3장 3~5번(ExecuteSQLRecord CAS, partition Wait 해제, PUBLISH 판별)을 아직 적용하지 않았다.
+3장 3~5번(PutSQL CAS 결과, Wait 해제, PUBLISH 판별)은 API 연동 구조에서 문제 자체가 없어졌거나 API가 처리한다(6장).
+
+## 6. API 연동 구조 PoC (2026-10-01)
+
+`poc/build_flow.py`를 Load Control API 연동 구조(가이드 7~10장)로 바꾸고 같은 데이터로 다시 실행했다.
+
+- 실행 환경: Apache NiFi 2.4.0(단일 노드, HTTP `127.0.0.1:18888`), PostgreSQL 16, Load Control API(`load-control-api`, api 1 프로세스 + worker 1 프로세스, `config.yaml`)
+- 추가 설치: 1장과 같음(`nifi-parquet-nar`, `nifi-hadoop-nar`, `nifi-hadoop-libraries-nar` 2.4.0, PostgreSQL JDBC 42.7.3)
+- 데이터: `srcdb.app.insp_dtl` 업무일자 `2026-09-28` 105,000건(seq 1~120000 중 30001~45000 공백), 다른 일자 500건
+- Flow: Processor 85개, Connection 135개. PG-00 → PG-10 → PG-20 → (API 판정·outbox) → PG-05 → PG-40 입구(`/validation/start`, `_SUCCESS`). Hive가 없으므로 `STAGE_VALIDATING`까지
+- NiFi↔API는 평문 HTTP로 연결했다. 운영에서는 SSL Context Service(mTLS)를 붙인다.
+
+### 6.1 시험 결과
+
+| 시나리오 | 결과 |
+|---|---|
+| 정상 실행(105,000건, 8파티션, 5,000행/파일) | run `STAGE_VALIDATING`, 8/8 SUCCESS, Parquet 21개, `_SUCCESS` 생성, 검증 dispatch `ACKED`. Parquet를 직접 읽어 count·distinct·min/max·`SUM(amount)`(65,611,875.00)·NULL 수가 원천과 일치, DECIMAL(18,2)/DATE 타입 유지 |
+| 0건 파티션(seq 30001~45000) | API가 manifest 등록 시 SUCCESS 처리, Worker로 보내지 않음 |
+| 파티션 건수가 파일 행 수의 배수(15,000/5,000) | 파티션당 3파일, 빈 FlowFile 없음 |
+| 동일 업무일자 중복 실행 | API 409 → `DUPLICATE_ACTIVE_RUN` WARN 이벤트, 기존 run 상태 변화 없음 |
+| 파티션 0004 HDFS 쓰기 실패 주입(재시도 3회 소진) | 0004만 FAILED, run `FAILED_EXTRACT`, 검증 dispatch 0건, `_SUCCESS` 미생성. 나머지 chunk의 늦은 실패 보고는 멱등 처리 |
+| API 중단 중 실행 시작(약 10초 후 재기동) | `InvokeHTTP` Failure(Connection refused) → `RetryFlowFile` 재시도 → API 재기동 후 run 생성부터 `STAGE_VALIDATING`까지 자동 진행 |
+| 파티션 0004 chunk 보고 차단 후 sweeper REISSUE 모드 | 0004가 RUNNING으로 정체 → sweeper가 RETRY로 초기화·이전 chunk 기록 무효화·`REISSUE_PARTITION` dispatch → PG-05 `/reissue` 수신 → 재 claim(attempt 2, dispatch `ACKED`) → 파티션 SUCCESS → run 완료(105,000건, WRITTEN 21파일) |
+
+이전 구조(1장)와 비교하면 PG-30(Wait/Notify)과 DMC Controller Service가 없어졌고, 원장 쓰기 `PutSQL`이 모두 `InvokeHTTP`로 바뀌었다. 재발행 경로는 이전 PoC에서 구현하지 못했던 부분이다.
+
+### 6.2 이번 PoC에서 찾은 결함
+
+| # | 위치 | 문제 | 조치 |
+|---|---|---|---|
+| 11 | 가이드 8.2 #20 | 같은 `UpdateAttribute` 안에서 `partition.claim.token=${UUID()}`를 만들고 `claimToken=${partition.claim.token}`으로 참조했다. `UpdateAttribute`는 모든 속성을 들어온 attribute 기준으로 평가하므로 `claimToken`이 빈 값이 되어 claim 7건이 모두 422(UUID 형식 오류)를 받았다 | token 생성과 복사를 두 `UpdateAttribute`로 분리(가이드 8.2, 빌더 30/30B) |
+| 12 | 가이드 9.2, 3.1 | `Authorization` 동적 속성을 `Bearer #{CONTROL.API.TOKEN}`으로 쓰면 NiFi가 400으로 거부한다. Sensitive 속성은 Parameter 참조 외의 텍스트를 가질 수 없다 | Parameter를 `CONTROL.API.AUTHORIZATION`(값 `Bearer <token>`)으로 바꾸고 속성 값은 `#{CONTROL.API.AUTHORIZATION}`만 둔다 |
+| 13 | 빌더 14번 | `RouteOnAttribute` EL의 닫는 괄호 위치 오류로 "Found multiple Expressions" 검증 실패 | 수정. 빌드 후 모든 Processor의 `validationStatus`를 확인한다 |
+| 14 | 빌더 오류 경로 | 오류 경로가 `event.name`을 지정하지 않아 앞 단계의 `RUN_CREATED`가 오류 이벤트 이름으로 남았다 | 오류 경로마다 `event.name`, `event.level`을 지정 |
+
+### 6.3 재현 방법
+
+```bash
+# 1. 관리 DB migration과 API·worker 실행(load-control-api/README.md)
+LCA_CONFIG=config.yaml alembic upgrade head
+python -m load_control.server --config config.yaml
+python -m load_control.worker --config config.yaml     # nifi.receiver_url = http://<nifi-host>:<CONTROL.LISTEN.PORT>
+
+# 2. NiFi Flow 생성(config.example.json 사본에 API URL, 인증 헤더, DB, 경로를 채운다)
+python3 poc/build_flow.py http://<nifi-host>:<port>/nifi-api my-config.json
+# 00_Generate_Trigger를 제외한 Processor를 시작하고, Trigger는 Run Once로 실행한다
+
+# 3. 다시 만들 때
+python3 poc/teardown_flow.py http://<nifi-host>:<port>/nifi-api
+```
+

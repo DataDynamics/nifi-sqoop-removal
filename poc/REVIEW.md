@@ -158,11 +158,11 @@ python3 poc/teardown_flow.py http://<nifi-host>:<port>/nifi-api my-config.json
 
 | 위치 | 변경 |
 |---|---|
-| Controller Service | `CS_DBCP_SRC`: `oracle.jdbc.OracleDriver`, `#{SRC.JDBC.DRIVER.PATH}`(ojdbc), 검사 쿼리 `SELECT 1 FROM DUAL`, 최대 연결 `#{ORACLE.POOL.MAX}`. 관리 DB(`CS_DBCP_META`)는 PostgreSQL 그대로이며 드라이버 경로를 `#{META.JDBC.DRIVER.PATH}`로 분리 |
+| Controller Service | `CS_DBCP_ORACLE`: `oracle.jdbc.OracleDriver`, `#{ORACLE.JDBC.*}`(ojdbc 경로 포함), 검사 쿼리 `SELECT 1 FROM DUAL`, 최대 연결 `#{ORACLE.POOL.MAX}`. 이름은 가이드 3.1·4장과 같다. 관리 DB(`CS_DBCP_META`)는 PostgreSQL 그대로이며 드라이버 경로를 `#{META.JDBC.DRIVER.PATH}`로 분리 |
 | PG-10 | 14 SCN 조회(`V$DATABASE`), 15 SCN 추출을 추가(Processor 8 → 10, 번호는 가이드 7.2와 같은 11~20). 16 원천 지표+manifest SQL을 Oracle 문법(`AS OF SCN`, `CONNECT BY`, `TO_CHAR`, 문자열 boolean)으로 작성하고 SCN·`MIN_TS`/`MAX_TS`도 반환. SCN이 숫자가 아니면 `INVALID_SCN`이 들어가 SQL 오류로 실패. 17 Jolt는 대문자 컬럼 키 |
 | PG-20 | 33에 SCN 숫자 검사 추가. 34는 `AS OF SCN ${load.snapshot.scn}`, 재시도 없음(가이드 16장), autocommit 기본값, 정밀도 없는 `NUMBER`를 위해 Default Decimal Precision/Scale을 `#{ORACLE.NUMBER.DEFAULT.PRECISION}`/`#{ORACLE.NUMBER.DEFAULT.SCALE}`로 지정 |
 | PG-05 | 09에서 재발행 본문의 `snapshotScn`, `isNullPartition`도 추출 |
-| Parameter | 추가: `META.JDBC.DRIVER.PATH`, `SRC.JDBC.DRIVER.PATH`, `ORACLE.POOL.MAX`, `ORACLE.NUMBER.DEFAULT.PRECISION`, `ORACLE.NUMBER.DEFAULT.SCALE`, `DQ.TIMESTAMP.COLUMN`. 제거: `JDBC.DRIVER.PATH` |
+| Parameter | 원천 연결은 `ORACLE.JDBC.URL/USER/PASSWORD/DRIVER.PATH`(V3의 `SRC.JDBC.*` 대신). 추가: `META.JDBC.DRIVER.PATH`, `ORACLE.POOL.MAX`, `ORACLE.NUMBER.DEFAULT.PRECISION`, `ORACLE.NUMBER.DEFAULT.SCALE`, `DQ.TIMESTAMP.COLUMN`. 제거: `JDBC.DRIVER.PATH` |
 | 이름 | `SQOOP_REPLACEMENT_POC_V4`, `PC_SQOOP_REPLACEMENT_COMMON_V4`, `PC_JOB_ORACLE_INSP_DTL_DAILY_V4` |
 
 NULL split 파티션(`SPLIT.NULL.POLICY=SEPARATE`)은 만들지 않는다. split 컬럼에 NULL이 있으면 API가 manifest를 거부한다.

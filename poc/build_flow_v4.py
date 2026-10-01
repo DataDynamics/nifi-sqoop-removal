@@ -7,7 +7,8 @@
     모든 PG ─errors▶ PG-90 Error and Event
 
 V3 대비 변경점
-- 원천 Connection Pool: oracle.jdbc.OracleDriver, ojdbc 경로(SRC.JDBC.DRIVER.PATH), 검사 쿼리 SELECT 1 FROM DUAL.
+- 원천 Connection Pool(CS_DBCP_ORACLE): oracle.jdbc.OracleDriver, ORACLE.JDBC.* Parameter(ojdbc 경로 포함),
+  검사 쿼리 SELECT 1 FROM DUAL. 이름은 가이드 3.1·4장과 같다.
   관리 DB(load_event)는 PostgreSQL 그대로이므로 드라이버 경로를 META.JDBC.DRIVER.PATH로 나눈다.
 - PG-10: SCN 조회(14)·추출(15)을 추가해 모든 원천 SQL이 같은 SCN(AS OF SCN)을 읽는다. 원천 지표+manifest SQL(16)은
   Oracle 문법(CONNECT BY, TO_CHAR, 문자열 boolean)이며 결과 컬럼은 대문자다. SCN과 timestamp 지표(MIN_TS/MAX_TS)도
@@ -121,8 +122,8 @@ def hikari(prefix, driver_class, validation_query, max_conns="10"):
 
 # 관리 DB는 PostgreSQL(load_event INSERT 전용), 원천은 Oracle. 드라이버가 다르므로 경로 Parameter를 나눈다.
 META = cs("CS_DBCP_META", "HikariCPConnectionPool", hikari("META", "org.postgresql.Driver", "SELECT 1"))
-SRC = cs("CS_DBCP_SRC", "HikariCPConnectionPool",
-         hikari("SRC", "oracle.jdbc.OracleDriver", "SELECT 1 FROM DUAL", "#{ORACLE.POOL.MAX}"))
+SRC = cs("CS_DBCP_ORACLE", "HikariCPConnectionPool",
+         hikari("ORACLE", "oracle.jdbc.OracleDriver", "SELECT 1 FROM DUAL", "#{ORACLE.POOL.MAX}"))
 JARR = cs("CS_JSON_WRITER_ARRAY", "JsonRecordSetWriter", {"output-grouping": "output-array"})
 PARQ = cs("CS_PARQUET_WRITER", "ParquetRecordSetWriter", {"compression-type": "SNAPPY"})
 HTTPCTX = cs("CS_HTTP_CONTEXT_MAP", "StandardHttpContextMap", {"Request Expiration": "1 min"})

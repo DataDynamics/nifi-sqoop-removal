@@ -145,7 +145,7 @@ PostgreSQL에는 `AS OF SCN`에 해당하는 과거 시점 조회가 없다. `pg
 - 불변 업무 마감 조건: 대상 `business_key` 범위의 행이 적재 시점에 더 이상 변경되지 않음을 업무적으로 보장
 - 원천 측 snapshot table: 마감 시점에 원천에서 별도 테이블로 복제한 뒤 그 테이블을 추출
 
-SQL에서는 `AS OF SCN` 절을 제거하고, 7.2의 12~14(SCN 조회·검증) 단계를 생략하거나 마감 확인 조회로 대체한다. PostgreSQL JDBC driver는 autocommit=false일 때만 Fetch Size(server-side cursor)를 적용한다. 그러므로 추출 `ExecuteSQLRecord`에 `Set Auto Commit=false`를 설정한다. 설정하지 않으면 파티션 결과 전체를 NiFi 메모리에 적재한다. 이 구성은 NiFi 2.4.0 + PostgreSQL 16 PoC에서 105,000건, 8파티션으로 검증했다.
+SQL에서는 `AS OF SCN` 절을 제거하고, 7.2의 14·15(SCN 조회·추출) 단계를 생략하거나 마감 확인 조회로 대체한다. PostgreSQL JDBC driver는 autocommit=false일 때만 Fetch Size(server-side cursor)를 적용한다. 그러므로 추출 `ExecuteSQLRecord`에 `Set Auto Commit=false`를 설정한다. 설정하지 않으면 파티션 결과 전체를 NiFi 메모리에 적재한다. 이 구성은 NiFi 2.4.0 + PostgreSQL 16 PoC에서 105,000건, 8파티션으로 검증했다.
 
 ### 범위 파티셔닝
 
@@ -269,7 +269,7 @@ flowchart LR
 | PG | Processor | PoC 검증 |
 |---|---:|---|
 | PG-00 Trigger | 3 | 검증 |
-| PG-10 Run Coordinator | 10 | 검증(PostgreSQL 원천이라 SCN 조회 2개를 뺀 8개) |
+| PG-10 Run Coordinator | 10 | PostgreSQL 원천 V3로 검증(SCN 조회 2개를 뺀 8개). Oracle V4는 구성만 확인(dry-run) |
 | PG-20 Extract Worker | 9 (+ 선택 `ValidateRecord` 1) | 검증(`ValidateRecord` 제외) |
 | PG-05 Control Receiver | 6 | 검증(Job PG 안에 둔 형태) |
 | PG-40 Staging Validation | 15 | 입구 7개만 검증(Hive 없음) |
@@ -306,10 +306,11 @@ Concurrent Tasks와 Retry Count는 정수 스케줄링 설정이라 Parameter(`#
 | `META.JDBC.URL` | `jdbc:postgresql://meta:5432/nifiops` | N | 관리 DB. PG-90 이벤트 기록 전용 |
 | `META.JDBC.USER` | `nifi_runtime` | N | `load_event` INSERT 권한만 가진 계정 |
 | `META.JDBC.PASSWORD` | 미표시 | Y | 관리 DB 암호 |
+| `META.JDBC.DRIVER.PATH` | `/opt/nifi/jdbc/postgresql-42.7.3.jar` | N | 관리 DB(PostgreSQL) JDBC Driver. 원천과 드라이버가 다르므로 경로를 나눈다 |
 | `ORACLE.JDBC.URL` | `jdbc:oracle:thin:@//host:1521/service` | N | 원천 Oracle |
 | `ORACLE.JDBC.USER` | `nifi_reader` | N | 원천 조회 계정 |
 | `ORACLE.JDBC.PASSWORD` | 미표시 | Y | 원천 암호 |
-| `ORACLE.JDBC.DRIVER.PATH` | `/opt/nifi/jdbc/ojdbc11.jar` | N | JDBC Driver |
+| `ORACLE.JDBC.DRIVER.PATH` | `/opt/nifi/jdbc/ojdbc11.jar` | N | 원천 Oracle JDBC Driver |
 | `HIVE.JDBC.URL` | 환경별 HiveServer2 URL | N | HiveQL 실행 |
 | `HIVE.USER` | service account | N | Hive 계정 |
 | `HADOOP.CONF.FILES` | `core-site.xml,hdfs-site.xml` 절대경로 | N | PutHDFS |
@@ -318,7 +319,9 @@ Concurrent Tasks와 Retry Count는 정수 스케줄링 설정이라 Parameter(`#
 | `HDFS.PERMISSIONS.UMASK` | `027` | N | PutHDFS 생성 파일/경로 umask |
 | `HDFS.REPLICATION` | 환경 기본값 또는 `3` | N | 필요 시 PutHDFS replication override |
 | `WORKER.CONCURRENT.TASKS` | `2` | N | 노드당 추출 병렬도 기준값. Concurrent Tasks에는 참조할 수 없으므로 배포 시 정수로 입력 |
-| `ORACLE.POOL.MAX` | `8` | N | 전체 노드 정책과 맞춤 |
+| `ORACLE.POOL.MAX` | `8` | N | `CS_DBCP_ORACLE` 최대 연결 수. 전체 노드 정책과 맞춤 |
+| `ORACLE.NUMBER.DEFAULT.PRECISION` | `38` | N | 정밀도 없는 `NUMBER` 컬럼을 Parquet decimal로 쓸 때의 precision(PG-20 34, 4장) |
+| `ORACLE.NUMBER.DEFAULT.SCALE` | `10` | N | 같은 경우의 scale. `0`이면 소수점 이하가 잘린다 |
 | `EXTRACT.FETCH.SIZE` | `5000` | N | JDBC fetch size |
 | `EXTRACT.ROWS.PER.FILE` | `500000` | N | chunk 행 수, 부하 시험으로 조정 |
 | `EXTRACT.QUERY.TIMEOUT` | `60 min` | N | 파티션 query timeout |
@@ -334,9 +337,10 @@ run timeout, stale 판정, dispatch 재시도 같은 제어 설정은 NiFi Param
 | Parameter | 예시 | 설명 |
 |---|---|---|
 | `JOB.KEY` | `ORACLE_INSP_DTL_DAILY` | 관리용 고유 키 |
+| `BUSINESS.KEY` | `2026-09-28` | 선택. 재처리·시험용 고정 업무일자. 두면 PG-00 01이 `now()` 대신 이 값을 쓴다(PoC 빌더는 이 방식) |
 | `SRC.OWNER` | `APP` | Oracle owner |
 | `SRC.TABLE` | `INSP_DTL` | Oracle table |
-| `SRC.COLUMNS` | `COL_A,COL_B,...,INSP_DTL_SEQ` | 순서를 고정한 컬럼 목록 |
+| `SRC.COLUMNS` | `INSP_DTL_SEQ, BASE_DT, CAST(AMOUNT AS NUMBER(18,2)) AS AMOUNT, ...` | 순서를 고정한 컬럼 목록. 정밀도 없는 `NUMBER`는 `CAST(... AS NUMBER(p,s))`로 정밀도를 명시한다(4장) |
 | `SRC.SPLIT.COLUMN` | `INSP_DTL_SEQ` | split-by 대체 컬럼 |
 | `SRC.BASE.WHERE` | `BASE_DT = TO_DATE('${load.business.key}', 'YYYY-MM-DD')` | 승인된 고정 조건 템플릿. 업무키는 PG-00에서 형식을 고정한 값만 들어간다(6.2) |
 | `PARTITION.COUNT` | `8` | 논리 파티션 수 |
@@ -348,6 +352,8 @@ run timeout, stale 판정, dispatch 재시도 같은 제어 설정은 NiFi Param
 | `HIVE.TARGET.TABLE` | `INSP_DTL` | target table |
 | `HIVE.INSERT.COLUMNS` | 명시적 SELECT 컬럼 | `SELECT *` 금지 |
 | `TARGET.PARTITION.CLAUSE` | `PARTITION (BASE_DT='...')` | 전체 overwrite면 빈 값 |
+| `DQ.AMOUNT.COLUMN` | `AMOUNT` | 원천·stage·target 금액 합계 지표 컬럼(7.3, 10.3) |
+| `DQ.TIMESTAMP.COLUMN` | `REG_TS` | 시간대 해석 차이를 잡는 `MIN_TS`/`MAX_TS` 지표 컬럼(4장, 7.3, 10.3) |
 | `DQ.SOURCE.SQL` | 승인된 집계 SQL | count 외 검증 |
 | `DQ.STAGE.SQL` | 대응 Hive SQL | 동일 의미의 집계 |
 | `DQ.TARGET.SQL` | 대응 target SQL | 게시 후 검증 |
@@ -360,8 +366,8 @@ run timeout, stale 판정, dispatch 재시도 같은 제어 설정은 NiFi Param
 
 | 이름 | 구현 | 주요 설정 |
 |---|---|---|
-| `CS_DBCP_ORACLE` | `HikariCPConnectionPool` | URL/계정/ojdbc, Max Total=`${ORACLE.POOL.MAX}`, validation query=`SELECT 1 FROM DUAL` |
-| `CS_DBCP_META` | `HikariCPConnectionPool` | 관리 DB, `load_event` INSERT 전용(PG-90), Max Total 4~8 |
+| `CS_DBCP_ORACLE` | `HikariCPConnectionPool` | Driver Class=`oracle.jdbc.OracleDriver`, URL·계정·Driver 경로=`#{ORACLE.JDBC.*}`, Max Total=`#{ORACLE.POOL.MAX}`, validation query=`SELECT 1 FROM DUAL` |
+| `CS_DBCP_META` | `HikariCPConnectionPool` | 관리 DB(PostgreSQL), `load_event` INSERT 전용(PG-90). Driver Class=`org.postgresql.Driver`, URL·계정·Driver 경로=`#{META.JDBC.*}`, validation query=`SELECT 1`, Max Total 4~8 |
 | `CS_HIVE3_DBCP` | CFM 제공 Hive Connection Pool | HiveServer2의 실제 인증 방식 적용. Apache NiFi 2.x에는 Hive 구성요소가 없으므로 CFM 4.12.0 제공 이름을 확정 |
 | `CS_JSON_WRITER_ARRAY` | `JsonRecordSetWriter` | Output Grouping=`Array`, pretty print=false |
 | `CS_PARQUET_WRITER` | `ParquetRecordSetWriter` | Schema=`Inherit Record Schema`, compression=`SNAPPY` |
@@ -376,6 +382,8 @@ run timeout, stale 판정, dispatch 재시도 같은 제어 설정은 NiFi Param
 운영 데이터에는 schema inference를 사용하지 않는다. Oracle JDBC schema를 상속하되, Oracle `NUMBER`, `DATE`, `TIMESTAMP`, CLOB 처리 결과가 Hive DDL과 일치하는지 사전 시험하고 필요하면 `ConvertRecord`를 추가해 명시적 schema로 변환한다.
 
 추출 `ExecuteSQLRecord`에는 `Use Avro Logical Types=true`를 명시한다. 기본값 `false`이면 DATE, TIMESTAMP, DECIMAL이 문자열로 기록되어 Hive DDL과 어긋난다.
+
+Oracle의 정밀도 없는 `NUMBER` 컬럼은 JDBC가 precision 0으로 알려 주므로, `ExecuteSQLRecord`의 Default Decimal Precision/Scale(기본 10, 0)로 기록된다. 기본값 그대로면 소수점 이하가 잘리거나 큰 값이 깨질 수 있다. 원천 컬럼은 `SRC.COLUMNS`에서 `CAST(col AS NUMBER(p,s))`로 정밀도를 명시하고, 남는 경우를 위해 34의 Default Decimal Precision/Scale을 `#{ORACLE.NUMBER.DEFAULT.PRECISION}`/`#{ORACLE.NUMBER.DEFAULT.SCALE}`로 지정한다. Oracle `DATE`는 시각까지 담고 있어 Parquet에 timestamp로 기록되므로 아래 시간대 규칙을 똑같이 적용한다.
 
 시간대가 없는 원천 `DATE`/`TIMESTAMP`는 JDBC가 NiFi JVM 기본 시간대로 해석한다. 그 결과 Parquet에는 UTC로 변환된 `TIMESTAMP_MILLIS (isAdjustedToUTC=true)`로 기록된다. NiFi 2.4.0 PoC에서 JVM 시간대가 KST일 때 원천 `2026-09-28 00:00:01`이 `2026-09-27T15:00:01Z`로 저장됐고, 마이크로초 이하 정밀도는 버려졌다. Hive가 이 값을 읽는 방식은 Hive 버전과 parquet timestamp 설정에 따라 다르며, 건수 검증으로는 이 차이를 잡을 수 없다. 따라서 다음을 지킨다.
 
@@ -856,14 +864,14 @@ flowchart TD
 | 14 | `ExecuteSQLRecord` | Primary, 1 | `CS_DBCP_ORACLE`, `SELECT TO_CHAR(CURRENT_SCN) AS SNAPSHOT_SCN FROM V$DATABASE`, `CS_JSON_WRITER_ARRAY` | success→15, failure→`errors` |
 | 15 | `EvaluateJsonPath` | Primary, 1 | `load.snapshot.scn=$[0].SNAPSHOT_SCN`, Destination=flowfile-attribute | matched→16, unmatched/failure→`errors` |
 | 16 | `ExecuteSQLRecord` | Primary, 1 | `CS_DBCP_ORACLE`, 원천 지표+manifest SQL(7.3), JSON array writer, Max Wait Time=`#{EXTRACT.QUERY.TIMEOUT}` | success→17, failure→`errors` |
-| 17 | `JoltTransformJSON` | Primary, 1 | 0번 행에서 원천 지표를 꺼내고 배열을 `partitions`로 감싼다(아래 spec) | success→18, failure→`errors` |
+| 17 | `JoltTransformJSON` | Primary, 1 | 0번 행에서 SCN과 원천 지표를 꺼내고 배열을 `partitions`로 감싼다(아래 spec) | success→18, failure→`errors` |
 | 18 | `InvokeHTTP` | Primary, 1 | 9.2 공통 설정, URL=`#{CONTROL.API.URL}/runs/${load.run.id}/manifest`. `Response Body Attribute Name`은 비워 응답을 content로 받음 | Response→19, No Retry/Retry/Failure→`errors`, Original→auto-terminate |
 | 19 | `SplitJson` | Primary, 1 | JsonPath Expression=`$.dispatchPartitions` | split→20, failure→`errors` |
 | 20 | `EvaluateJsonPath` | Primary, 1 | `partition.id=$.partitionId`, `partition.lower=$.lowerBound`, `partition.upper=$.upperBound`, `partition.upper.inclusive=$.upperInclusive`, `partition.is.null=$.isNullPartition`, `partition.expected.rows=$.expectedRowCount` | matched→`partitions`, unmatched/failure→`errors` |
 
 `V$DATABASE` 조회 권한이 없으면 14를 `SELECT TO_CHAR(DBMS_FLASHBACK.GET_SYSTEM_CHANGE_NUMBER) AS SNAPSHOT_SCN FROM DUAL`로 바꾼다. 16은 SCN이 숫자가 아니면 SQL 오류로 실패하도록 `${load.snapshot.scn:matches('^[0-9]+$'):ifElse(${load.snapshot.scn},'INVALID_SCN')}`로 넣는다. 숫자 검증용 `RouteOnAttribute`를 따로 두지 않는다.
 
-17 `JoltTransformJSON` spec(Jolt Specification은 FlowFile attribute EL을 지원한다). shift는 `"0"`과 `"*"`가 같은 키에 맞으면 `"0"`만 적용하므로, 0번 행에도 파티션 필드 매핑을 함께 둔다.
+17 `JoltTransformJSON` spec. SCN과 계획 파티션 수도 16의 SQL 결과 컬럼(`SNAPSHOT_SCN`, `PLANNED_PARTITION_COUNT`)에서 가져오므로 spec에 EL이나 Parameter가 없다. Oracle은 따옴표 없는 별칭을 대문자로 돌려주므로 키는 대문자다. shift는 `"0"`과 `"*"`가 같은 키에 맞으면 `"0"`만 적용하므로, 0번 행에도 파티션 필드 매핑을 함께 둔다.
 
 ```json
 [
@@ -876,6 +884,7 @@ flowchart TD
         "UPPER_INCLUSIVE": "partitions[&1].upperInclusive",
         "IS_NULL_PARTITION": "partitions[&1].isNullPartition",
         "EXPECTED_ROW_COUNT": "partitions[&1].expectedRowCount",
+        "SNAPSHOT_SCN": "snapshotScn",
         "SOURCE_COUNT": "sourceCount",
         "SOURCE_NULL_SPLIT_COUNT": "sourceNullSplitCount",
         "SOURCE_MIN": "sourceMinSplit",
@@ -890,9 +899,7 @@ flowchart TD
         "UPPER_BOUND": "partitions[&1].upperBound",
         "UPPER_INCLUSIVE": "partitions[&1].upperInclusive",
         "IS_NULL_PARTITION": "partitions[&1].isNullPartition",
-        "EXPECTED_ROW_COUNT": "partitions[&1].expectedRowCount" } } },
-  { "operation": "default",
-    "spec": { "snapshotScn": "${load.snapshot.scn}" } }
+        "EXPECTED_ROW_COUNT": "partitions[&1].expectedRowCount" } } }
 ]
 ```
 
@@ -902,18 +909,15 @@ flowchart TD
 
 ### 7.3 원천 지표와 Manifest SQL
 
-원천 지표와 파티션별 예상 건수를 한 문장에서 같은 SCN으로 계산한다. 한 문장이므로 지표와 파티션 건수가 같은 시점 값임이 보장된다. 업무 조건은 `#{SRC.BASE.WHERE}`(3.2)로 넣는다.
+원천 지표와 파티션별 예상 건수를 한 문장에서 같은 SCN으로 계산한다. 한 문장이므로 지표와 파티션 건수가 같은 시점 값임이 보장된다. 아래는 16의 SQL Query 속성 그대로다(`poc/build_flow_v4.py` 16). `@SCN@`은 7.2의 숫자 검증 식 `${load.snapshot.scn:matches('^[0-9]+$'):ifElse(${load.snapshot.scn},'INVALID_SCN')}`로 바꿔 넣는다.
 
 ```sql
 WITH m AS (
-  SELECT COUNT(*) AS source_count,
-         COUNT(*) - COUNT(INSP_DTL_SEQ) AS null_cnt,
-         NVL(MIN(INSP_DTL_SEQ), 0) AS mn,
-         NVL(MAX(INSP_DTL_SEQ), 0) AS mx,
-         NVL(SUM(<BUSINESS_AMOUNT>), 0) AS amount_sum,
-         MIN(<BUSINESS_TIMESTAMP>) AS min_ts,
-         MAX(<BUSINESS_TIMESTAMP>) AS max_ts
-    FROM APP.INSP_DTL AS OF SCN ${load.snapshot.scn}
+  SELECT COUNT(*) AS source_count, COUNT(*) - COUNT(#{SRC.SPLIT.COLUMN}) AS null_cnt,
+         NVL(MIN(#{SRC.SPLIT.COLUMN}), 0) AS mn, NVL(MAX(#{SRC.SPLIT.COLUMN}), 0) AS mx,
+         NVL(SUM(#{DQ.AMOUNT.COLUMN}), 0) AS amount_sum,
+         MIN(#{DQ.TIMESTAMP.COLUMN}) AS min_ts, MAX(#{DQ.TIMESTAMP.COLUMN}) AS max_ts
+    FROM #{SRC.OWNER}.#{SRC.TABLE} AS OF SCN @SCN@
    WHERE #{SRC.BASE.WHERE}
 ), g AS (
   SELECT LEVEL - 1 AS pid FROM DUAL CONNECT BY LEVEL <= #{PARTITION.COUNT}
@@ -925,30 +929,34 @@ WITH m AS (
          CASE WHEN g.pid = #{PARTITION.COUNT} - 1 THEN 1 ELSE 0 END AS incl
     FROM m CROSS JOIN g
 ), c AS (
-  SELECT b.*,
-         (SELECT COUNT(*) FROM APP.INSP_DTL AS OF SCN ${load.snapshot.scn} s
+  SELECT b.pid, b.lo, b.hi, b.incl,
+         (SELECT COUNT(*) FROM #{SRC.OWNER}.#{SRC.TABLE} AS OF SCN @SCN@ s
            WHERE #{SRC.BASE.WHERE}
-             AND s.INSP_DTL_SEQ >= b.lo
-             AND (s.INSP_DTL_SEQ < b.hi OR (b.incl = 1 AND s.INSP_DTL_SEQ = b.hi))) AS cnt
+             AND s.#{SRC.SPLIT.COLUMN} >= b.lo
+             AND (s.#{SRC.SPLIT.COLUMN} < b.hi OR (b.incl = 1 AND s.#{SRC.SPLIT.COLUMN} = b.hi))) AS cnt
     FROM b
 )
 SELECT LPAD(c.pid, 4, '0') AS PARTITION_ID,
        TO_CHAR(c.lo) AS LOWER_BOUND, TO_CHAR(c.hi) AS UPPER_BOUND,
        CASE c.incl WHEN 1 THEN 'true' ELSE 'false' END AS UPPER_INCLUSIVE,
-       'false' AS IS_NULL_PARTITION, c.cnt AS EXPECTED_ROW_COUNT,
-       m.source_count AS SOURCE_COUNT, m.null_cnt AS SOURCE_NULL_SPLIT_COUNT,
+       'false' AS IS_NULL_PARTITION, TO_CHAR(c.cnt) AS EXPECTED_ROW_COUNT,
+       TO_CHAR(@SCN@) AS SNAPSHOT_SCN,
+       TO_CHAR(m.source_count) AS SOURCE_COUNT, TO_CHAR(m.null_cnt) AS SOURCE_NULL_SPLIT_COUNT,
        TO_CHAR(m.mn) AS SOURCE_MIN, TO_CHAR(m.mx) AS SOURCE_MAX,
-       #{PARTITION.COUNT} AS PLANNED_PARTITION_COUNT,
+       TO_CHAR(#{PARTITION.COUNT}) AS PLANNED_PARTITION_COUNT,
        TO_CHAR(m.amount_sum) AS AMOUNT_SUM,
-       TO_CHAR(m.min_ts, 'YYYY-MM-DD HH24:MI:SS.FF6') AS MIN_TS,
-       TO_CHAR(m.max_ts, 'YYYY-MM-DD HH24:MI:SS.FF6') AS MAX_TS
+       TO_CHAR(m.min_ts, 'YYYY-MM-DD HH24:MI:SS') AS MIN_TS,
+       TO_CHAR(m.max_ts, 'YYYY-MM-DD HH24:MI:SS') AS MAX_TS
   FROM c CROSS JOIN m
  ORDER BY c.pid
 ```
 
-실제 구현에서는 `APP.INSP_DTL`, 컬럼, WHERE 부분을 Job Parameter로 치환한다. `${load.snapshot.scn}` 자리에는 7.2의 숫자 검증 식을 쓴다. 원천이 0건이면 경계를 0으로 두고 모든 파티션의 예상 건수가 0이 된다. 허용 여부는 API가 `allowEmptySource`로 판정한다.
+- 숫자와 SCN은 모두 `TO_CHAR`로 문자열로 반환한다. API는 숫자 문자열을 정수로 받아들인다(API 설계 9.4). boolean은 Oracle 19c 이하에 SQL 타입이 없으므로 `'true'`/`'false'` 문자열이며 API가 boolean으로 받는다.
+- `MIN_TS`/`MAX_TS`는 초 단위 형식(`YYYY-MM-DD HH24:MI:SS`)이다. `DATE` 컬럼에는 소수 초 형식(`FF`)을 쓸 수 없기 때문이다. stage·target 지표도 같은 형식으로 만든다(10.3). `TIMESTAMP` 컬럼의 소수 초까지 비교해야 하면 양쪽 모두 `FF6`/`.SSSSSS` 형식으로 바꾼다.
+- 원천이 0건이면 경계를 0으로 두고 모든 파티션의 예상 건수가 0이 된다. 허용 여부는 API가 `allowEmptySource`로 판정한다.
+- NULL 파티션(`SPLIT.NULL.POLICY=SEPARATE`)은 위 SQL에 없다. 필요하면 `IS NULL` 행을 `UNION ALL`로 추가한다(7.4).
 
-이 구조는 PostgreSQL 원천 PoC(`poc/build_flow_v3.py` 14번)로 검증했다. Oracle 문법(`AS OF SCN`, `CONNECT BY`, 상관 서브쿼리)은 PoC 범위 밖이므로 대상 DB에서 실행 계획과 함께 확인한다. 파티션마다 상관 서브쿼리가 원천을 다시 읽으므로, split 컬럼과 업무 조건에 맞는 인덱스가 없으면 `GROUP BY` 방식(`WIDTH_BUCKET` 등으로 버킷을 계산해 한 번에 집계)으로 바꾼다.
+이 구조는 PostgreSQL 원천 V3(`poc/build_flow_v3.py` 14)로 NiFi 2.4.0에서 검증했다. 위 Oracle SQL은 V4(`poc/build_flow_v4.py` 16)에 그대로 들어 있으나 Oracle 환경에서 실행하지 않았다. 대상 DB에서 실행 계획과 함께 확인한다. 파티션마다 상관 서브쿼리가 원천을 다시 읽으므로, split 컬럼과 업무 조건에 맞는 인덱스가 없으면 `GROUP BY` 방식(`WIDTH_BUCKET` 등으로 버킷을 계산해 한 번에 집계)으로 바꾼다.
 
 ### 7.4 Manifest SQL 원칙
 
@@ -960,7 +968,7 @@ N-1    : split_column >= lower AND split_column <= upper
 NULL    : split_column IS NULL, SPLIT.NULL.POLICY=SEPARATE일 때만
 ```
 
-각 range의 `EXPECTED_ROW_COUNT`를 동일 SCN에서 계산한다. 결과 컬럼 이름은 17의 Jolt spec과 일치해야 한다. `LOWER_BOUND`, `UPPER_BOUND`, SCN, 원천 최솟값·최댓값은 `TO_CHAR(...)`로 문자열로 반환한다. `NUMBER(38)` 값이 JSON 숫자로 바뀌며 정밀도를 잃는 것을 막기 위해서다. `SPLIT.NULL.POLICY=SEPARATE`이면 `IS NULL` 파티션 행을 `UNION ALL`로 추가하고 `PLANNED_PARTITION_COUNT`에 1을 더한다.
+각 range의 `EXPECTED_ROW_COUNT`를 동일 SCN에서 계산한다. 결과 컬럼 이름은 17의 Jolt spec과 일치해야 한다. 경계, 건수, SCN, 원천 지표는 모두 `TO_CHAR(...)`로 문자열로 반환한다. `NUMBER(38)` 값이 JSON 숫자로 바뀌며 정밀도를 잃는 것을 막기 위해서다. `SPLIT.NULL.POLICY=SEPARATE`이면 `IS NULL` 파티션 행을 `UNION ALL`로 추가하고 `PLANNED_PARTITION_COUNT`에 1을 더한다.
 
 불변식은 API가 `POST /manifest`에서 한 트랜잭션으로 검증한다(API 설계 3.4).
 
@@ -1069,6 +1077,9 @@ SELECT #{SRC.COLUMNS}
 | Output Batch Size | `0` |
 | Max Wait Time | `#{EXTRACT.QUERY.TIMEOUT}` |
 | Use Avro Logical Types | `true` (DATE/TIMESTAMP/DECIMAL 타입 유지, 4장 참조) |
+| Default Decimal Precision | `#{ORACLE.NUMBER.DEFAULT.PRECISION}` (정밀도 없는 `NUMBER`, 4장) |
+| Default Decimal Scale | `#{ORACLE.NUMBER.DEFAULT.SCALE}` |
+| Set Auto Commit | `true` (기본값. Oracle은 autocommit과 무관하게 Fetch Size를 적용한다) |
 | Retry Count | `0` (16장) |
 | Concurrent Tasks | `WORKER.CONCURRENT.TASKS` 기준값을 정수로 입력 (Parameter 참조 불가) |
 | Execution | All Nodes |
@@ -1348,8 +1359,8 @@ WITH s AS (
          SUM(CASE WHEN INSP_DTL_SEQ IS NULL THEN 1 ELSE 0 END) AS null_cnt,
          COUNT(*) - COUNT(DISTINCT <BUSINESS_PK>) AS dup_cnt,
          SUM(<BUSINESS_AMOUNT>) AS amount_sum,
-         CAST(MIN(<BUSINESS_TIMESTAMP>) AS STRING) AS min_ts,
-         CAST(MAX(<BUSINESS_TIMESTAMP>) AS STRING) AS max_ts
+         DATE_FORMAT(MIN(<BUSINESS_TIMESTAMP>), 'yyyy-MM-dd HH:mm:ss') AS min_ts,
+         DATE_FORMAT(MAX(<BUSINESS_TIMESTAMP>), 'yyyy-MM-dd HH:mm:ss') AS max_ts
     FROM #{HIVE.STAGE.DB}.${load.stage.table}
 )
 SELECT 'ROW_COUNT' AS metric_name, '${load.source.count}' AS expected_value, CAST(cnt AS STRING) AS actual_value,
@@ -1367,7 +1378,7 @@ UNION ALL
 SELECT 'MAX_TS', '${validation.source.MAX_TS}', max_ts, IF(max_ts = '${validation.source.MAX_TS}', 'PASS', 'FAIL') FROM s
 ```
 
-`MIN_TS`/`MAX_TS`는 원천(7.3)과 같은 형식의 문자열로 비교한다. 시간대 해석이 어긋나면 count는 같아도 이 지표가 불일치한다(4장). Hive는 결과 컬럼 이름을 소문자로 돌려주므로 4A의 Jolt spec은 소문자 이름(`metric_name` 등)을 `metricName` 등으로 옮긴다. CTE가 지표마다 다시 계산되면 `hive.optimize.cte.materialize.threshold`로 한 번만 계산하게 한다.
+`MIN_TS`/`MAX_TS`는 원천(7.3)과 같은 형식(`yyyy-MM-dd HH:mm:ss`)의 문자열로 비교한다. `CAST(... AS STRING)`은 소수 초를 붙일 수 있어 원천 형식과 달라지므로 `DATE_FORMAT`으로 맞춘다. 시간대 해석이 어긋나면 count는 같아도 이 지표가 불일치한다(4장). Hive는 결과 컬럼 이름을 소문자로 돌려주므로 4A의 Jolt spec은 소문자 이름(`metric_name` 등)을 `metricName` 등으로 옮긴다. CTE가 지표마다 다시 계산되면 `hive.optimize.cte.materialize.threshold`로 한 번만 계산하게 한다.
 
 4B는 지표별 PASS/FAIL을 모두 보고한다. FAIL이 있어도 먼저 기록한 뒤 4D에서 판정한다. API는 NiFi의 판정을 그대로 믿지 않고, 저장된 STAGING 지표가 모두 PASS일 때만 `STAGE_VALIDATING → STAGING_VALIDATED`로 CAS 갱신하고 `stageValidated=true`를 돌려준다.
 

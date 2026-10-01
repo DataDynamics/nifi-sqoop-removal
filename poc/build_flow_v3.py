@@ -206,6 +206,13 @@ def p(g, key, name, short, props=None, col=0, row=0, tasks=1, sched="0 sec", sen
     return key
 
 
+def label(g, text, x, y, width, height):
+    """PG 설명 Label. Processor 영역 위쪽에 둔다."""
+    call("POST", f"/process-groups/{g}/labels", {"revision": REV, "component": {
+        "label": text, "position": {"x": x, "y": y}, "width": width, "height": height,
+        "style": {"font-size": "14px"}}})
+
+
 def port(g, name, kind, col, row):
     path = "input-ports" if kind == "in" else "output-ports"
     ent = call("POST", f"/process-groups/{g}/{path}",
@@ -276,6 +283,53 @@ G20 = new_pg(TOP, "PG-20 Extract Worker", 0, 520, "claim, 파티션 추출, PutH
 G05 = new_pg(TOP, "PG-05 Control Receiver", 700, 0, "API worker의 validate/reissue 호출 수신")
 G40 = new_pg(TOP, "PG-40 Staging Validation", 700, 260, "/validation/start, _SUCCESS marker (Hive 단계 자리)")
 G90 = new_pg(TOP, "PG-90 Error and Event", 700, 520, "공통 오류 정규화, 실패 보고 API, load_event 기록")
+
+# 각 PG 안 위쪽에 역할·흐름·입출력·주의점을 적은 Label을 둔다. 상위 PG에는 전체 흐름 Label을 둔다.
+PG_LABELS = {
+    G00: """PG-00 Trigger
+역할: 스케줄마다 적재 실행을 시작한다.
+흐름: 00 트리거 → 01 Job 키·업무일자 설정(load.stage=RUN_CREATE) → 02 업무일자 형식 검증
+출력: start-run → PG-10 / errors → PG-90
+주의: 00은 DISABLED로 배포하고 운영 전환 시 enable한다. 업무일자는 SQL에 들어가므로 02의 정규식이 SQL 주입을 막는 경계다.""",
+    G10: """PG-10 Run Coordinator
+역할: Load Control API에 run을 만들고, 원천 지표와 파티션 manifest를 계산해 등록한다.
+흐름: 11·12 run 생성(POST /runs) → 13 run 정보 설정(load.stage=MANIFEST) → 14 원천 지표+manifest SQL 1문장
+      → 15 요청 변환(Jolt) → 16 manifest 등록(API가 불변식 검사) → 17·18 파티션별 FlowFile
+입력: start-run / 출력: partitions → PG-20(Round Robin), errors → PG-90
+주의: 0건 파티션은 API가 바로 SUCCESS 처리해 Worker로 보내지 않는다. 12의 409는 같은 업무일자의 활성 run(중복 실행)이다.""",
+    G20: """PG-20 Extract Worker
+역할: 파티션을 claim하고 원천을 조회해 Parquet로 HDFS에 쓴 뒤 chunk마다 API에 보고한다.
+흐름: 30 claim token(load.stage=EXTRACT) → 31·32 claim → 33 소유 확인 → 34 파티션 조회(Parquet chunk)
+      → 35 파일 이름(load.stage=CHUNK_WRITE) → 36 PutHDFS → 37·38 chunk 보고
+입력: partitions(PG-10 manifest, PG-05 재발행) / 출력: errors → PG-90
+주의: 파티션·run 완료 판정과 검증 호출 예약은 API가 한다. claimed=false는 정상 경합이므로 조용히 끝낸다.""",
+    G05: """PG-05 Control Receiver
+역할: Load Control API worker가 보내는 검증 시작·파티션 재발행 요청을 받는다.
+흐름: 05 HTTP 수신(/validate·/reissue/<Job>) → 06 헤더 검증(07: 400 응답) → 08 202 응답 → 09 본문 추출 → 10 동작별 분기
+출력: validate → PG-40, reissue → PG-20, errors → PG-90
+주의: 202를 먼저 응답한다. 처리 확인(ACK)은 PG-40의 /validation/start 또는 PG-20의 재 claim이다.
+      운영에서는 root에 두고 여러 Job이 공유한다(가이드 9.5).""",
+    G40: """PG-40 Staging Validation (입구)
+역할: API에 검증 시작을 알리고 run 경로에 _SUCCESS marker를 쓴다.
+흐름: 40 load.stage=VALIDATION_START → 41·42 검증 시작(POST /validation/start) → 43 started 확인
+      → 44 run 정보 → 45·46 _SUCCESS 기록
+입력: validate / 출력: errors → PG-90
+주의: started=true는 run당 한 번만 온다(중복 요청은 조용히 종료). Hive staging 검증(가이드 10장 47 이후)은
+      이 PoC 환경에 없어 46에서 끝난다.""",
+    G90: """PG-90 Error and Event
+역할: 모든 PG의 실패를 한 곳에서 처리한다.
+흐름: 90 오류 정규화(load.stage, HTTP 상태, SQL 오류, 연결 예외 → 코드·수준·메시지) → 91 분기
+      → 92·93 run 실패 보고(MANIFEST 단계) / 94·95 파티션 실패 보고(claim한 파티션) → 96 load_event 기록 → 97 로그
+입력: errors(모든 PG)
+주의: 409(중복 실행, CLAIM_MISMATCH)는 정상 경합이므로 WARN. 상태 전이 이벤트는 API가 기록하므로 여기서는 오류·경고만 남긴다.""",
+}
+for g, text in PG_LABELS.items():
+    label(g, text, 0, -2 * ROWH, 5 * COLW, 170)
+label(TOP, """SQOOP_REPLACEMENT_POC_V3 — Load Control API 연동 Sqoop 대체 PoC
+PG-00 →(start-run)→ PG-10 →(partitions, Round Robin)→ PG-20 → API가 완료 판정 → API worker가 PG-05 호출
+PG-05 →(validate)→ PG-40,  PG-05 →(reissue, Round Robin)→ PG-20,  모든 PG →(errors)→ PG-90
+원장 기록·완료 판정은 Load Control API가 하고, NiFi는 데이터 처리와 API 호출만 한다.
+상세: nifi-sqoop-removal-guide.md 2장, poc/REVIEW.md 6장""", 0, -230, 1100, 150)
 
 # ===== PG-00 Trigger
 port(G00, "start-run", "out", 3, 0)

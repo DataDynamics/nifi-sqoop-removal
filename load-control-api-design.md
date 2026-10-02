@@ -22,17 +22,124 @@ NiFi (검증)  : 호출을 받아 staging 검증 → 게시 → target 검증, �
 flowchart LR
     C[NiFi PG-10] -- "POST /runs, /manifest" --> API
     W[NiFi PG-20] -- "claim, chunks" --> API
-    API[api 프로세스] --- DB[(PostgreSQL nifi_ops)]
+    API[server 프로세스] --- DB[(PostgreSQL nifi_ops)]
     WK[worker 프로세스<br/>dispatcher + sweeper] --- DB
     WK -- "POST /validate/{jobKey}" --> R[NiFi PG-05]
     R --> V[NiFi PG-40~60]
     V -- "start, validations, publish, success" --> API
 ```
 
-| 프로세스 | 역할 | 실행 |
+### 2.1 server와 worker
+
+| | server | worker |
 |---|---|---|
-| `api` | HTTP 엔드포인트. 판정과 상태 변경 | `bin/start.sh server`. 운영은 2개 이상을 LB 뒤에 |
-| `worker` | dispatcher(NiFi 호출 전달), sweeper(멈춘 작업 정리) | `bin/start.sh worker`. 2개를 띄워도 중복 처리하지 않는다 |
+| 실행 | `bin/start.sh server`(`python -m load_control.server`). 운영은 2개 이상을 LB 뒤에 | `bin/start.sh worker`(`python -m load_control.worker`). 2개를 띄워도 중복 처리하지 않는다 |
+| 동작 방식 | 요청이 와야 일한다 | 요청과 관계없이 계속 돈다 |
+| 하는 일 | NiFi·운영자의 HTTP 요청 처리: run 생성, claim, chunk 보고, 완료 판정, 검증·게시 결과 기록 | **dispatcher**: `load_dispatch`(outbox)의 호출 요청을 NiFi PG-05로 보낸다(5장)<br>**sweeper**: 멈춘 파티션·run, ACK 없는 dispatch, 정체된 검증·게시를 찾는다(8장) |
+| 외부 호출 | 하지 않는다(DB만 쓴다) | NiFi PG-05로 HTTP 호출 |
+| 로그·메트릭 | `logs/server.log`, API 포트의 `/metrics` | `logs/worker.log`, `worker.metrics_port`의 `/metrics` |
+
+나눈 이유:
+
+1. **API 응답이 NiFi 상태에 묶이지 않는다.** server는 완료를 판정한 트랜잭션에서 `load_dispatch` 행만 만들고 바로 응답한다. NiFi 호출은 worker가 커밋 뒤에 한다. NiFi가 느리거나 멈춰도 보고 요청은 바로 끝나고, 판정과 호출 요청이 함께 커밋되거나 함께 롤백된다.
+2. **요청이 없을 때 감시가 필요하다.** run이 멈추면 NiFi에서 요청이 오지 않는다. 이것을 찾아내려면 요청과 관계없이 도는 프로세스가 있어야 한다.
+3. **규모를 따로 정한다.** server는 부하에 맞춰 늘리고, 백그라운드 작업은 server 수만큼 중복되지 않는다(dispatcher는 lease, sweeper는 advisory lock).
+4. **장애가 번지지 않는다.** worker를 재시작해도 NiFi 보고는 계속 받고, server를 재시작해도 쌓인 dispatch 전송과 감시는 이어진다.
+
+server와 worker는 서로 직접 통신하지 않는다. 둘 다 PostgreSQL만 보며, server가 dispatch 행을 만들면 `pg_notify`로 worker를 깨운다.
+
+### 2.2 정상 흐름
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant N as NiFi
+    participant S as server
+    participant DB as PostgreSQL
+    participant W as worker
+
+    Note over N: PG-10 Run Coordinator
+    N->>S: POST /v1/runs
+    S->>DB: load_run 생성(CREATED)
+    S-->>N: run_id, run 경로, staging 테이블
+    N->>S: POST /runs/{id}/manifest(SCN, 원천 건수, 파티션)
+    S->>DB: 파티션 등록(EXTRACTING)
+
+    Note over N: PG-20 Extract Worker(파티션마다 병렬)
+    loop 파티션마다
+        N->>S: POST .../partitions/{pid}/claim
+        S->>DB: PENDING → RUNNING(CAS, claim token)
+        S-->>N: claim token
+        N->>S: POST .../partitions/{pid}/chunks
+        S->>DB: chunk 기록, 파티션 완료 판정
+    end
+    Note over S,DB: 마지막 보고: 합계 = 원천 건수
+    S->>DB: EXTRACTED_VALIDATED + load_dispatch(PENDING), 같은 트랜잭션
+    S-->>N: 200
+    DB-)W: pg_notify
+
+    W->>DB: dispatch 선점(FOR UPDATE SKIP LOCKED, lease)
+    W->>N: POST {receiver_url}/validate/{jobKey}(PG-05)
+    N-->>W: 202
+    W->>DB: SENT
+
+    Note over N: PG-40 Staging Validation
+    N->>S: POST /runs/{id}/validation/start
+    S->>DB: EXTRACTED_VALIDATED → STAGE_VALIDATING(CAS), dispatch ACKED
+    S-->>N: started=true, 기대값
+    N->>S: POST /runs/{id}/validations(STAGING)
+    N->>S: POST /runs/{id}/stage-validated
+    S->>DB: STAGING_VALIDATED
+
+    Note over N: PG-50 Publish
+    N->>S: POST /runs/{id}/publish/claim
+    S->>DB: PUBLISHING(publish token)
+    N->>S: POST /runs/{id}/publish/result
+    S->>DB: PUBLISHED
+
+    Note over N: PG-60 Target Validation
+    N->>S: POST /runs/{id}/validations(TARGET)
+    N->>S: POST /runs/{id}/success
+    S->>DB: SUCCESS
+```
+
+### 2.3 장애 흐름
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant N as NiFi
+    participant S as server
+    participant DB as PostgreSQL
+    participant W as worker
+    actor O as 운영자
+
+    Note over W,N: 전송 실패
+    W->>N: POST /validate/{jobKey}
+    N--xW: 연결 실패 또는 5xx
+    W->>DB: PENDING, 다음 시도 시각(backoff)
+    W->>N: 재시도
+    Note over W: 최대 시도 초과 또는 4xx
+    W->>DB: DEAD, DISPATCH_DEAD 이벤트
+    O->>S: POST /dispatches/{did}/resend(TUI x 또는 s)
+    S->>DB: PENDING으로 되돌림
+    DB-)W: pg_notify, 다시 전송
+
+    Note over W,N: 202 뒤 NiFi 노드 장애
+    W->>DB: sweeper: SENT 후 ack_timeout 동안 ACK 없음 → PENDING
+    W->>N: dispatcher가 다시 전송
+    N->>S: POST /validation/start(두 번 올 수 있다)
+    S-->>N: 첫 요청만 started=true, 나머지는 started=false
+
+    Note over W,DB: 추출 정체
+    W->>DB: heartbeat가 recovery.stale보다 오래된 RUNNING 파티션
+    W->>DB: mode=FAIL이면 run TIMED_OUT, REISSUE면 RETRY와 재발행 dispatch
+
+    Note over W,DB: 게시 결과 불명
+    W->>DB: PUBLISHING이 publish_stale 경과 → PUBLISH_UNKNOWN
+    O->>S: POST /publish-unknown/resolve(TUI x 또는 p)
+    S->>DB: PUBLISHED 또는 FAILED_PUBLISH
+```
 
 ## 3. 상태
 

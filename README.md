@@ -6,21 +6,31 @@
 
 AS-IS 처리는 다음 순서로 동작한다.
 
-```text
-Oracle
-  → Sqoop 병렬 Import
-  → HDFS 적재
-  → HDFS 경로 기반 Hive External 임시 테이블
-  → 원본 테이블 INSERT OVERWRITE
-  → 원천/대상 건수 검증
+```mermaid
+flowchart LR
+    A[(Oracle)] --> B[Sqoop 병렬 Import]
+    B --> C[HDFS 적재]
+    C --> D[HDFS 경로 기반<br/>Hive External 임시 테이블]
+    D --> E[원본 테이블<br/>INSERT OVERWRITE]
+    E --> F[원천/대상<br/>건수 검증]
 ```
 
 TO-BE에서는 Sqoop Mapper가 담당하던 분할 조회와 병렬 실행을 NiFi Flow로, 실패 전파와 전체 작업 완료 판정을 Load Control API(Python FastAPI)와 PostgreSQL 영속 관리 테이블로 구현한다.
 
-```text
-NiFi             : Oracle 병렬 조회 → Parquet → HDFS 기록 → chunk마다 API에 보고
-Load Control API : 보고 기록 → 파티션·run 완료 판정 → 검증 flow 호출(run당 1회)
-NiFi 검증 flow    : Hive staging 검증 → INSERT OVERWRITE → Target 검증 → 결과를 API에 보고
+```mermaid
+flowchart LR
+    subgraph N1[NiFi]
+        A[(Oracle)] --> B[병렬 조회] --> C[Parquet] --> D[HDFS 기록]
+    end
+    subgraph API[Load Control API]
+        E[보고 기록] --> F[파티션·run<br/>완료 판정]
+    end
+    subgraph N2[NiFi 검증 flow]
+        G[Hive staging 검증] --> H[INSERT OVERWRITE] --> I[Target 검증]
+    end
+    D -->|chunk마다 보고| E
+    F -->|검증 flow 호출<br/>run당 1회| G
+    I -->|결과 보고| API
 ```
 
 ## 설계 목표

@@ -35,7 +35,8 @@ async def summary(conn: AsyncConnection, settings: Settings, *, alert_limit: int
         dispatches=await dispatch.backlog(conn), cleanup_due=len(due),
         alerts=[Alert(kind=a.kind, severity=a.severity, run_id=str(a.run_id) if a.run_id else None,
                       job_key=a.job_key, business_key=a.business_key, status=a.status, at=a.at,
-                      message=(a.message or "").strip()[:500] or None) for a in alerts])
+                      message=(a.message or "").strip()[:500] or None,
+                      dispatch_id=str(a.dispatch_id) if a.dispatch_id else None) for a in alerts])
 
 
 async def _require_run(conn: AsyncConnection, run_id: UUID) -> None:

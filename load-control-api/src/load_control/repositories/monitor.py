@@ -25,6 +25,7 @@ class AlertRow:
     status: str | None
     at: datetime | None
     message: str | None
+    dispatch_id: UUID | None
 
 
 async def active_counts(conn: AsyncConnection) -> dict[str, int]:
@@ -52,23 +53,23 @@ async def alerts(conn: AsyncConnection, *, window: timedelta, validation_stale: 
     rows = (await conn.execute(text("""
         SELECT * FROM (
             SELECT 'PUBLISH_UNKNOWN' AS kind, 'ERROR' AS severity, run_id, job_key, business_key, status,
-                   heartbeat_at AS at, error_message AS message
+                   heartbeat_at AS at, error_message AS message, NULL::uuid AS dispatch_id
               FROM nifi_ops.load_run WHERE status = 'PUBLISH_UNKNOWN'
             UNION ALL
             SELECT 'DISPATCH_DEAD', 'ERROR', r.run_id, r.job_key, r.business_key, r.status,
-                   d.next_attempt_at, d.dispatch_type || ': ' || COALESCE(d.last_error, '')
+                   d.next_attempt_at, d.dispatch_type || ': ' || COALESCE(d.last_error, ''), d.dispatch_id
               FROM nifi_ops.load_dispatch d JOIN nifi_ops.load_run r USING (run_id)
              WHERE d.status = 'DEAD'
             UNION ALL
             SELECT 'RUN_FAILED', 'ERROR', run_id, job_key, business_key, status,
                    COALESCE(completed_at, heartbeat_at),
-                   COALESCE(error_code, '') || ' ' || COALESCE(error_message, '')
+                   COALESCE(error_code, '') || ' ' || COALESCE(error_message, ''), NULL
               FROM nifi_ops.load_run
              WHERE status = ANY(:failed)
                AND COALESCE(completed_at, heartbeat_at) >= clock_timestamp() - CAST(:window AS interval)
             UNION ALL
             SELECT 'RUN_STALE', 'WARN', run_id, job_key, business_key, status, heartbeat_at,
-                   '마지막 변화 이후 오래 멈춤'
+                   '마지막 변화 이후 오래 멈춤', NULL
               FROM nifi_ops.load_run
              WHERE (status IN ('STAGE_VALIDATING', 'PUBLISHED', 'EXTRACTED_VALIDATED')
                     AND heartbeat_at < clock_timestamp() - CAST(:validation_stale AS interval))
@@ -76,7 +77,7 @@ async def alerts(conn: AsyncConnection, *, window: timedelta, validation_stale: 
                     AND heartbeat_at < clock_timestamp() - CAST(:stale AS interval))
             UNION ALL
             SELECT DISTINCT ON (e.run_id) 'CLEANUP_FAILED', 'WARN', e.run_id, e.job_key, e.business_key,
-                   NULL, e.event_time, e.message
+                   NULL, e.event_time, e.message, NULL
               FROM nifi_ops.load_event e
              WHERE e.event_name = 'CLEANUP_FAILED'
                AND e.event_time >= clock_timestamp() - CAST(:window AS interval)

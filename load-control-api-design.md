@@ -280,7 +280,7 @@ PG-70이 끝난 run의 staging 테이블과 HDFS run 경로를 지울 때 대상
 - **로그**: `logs/server.log`, `logs/worker.log`. 한 줄 형식, 한글 메시지, `YYYY-MM-DD HH:MM:SS.SSS`. API 호출마다 수신·응답 두 줄(본문 포함), 같은 요청의 모든 로그에 `requestId`·`runId`가 붙는다.
 - **메트릭(`/metrics`)**: 엔드포인트별 요청 수·지연, dispatch 상태별 수, 활성 run 수, sweeper 처리 건수.
 - **알림 대상**: `DEAD` dispatch, `PUBLISH_UNKNOWN`, `TIMED_OUT`, `FAILED_*`, 5xx 급증, `PENDING` dispatch 증가.
-- **TUI 모니터**: `bin/monitor.sh`. 조회 API로 대시보드·경보·run 상세·로그를 본다([load-control-api/README.md](./load-control-api/README.md) "모니터").
+- **TUI 모니터**: `bin/monitor.sh`. 조회 API로 대시보드·경보·run 상세·로그를 보고, 확인 창을 거쳐 DEAD dispatch 재전송, `PUBLISH_UNKNOWN` 확정(operator 토큰), 서비스 시작·중지·재시작(bin 스크립트)을 한다([load-control-api/README.md](./load-control-api/README.md) "모니터").
 - **설정**: `config/config.yaml` 하나. 항목은 `config/config.example.yaml`에 설명이 있다.
 
 ## 11. 구현 구조와 테스트

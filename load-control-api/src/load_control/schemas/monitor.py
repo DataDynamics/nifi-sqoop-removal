@@ -16,6 +16,7 @@ class Alert(ApiModel):
     status: str | None
     at: datetime | None
     message: str | None
+    dispatch_id: str | None = None   # DISPATCH_DEAD일 때 재전송 대상
 
 
 class MonitorSummary(ApiModel):

@@ -236,7 +236,7 @@ SELECT count(*), sum(amount), min(reg_ts), max(reg_ts) FROM dw.insp_dtl WHERE ba
 
 ### 6.3 TUI 모니터
 
-API 서버 호스트에서 `load-control-api/bin/monitor.sh`를 실행하면 진행 중 run, 경보(`PUBLISH_UNKNOWN`, DEAD dispatch, 실패, 멈춘 run), run별 파티션·지표·이벤트, 로그를 한 화면에서 본다. 사용법은 [load-control-api/README.md](../load-control-api/README.md) "모니터".
+API 서버 호스트에서 `load-control-api/bin/monitor.sh`를 실행하면 진행 중 run, 경보(`PUBLISH_UNKNOWN`, DEAD dispatch, 실패, 멈춘 run), run별 파티션·지표·이벤트, 로그를 한 화면에서 본다. DEAD dispatch 재전송(7.4), `PUBLISH_UNKNOWN` 확정(7.5), 서비스 재시작도 이 화면에서 할 수 있다(operator 토큰 필요). 사용법은 [load-control-api/README.md](../load-control-api/README.md) "모니터".
 
 ### 6.4 로그
 

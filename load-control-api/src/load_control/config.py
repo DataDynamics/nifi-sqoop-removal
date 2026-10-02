@@ -137,7 +137,8 @@ class MonitorSettings(Section):
     """TUI 모니터(bin/monitor.sh). 조회 API만 쓰고 상태를 바꾸지 않는다."""
 
     api_url: AnyHttpUrl | None = None  # 기본: http://127.0.0.1:<server.port>
-    token: str | None = None           # nifi 또는 operator role 토큰 원문(digest가 아니다)
+    token: str | None = None           # 조회용: nifi 또는 operator role 토큰 원문(digest가 아니다)
+    operator_token: str | None = None  # 운영 작업(재전송, PUBLISH_UNKNOWN 확정)용 operator 토큰. 없으면 token
     refresh_seconds: float = Field(default=5.0, ge=1.0)
     log_dir: Path = Path("logs")       # server.log, worker.log, *.pid 위치(설치 디렉터리 기준)
 

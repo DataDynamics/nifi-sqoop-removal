@@ -34,6 +34,8 @@ async def test_summary_counts_and_alerts(client: httpx.AsyncClient, operator: ht
     assert kinds == {("PUBLISH_UNKNOWN", unknown.run_id), ("DISPATCH_DEAD", dead_run.run_id),
                      ("RUN_FAILED", failed.run_id), ("RUN_STALE", stale.run_id)}
     assert [a["severity"] for a in body["alerts"]][-1] == "WARN"  # ERROR가 먼저
+    dead = next(a for a in body["alerts"] if a["kind"] == "DISPATCH_DEAD")
+    assert dead["dispatchId"] and all(a["dispatchId"] is None for a in body["alerts"] if a is not dead)
     failed_alert = next(a for a in body["alerts"] if a["kind"] == "RUN_FAILED")
     assert failed_alert["message"] == "ORA-00942"
     assert active.run_id not in {a["runId"] for a in body["alerts"]} and staged.run_id

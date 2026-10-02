@@ -13,7 +13,7 @@ Sqoop 대체 적재(NiFi)의 상태 원장 기록과 완료 판정을 담당하�
 | 조회 | `GET /v1/runs`, `GET /v1/runs/{id}` (role `nifi`, `operator`) |
 | 운영자 | `POST /dispatches/{id}/resend`, `/publish-unknown/resolve` (role `operator`만) |
 | 정리 | `GET /v1/cleanup/candidates`, `POST /v1/runs/{id}/cleanup` (NiFi PG-70, 운영자 수동 기록) |
-| 모니터 | `GET /v1/monitor/summary`, `/v1/runs/{id}/validations`, `/v1/runs/{id}/events`(조회 전용), TUI `bin/monitor.sh` |
+| 모니터 | `GET /v1/monitor/summary`, `/v1/runs/{id}/validations`, `/v1/runs/{id}/events`, TUI `bin/monitor.sh`(조회와 운영 작업) |
 | worker | outbox dispatcher(LISTEN/NOTIFY, lease, backoff, DEAD), sweeper(stale 파티션, run timeout, ACK timeout 재전송, 검증 정체 경보, 게시 결과 불명) |
 
 ## 디렉터리 구조
@@ -112,17 +112,17 @@ sudo bin/systemd/install.sh --uninstall       # 제거
 
 ## 모니터
 
-`bin/monitor.sh`는 터미널 화면에서 상태를 보는 조회 전용 도구다. 조회 API만 부르고 상태를 바꾸지 않는다.
+`bin/monitor.sh`는 터미널 화면에서 상태를 보고 자주 하는 운영 작업을 하는 도구다.
 
 ```bash
 bin/monitor.sh                         # config/config.yaml의 monitor 섹션 사용
-bin/monitor.sh --url http://api-host:8080 --token <token>
+bin/monitor.sh --url http://api-host:8080 --token <token> --operator-token <operator token>
 ```
 
 | 화면 | 내용 | 키 |
 |---|---|---|
-| 대시보드 | API 준비 여부, server·worker PID, 진행 중·최근 24시간 run 수, dispatch(PENDING·SENT·DEAD), 정리 대상 수, 경보, run 목록(진행률·단계별 건수·소요) | `Enter` 상세, `l` 로그, `a` 진행 중만, `r` 새로고침, `q` 종료 |
-| run 상세 | run 정보, 탭: 파티션(상태·건수·시도·노드), 검증 지표(SOURCE·STAGING·TARGET, PASS/FAIL), dispatch, 이벤트 타임라인 | `l` 이 run의 로그, `Esc` 뒤로 |
+| 대시보드 | API 준비 여부, server·worker PID, 진행 중·최근 24시간 run 수, dispatch(PENDING·SENT·DEAD), 정리 대상 수, 경보, run 목록(진행률·단계별 건수·소요) | `Enter` 상세, `x` 선택한 경보 조치, `s` 서비스 관리, `l` 로그, `a` 진행 중만, `r` 새로고침, `q` 종료 |
+| run 상세 | run 정보, 탭: 파티션(상태·건수·시도·노드), 검증 지표(SOURCE·STAGING·TARGET, PASS/FAIL), dispatch, 이벤트 타임라인 | `s` dispatch 재전송, `p` `PUBLISH_UNKNOWN` 확정, `l` 이 run의 로그, `Esc` 뒤로 |
 | 로그 | `logs/server.log`, `worker.log` 실시간. 입력란 글자(run ID, requestId 등)가 들어간 줄만 표시 | `F2` WARN·ERROR만, `F3` server/worker 전환, `Esc` 뒤로 |
 
 경보 종류:
@@ -135,7 +135,16 @@ bin/monitor.sh --url http://api-host:8080 --token <token>
 | `RUN_STALE` | 오래 멈춘 run(`recovery.stale`, `recovery.validation_stale` 기준) |
 | `CLEANUP_FAILED` | 정리 실패가 남아 있는 run |
 
-- 설정: `monitor.api_url`(기본 `http://127.0.0.1:<server.port>`), `monitor.token`(nifi 또는 operator 토큰 원문), `monitor.refresh_seconds`(기본 5초), `monitor.log_dir`
+운영 작업(모두 확인 창을 거치고, 확인 창의 기본 선택은 취소다):
+
+| 작업 | 키 | 동작 |
+|---|---|---|
+| dispatch 재전송 | 대시보드 `DISPATCH_DEAD` 경보에서 `x`, run 상세에서 `s`(dispatch 탭에서 고른 행, 없으면 첫 DEAD·SENT) | `POST /v1/runs/{id}/dispatches/{id}/resend`. 먼저 PG-05 수신(포트, 등록된 Job)을 확인한다 |
+| `PUBLISH_UNKNOWN` 확정 | 대시보드 `PUBLISH_UNKNOWN` 경보에서 `x`, run 상세에서 `p` | 결과(`FAILED_PUBLISH` 기본, `PUBLISHED`)와 확인 근거(5자 이상)를 입력한다. `PUBLISHED`면 PG-60이 돌지 않으므로 target 검증을 직접 한다 |
+| 서비스 시작·중지·재시작 | 대시보드 `s` | 이 호스트의 `bin/start.sh`, `stop.sh`, `restart.sh`를 실행하고 출력을 보여 준다. systemd로 관리 중이면 막고 `systemctl`을 안내한다. server를 멈추면 모니터도 잠시 API에 붙지 못한다 |
+
+- 설정: `monitor.api_url`(기본 `http://127.0.0.1:<server.port>`), `monitor.token`(조회용 nifi 또는 operator 토큰 원문), `monitor.operator_token`(운영 작업용 operator 토큰, 없으면 `token`), `monitor.refresh_seconds`(기본 5초), `monitor.log_dir`
+- 운영 작업은 operator role이 필요하다. 토큰이 nifi role이면 "권한 없음"이 뜨고 아무것도 바뀌지 않는다
 - 서비스 PID와 로그는 이 디렉터리의 `logs/`에서 읽으므로 API 서버 호스트에서 실행한다. 다른 호스트에서 `--url`로 붙으면 API 정보만 보인다. systemd로 띄웠으면 PID는 "PID 파일 없음"으로 나오고 API 준비 여부로 판단한다
 - 터미널이 UTF-8이어야 한글이 깨지지 않는다
 

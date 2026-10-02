@@ -3,8 +3,8 @@
 자식 PG + Port)에서 원천을 PostgreSQL 대신 Oracle로 바꾼 버전이다. 가이드 7.2~7.3, 8.4의 Oracle 기준을 따른다.
 
     PG-00 Trigger ─start-run▶ PG-10 Run Coordinator ─partitions(RR)▶ PG-20 Extract Worker
-    PG-05 Control Receiver ─validate▶ PG-40 Staging Validation,  ─reissue(RR)▶ PG-20
-    모든 PG ─errors▶ PG-90 Error and Event
+    PG-05 Control Receiver ─validate▶ PG-40 Staging Validation ─staging-valid▶ PG-50 Publish ─published▶ PG-60 Target Validation
+    PG-05 ─reissue(RR)▶ PG-20,  모든 PG ─errors▶ PG-90 Error and Event
 
 V3 대비 변경점
 - 원천 Connection Pool(CS_DBCP_ORACLE): oracle.jdbc.OracleDriver, ORACLE.JDBC.* Parameter(ojdbc 경로 포함),
@@ -18,10 +18,14 @@ V3 대비 변경점
   CAST로 정밀도를 명시하는 것을 권장).
 - PG-05: 재발행 본문의 snapshotScn을 load.snapshot.scn으로 꺼낸다.
 - NULL split 파티션(SPLIT.NULL.POLICY=SEPARATE)은 만들지 않는다. NULL이 있으면 API가 manifest를 거부한다.
+- PG-40 나머지(47~4E), PG-50, PG-60(가이드 10~12장): Hive staging external table과 지표 검증, INSERT OVERWRITE 게시,
+  target 지표 검증으로 run을 SUCCESS까지 끝낸다. Hive 구성요소는 CFM의 ClouderaHiveConnectionPool(CS_HIVE3_DBCP)과
+  PutClouderaHiveQL이며, 지표 조회는 ExecuteSQLRecord(JSON)다. Apache NiFi에는 Hive 번들이 없어 이 빌더를 쓸 수 없다.
 
 Oracle Database 23ai Free에서 V3 시나리오와 NUMBER 정밀도, ORA-01555를 시험했다(REVIEW.md 7.4~7.7).
 Cloudera CFM 4.12(NiFi 2.6.0) 2노드 클러스터에서도 정상 실행을 확인했다(REVIEW.md 7.8). 클러스터에서 trigger가
-노드마다 생기지 않도록 00은 Primary Node에서만 실행한다.
+노드마다 생기지 않도록 00은 Primary Node에서만 실행한다. Hive 단계(PG-40~60)는 같은 클러스터와 Apache Hive 4.0.1
+(poc/hdfs-hive)에서 정상·staging DQ 실패·게시 실패·target 검증 실패·Hive 중단을 시험했다(REVIEW.md 7.9).
 사용 방법은 V4-MANUAL.md.
 
 사용법: build_flow_v4.py <nifi-api-url> <config.json>
@@ -60,6 +64,8 @@ TYPES = {t["type"].split(".")[-1]: t for t in
 
 
 def bundle(short):
+    if short not in TYPES:
+        raise SystemExit(f"{short} not found in this NiFi (Hive components need Cloudera CFM)")
     return TYPES[short]["bundle"], TYPES[short]["type"]
 
 
@@ -130,6 +136,12 @@ SRC = cs("CS_DBCP_ORACLE", "HikariCPConnectionPool",
 JARR = cs("CS_JSON_WRITER_ARRAY", "JsonRecordSetWriter", {"output-grouping": "output-array"})
 PARQ = cs("CS_PARQUET_WRITER", "ParquetRecordSetWriter", {"compression-type": "SNAPPY"})
 HTTPCTX = cs("CS_HTTP_CONTEXT_MAP", "StandardHttpContextMap", {"Request Expiration": "1 min"})
+# Hive(가이드 10~12장). 지표 조회 SQL의 결과 컬럼 이름이 table alias 없이 오도록 HIVE.JDBC.URL에
+# hive.resultset.use.unique.column.names=false를 둔다.
+HIVE = cs("CS_HIVE3_DBCP", "ClouderaHiveConnectionPool", {
+    "hive-db-connect-url": "#{HIVE.JDBC.URL}", "hive-db-user": "#{HIVE.JDBC.USER}",
+    "hive-db-password": "#{HIVE.JDBC.PASSWORD}", "hive-max-total-connections": "#{HIVE.POOL.MAX}",
+    "hive-max-wait-time": "10 secs", "Validation-query": "SELECT 1"})
 
 
 # Processor COMMENT(한글). NiFi UI의 Processor 설정 > Comments에 표시된다.
@@ -171,13 +183,40 @@ COMMENTS = {
     "V41": "검증 시작 요청 본문(dispatchId, node)을 만든다.",
     "V42": "API에 검증 시작을 알린다(POST /validation/start). 같은 run에 대해 한 번만 started=true를 받는다. 이 호출이 dispatch ACK가 된다.",
     "V43": "started=true인 경우만 진행한다. 중복 검증 요청은 오류 없이 종료한다.",
-    "V44": "검증 시작 응답에서 HDFS 경로, stage table, 업무일자를 꺼내고 _SUCCESS 파일 이름을 정한다.",
+    "V44": "검증 시작 응답에서 HDFS 경로, stage table, 업무일자, 원천·추출 건수, 원천 지표(AMOUNT_SUM, MIN_TS, MAX_TS)를 꺼내고 _SUCCESS 파일 이름을 정한다. 이후 실패는 run을 FAILED_STAGE_VALIDATION으로 보고한다.",
     "V45": "_SUCCESS marker를 빈 파일로 쓰기 위해 content를 비운다.",
-    "V46": "run 경로에 _SUCCESS marker를 쓴다. 이 파일은 API가 run 완료를 확정한 뒤에만 생긴다. 운영에서는 이후 Hive staging 검증으로 이어진다.",
+    "V46": "run 경로에 _SUCCESS marker를 쓴다. 이 파일은 API가 run 완료를 확정한 뒤에만 생긴다. Hive는 _로 시작하는 파일을 읽지 않는다.",
+    "V47": "run 경로를 LOCATION으로 하는 Hive external staging 테이블 DDL을 만든다. stage table 이름이 영문·숫자·_가 아니면 DDL이 실패하도록 바꾼다.",
+    "V48": "staging 테이블을 만든다(PutClouderaHiveQL). Hive retry는 3회 재시도 후 errors로 보낸다.",
+    "V49": "staging 테이블에서 건수, split NULL 수, PK 중복 수, 금액 합계, MIN_TS/MAX_TS를 계산하고 원천 기대값과 비교한 PASS/FAIL을 지표마다 한 행으로 돌려준다.",
+    "V4A": "지표 행 배열을 /validations 요청(stage=STAGING, queryVersion=v1, metrics)으로 바꾼다.",
+    "V4B": "staging 지표를 API에 기록한다(POST /validations). FAIL이 있어도 먼저 기록한다.",
+    "V4C": "stage-validated 요청 본문({})을 만든다.",
+    "V4D": "API에 staging 통과 판정을 요청한다(POST /stage-validated). API가 저장된 지표가 모두 PASS일 때만 STAGING_VALIDATED로 바꾼다.",
+    "V4E": "stageValidated=true면 PG-50으로 보낸다. false면 errors로 보내 run을 FAILED_STAGE_VALIDATION으로 보고한다.",
+    # PG-50 Publish
+    "B50": "게시 소유권 token(UUID)을 만들고 현재 단계를 PUBLISH로 표시한다. 이 단계의 실패는 PG-90이 이벤트만 남긴다(결과는 57이 직접 보고).",
+    "B51": "publish claim 요청 본문(publishToken)을 만든다.",
+    "B52": "API에 게시 소유권을 요청한다(POST /publish/claim). STAGING_VALIDATED → PUBLISHING CAS에 성공하거나 같은 token이면 claimed=true.",
+    "B53": "claimed=true인 경우만 게시한다. 중복 요청은 오류 없이 종료한다.",
+    "B54": "승인된 target·partition·column으로 INSERT OVERWRITE SQL을 만든다. FlowFile에서 받은 값은 stage table 이름(형식 검사)만 쓴다.",
+    "B55": "target에 INSERT OVERWRITE를 실행한다. 재시도하지 않는다. failure·retry는 실행 여부를 알 수 없으므로 PUBLISH_UNKNOWN으로 보고한다(가이드 11.2).",
+    "B56": "게시 결과 PUBLISHED 본문을 만든다.",
+    "B56U": "게시 결과 PUBLISH_UNKNOWN 본문을 만든다. 운영자가 Hive 이력과 target을 확인해 /publish-unknown/resolve로 확정한다.",
+    "B57": "API에 게시 결과를 보고한다(POST /publish/result). token이 일치할 때만 run 상태가 바뀐다.",
+    "B58": "run이 PUBLISHED면 PG-60으로 보낸다. 그 밖(PUBLISH_UNKNOWN 등)은 errors로 보내 이벤트를 남긴다.",
+    # PG-60 Target Validation
+    "T60": "현재 단계를 TARGET_VALIDATION으로 표시한다. 이후 실패는 run을 FAILED_TARGET_VALIDATION으로 보고한다.",
+    "T61": "target 업무 범위(TARGET.BUSINESS.WHERE)에서 건수, split NULL 수, PK 중복 수, 금액 합계, MIN_TS/MAX_TS를 계산하고 원천 기대값과 비교한다.",
+    "T62": "지표 행 배열을 /validations 요청(stage=TARGET)으로 바꾼다.",
+    "T63": "target 지표를 API에 기록한다(POST /validations).",
+    "T64": "success 요청 본문({})을 만든다. target 건수는 API가 TARGET_COUNT 지표에서 읽는다.",
+    "T65": "API에 최종 성공을 요청한다(POST /success). 저장된 TARGET 지표가 모두 PASS일 때만 SUCCESS로 바꾸고 RUN_SUCCESS를 기록한다.",
+    "T66": "success=true면 끝낸다. false면 errors로 보내 run을 FAILED_TARGET_VALIDATION으로 보고한다.",
     # PG-90 Error and Event
     "E90": "모든 PG의 오류를 정규화한다. load.stage와 Processor가 남긴 attribute(HTTP 상태, SQL 오류, 연결 예외)로 오류 단계·코드·분류·메시지와 이벤트 수준·이름을 만든다. 409(중복 실행, claim 불일치)는 정상 경합이므로 WARN이다.",
-    "E91": "오류 단계에 따라 run 실패 보고, 파티션 실패 보고, 이벤트 기록만 중 하나로 나눈다.",
-    "E92": "run 실패 보고 본문(CREATED → FAILED_MANIFEST, 오류 단계·코드·메시지)을 만든다. SCN 조회 실패도 여기로 온다.",
+    "E91": "오류 단계에 따라 run 실패 보고(MANIFEST, STAGE_VALIDATION, TARGET_VALIDATION), 파티션 실패 보고, 이벤트 기록만 중 하나로 나눈다.",
+    "E92": "run 실패 보고 본문(load.fail.expected → load.fail.status, 오류 단계·코드·메시지)을 만든다. SCN 조회 실패도 여기로 온다.",
     "E93": "API에 run 실패를 보고한다(POST /runs/{id}/fail). 보고하지 않으면 활성 run lock이 남는다.",
     "E94": "파티션 실패 보고 본문(claimToken, 오류 단계·분류·코드·메시지)을 만든다.",
     "E95": "API에 파티션 실패를 보고한다(POST .../partitions/{pid}/fail). API가 파티션과 run을 실패 처리한다.",
@@ -278,6 +317,13 @@ def put_hdfs(g, key, name, col, row, tasks=1):
     return key
 
 
+def hive_ql(g, key, name, col, row, retry=None):
+    """content의 HiveQL 한 문장을 실행한다(PutClouderaHiveQL). 오류 attribute를 남기지 않는다."""
+    return p(g, key, name, "PutClouderaHiveQL", {
+        "hive3-dbcp-service": HIVE, "hive-batch-size": "1", "hive3-query-timeout": "#{HIVE.QUERY.TIMEOUT}",
+        "rollback-on-failure": "false"}, col, row, retry=retry)
+
+
 NUM = "'^-?[0-9]+$'"
 SRC_TABLE = "#{SRC.OWNER}.#{SRC.TABLE}"
 SPLIT = "#{SRC.SPLIT.COLUMN}"
@@ -288,7 +334,9 @@ G00 = new_pg(TOP, "PG-00 Trigger", 0, 0, "스케줄 트리거와 업무일자 �
 G10 = new_pg(TOP, "PG-10 Run Coordinator", 0, 260, "run 생성, 원천 지표·manifest 계산, manifest 등록")
 G20 = new_pg(TOP, "PG-20 Extract Worker", 0, 520, "claim, 파티션 추출, PutHDFS, chunk 보고")
 G05 = new_pg(TOP, "PG-05 Control Receiver", 700, 0, "API worker의 validate/reissue 호출 수신")
-G40 = new_pg(TOP, "PG-40 Staging Validation", 700, 260, "/validation/start, _SUCCESS marker (Hive 단계 자리)")
+G40 = new_pg(TOP, "PG-40 Staging Validation", 700, 260, "/validation/start, _SUCCESS, Hive staging 테이블과 지표 검증")
+G50 = new_pg(TOP, "PG-50 Publish", 1400, 0, "publish claim, INSERT OVERWRITE, 게시 결과 보고")
+G60 = new_pg(TOP, "PG-60 Target Validation", 1400, 260, "target 지표 검증, 최종 SUCCESS")
 G90 = new_pg(TOP, "PG-90 Error and Event", 700, 520, "공통 오류 정규화, 실패 보고 API, load_event 기록")
 
 # 각 PG 안 위쪽에 역할·흐름·입출력·주의점을 적은 Label을 둔다. 상위 PG에는 전체 흐름 Label을 둔다.
@@ -318,13 +366,25 @@ PG_LABELS = {
 출력: validate → PG-40, reissue → PG-20, errors → PG-90
 주의: 202를 먼저 응답한다. 처리 확인(ACK)은 PG-40의 /validation/start 또는 PG-20의 재 claim이다.
       운영에서는 root에 두고 여러 Job이 공유한다(가이드 9.5).""",
-    G40: """PG-40 Staging Validation (입구)
-역할: API에 검증 시작을 알리고 run 경로에 _SUCCESS marker를 쓴다.
+    G40: """PG-40 Staging Validation
+역할: API에 검증 시작을 알리고, _SUCCESS를 쓴 뒤 Hive staging 테이블로 원천 지표와 비교한다.
 흐름: 40 load.stage=VALIDATION_START → 41·42 검증 시작(POST /validation/start) → 43 started 확인
-      → 44 run 정보 → 45·46 _SUCCESS 기록
-입력: validate / 출력: errors → PG-90
-주의: started=true는 run당 한 번만 온다(중복 요청은 조용히 종료). Hive staging 검증(가이드 10장 47 이후)은
-      이 PoC 환경에 없어 46에서 끝난다.""",
+      → 44 run 정보·원천 지표(load.stage=STAGE_VALIDATION) → 45·46 _SUCCESS → 47·48 external staging DDL
+      → 49 staging 지표·PASS/FAIL(SQL 1문장) → 4A·4B 지표 기록 → 4C·4D staging 통과 판정 → 4E
+입력: validate / 출력: staging-valid → PG-50, errors → PG-90
+주의: started=true는 run당 한 번만 온다(중복 요청은 조용히 종료). 44 이후 실패는 run을 FAILED_STAGE_VALIDATION으로 만든다.
+      판정은 API가 저장된 지표로 다시 한다. 시간대가 어긋나면 MIN_TS/MAX_TS가 FAIL이 된다.""",
+    G50: """PG-50 Publish
+역할: staging을 target에 INSERT OVERWRITE로 게시하고 결과를 API에 직접 보고한다.
+흐름: 50 publish token(load.stage=PUBLISH) → 51·52 publish claim → 53 소유 확인 → 54 INSERT OVERWRITE SQL
+      → 55 실행(재시도 없음) → 56 PUBLISHED / 56U PUBLISH_UNKNOWN → 57 결과 보고 → 58 PUBLISHED 확인
+입력: staging-valid / 출력: published → PG-60, errors → PG-90(이벤트만)
+주의: 55를 자동 재실행하지 않는다. 결과가 불명확하면 PUBLISH_UNKNOWN으로 남기고 운영자가 확정한다.""",
+    G60: """PG-60 Target Validation
+역할: 게시된 target 업무 범위를 원천 지표와 비교하고 API에 최종 성공을 요청한다.
+흐름: 60 load.stage=TARGET_VALIDATION → 61 target 지표·PASS/FAIL → 62·63 지표 기록 → 64·65 success → 66 확인
+입력: published / 출력: errors → PG-90
+주의: SUCCESS와 RUN_SUCCESS 이벤트는 API가 기록한다. 실패해도 재게시하지 않는다(FAILED_TARGET_VALIDATION).""",
     G90: """PG-90 Error and Event
 역할: 모든 PG의 실패를 한 곳에서 처리한다.
 흐름: 90 오류 정규화(load.stage, HTTP 상태, SQL 오류, 연결 예외 → 코드·수준·메시지) → 91 분기
@@ -334,11 +394,12 @@ PG_LABELS = {
 }
 for g, text in PG_LABELS.items():
     label(g, text, 0, -2 * ROWH, 5 * COLW, 170)
-label(TOP, """SQOOP_REPLACEMENT_POC_V4 — Load Control API 연동 Sqoop 대체 PoC (Oracle 원천, 미검증)
+label(TOP, """SQOOP_REPLACEMENT_POC_V4 — Load Control API 연동 Sqoop 대체 PoC (Oracle 원천)
 PG-00 →(start-run)→ PG-10 →(partitions, Round Robin)→ PG-20 → API가 완료 판정 → API worker가 PG-05 호출
-PG-05 →(validate)→ PG-40,  PG-05 →(reissue, Round Robin)→ PG-20,  모든 PG →(errors)→ PG-90
+PG-05 →(validate)→ PG-40 →(staging-valid)→ PG-50 →(published)→ PG-60,  PG-05 →(reissue, Round Robin)→ PG-20
+모든 PG →(errors)→ PG-90
 원장 기록·완료 판정은 Load Control API가 하고, NiFi는 데이터 처리와 API 호출만 한다.
-상세: nifi-sqoop-removal-guide.md 2장, poc/REVIEW.md 6장""", 0, -230, 1100, 150)
+상세: nifi-sqoop-removal-guide.md 2장, poc/REVIEW.md 6장""", 0, -250, 1100, 170)
 
 # ===== PG-00 Trigger
 port(G00, "start-run", "out", 3, 0)
@@ -529,25 +590,155 @@ c(G05, "R09", "matched", "R10"); c(G05, "R09", ["unmatched", "failure"], ("out",
 c(G05, "R10", "validate", ("out", "validate")); c(G05, "R10", "reissue", ("out", "reissue"))
 c(G05, "R10", "unmatched", ("out", "errors"))
 
-# ===== PG-40 Staging Validation 입구 (가이드 10장). Hive 단계는 이 환경에 없어 _SUCCESS까지만 한다.
+# ===== PG-40 Staging Validation (가이드 10장)
 port(G40, "validate", "in", 0, 0)
-port(G40, "errors", "out", 4, 1)
+port(G40, "errors", "out", 5, 1)
+port(G40, "staging-valid", "out", 5, 3)
 ua(G40, "V40", "40_Set_Validation_Stage", {"load.stage": "VALIDATION_START"}, 1, 0)
 body(G40, "V41", "41_Build_Start_Body", '{"dispatchId":"${load.dispatch.id}","node":"${hostname(true):escapeJson()}"}', 2, 0)
 invoke(G40, "V42", "42_Validation_Start", "/runs/${load.run.id}/validation/start", 3, 0)
 # started=false는 중복 dispatch이므로 조용히 끝낸다.
 route(G40, "V43", "43_Is_Started", {"started": "${api.response:jsonPath('$.started'):equals('true')}"}, 4, 0)
+# 검증 flow는 API 호출로 새로 시작되므로 기대값(원천 건수·지표)을 /validation/start 응답에서 받는다(가이드 10.2).
+# 여기부터 load.stage=STAGE_VALIDATION: 실패하면 PG-90이 run을 FAILED_STAGE_VALIDATION으로 보고한다.
 ua(G40, "V44", "44_Set_Run_Attrs", {
     "load.hdfs.path": "${api.response:jsonPath('$.hdfsRunPath')}",
     "load.stage.table": "${api.response:jsonPath('$.stageTable')}",
     "load.business.key": "${api.response:jsonPath('$.businessKey')}",
-    "filename": "_SUCCESS", "load.stage": "SUCCESS_MARKER"}, 1, 1)
+    "load.job.key": "${api.response:jsonPath('$.jobKey')}",
+    "load.snapshot.scn": "${api.response:jsonPath('$.snapshotScn')}",
+    "load.source.count": "${api.response:jsonPath('$.sourceCount')}",
+    "load.extracted.count": "${api.response:jsonPath('$.extractedCount')}",
+    "validation.source.AMOUNT_SUM": "${api.response:jsonPath('$.sourceMetrics.AMOUNT_SUM')}",
+    "validation.source.MIN_TS": "${api.response:jsonPath('$.sourceMetrics.MIN_TS')}",
+    "validation.source.MAX_TS": "${api.response:jsonPath('$.sourceMetrics.MAX_TS')}",
+    "filename": "_SUCCESS", "load.stage": "STAGE_VALIDATION"}, 1, 1)
 body(G40, "V45", "45_Empty_Content", "", 2, 1)
 put_hdfs(G40, "V46", "46_PutHDFS_SUCCESS_Marker", 3, 1)
-# 운영에서는 V46 success를 Hive staging DDL·지표 조회(PG-40 본체)로 연결한다.
+
+# SQL에 들어가는 FlowFile 값은 형식을 고정한다. 형식이 틀리면 SQL이 실패하도록 바꿔 errors로 보낸다.
+STAGE_TBL = "#{HIVE.STAGE.DB}.${load.stage.table:matches('^[A-Za-z0-9_]{1,128}$'):ifElse(${load.stage.table},'invalid-stage-table')}"
+
+
+def num_attr(a):
+    return "${" + a + ":matches('^-?[0-9]+$'):ifElse(${" + a + "},'NULL')}"
+
+
+def str_attr(a):
+    return "${" + a + ":replaceAll('[^0-9A-Za-z:. _-]', '')}"
+
+
+def metrics_sql(table_where, count_name):
+    """지표마다 (metric_name, expected_value, actual_value, result) 한 행(가이드 10.3).
+    MIN_TS/MAX_TS는 원천 TO_CHAR와 같은 형식의 문자열로 비교한다. AMOUNT_SUM은 DECIMAL(38,2)로 맞춰 비교한다."""
+    return f"""WITH s AS (
+  SELECT COUNT(*) AS cnt,
+         COALESCE(SUM(CASE WHEN #{{SRC.SPLIT.COLUMN}} IS NULL THEN 1 ELSE 0 END), 0) AS null_cnt,
+         COUNT(*) - COUNT(DISTINCT #{{DQ.PK.COLUMN}}) AS dup_cnt,
+         COALESCE(SUM(#{{DQ.AMOUNT.COLUMN}}), 0) AS amount_sum,
+         COALESCE(DATE_FORMAT(MIN(#{{DQ.TIMESTAMP.COLUMN}}), 'yyyy-MM-dd HH:mm:ss'), '') AS min_ts,
+         COALESCE(DATE_FORMAT(MAX(#{{DQ.TIMESTAMP.COLUMN}}), 'yyyy-MM-dd HH:mm:ss'), '') AS max_ts
+    FROM {table_where}
+)
+SELECT '{count_name}' AS metric_name, '{num_attr('load.source.count')}' AS expected_value,
+       CAST(cnt AS STRING) AS actual_value,
+       IF(cnt = {num_attr('load.source.count')} AND cnt = {num_attr('load.extracted.count')}, 'PASS', 'FAIL') AS result
+  FROM s
+UNION ALL
+SELECT 'NULL_SPLIT_COUNT', '0', CAST(null_cnt AS STRING), IF(null_cnt = 0, 'PASS', 'FAIL') FROM s
+UNION ALL
+SELECT 'DUP_PK_COUNT', '0', CAST(dup_cnt AS STRING), IF(dup_cnt = 0, 'PASS', 'FAIL') FROM s
+UNION ALL
+SELECT 'AMOUNT_SUM', '{str_attr('validation.source.AMOUNT_SUM')}', CAST(amount_sum AS STRING),
+       IF(CAST(amount_sum AS DECIMAL(38,2)) = CAST('{str_attr('validation.source.AMOUNT_SUM')}' AS DECIMAL(38,2)), 'PASS', 'FAIL') FROM s
+UNION ALL
+SELECT 'MIN_TS', '{str_attr('validation.source.MIN_TS')}', min_ts, IF(min_ts = '{str_attr('validation.source.MIN_TS')}', 'PASS', 'FAIL') FROM s
+UNION ALL
+SELECT 'MAX_TS', '{str_attr('validation.source.MAX_TS')}', max_ts, IF(max_ts = '{str_attr('validation.source.MAX_TS')}', 'PASS', 'FAIL') FROM s"""
+
+
+def jolt_metrics(stage):
+    """ExecuteSQLRecord 결과 배열 → /validations 요청. Hive 결과 컬럼은 소문자다."""
+    return json.dumps([
+        {"operation": "shift", "spec": {"*": {
+            "metric_name": "metrics[&1].metricName", "expected_value": "metrics[&1].expectedValue",
+            "actual_value": "metrics[&1].actualValue", "result": "metrics[&1].result"}}},
+        {"operation": "default", "spec": {"stage": stage, "queryVersion": "v1"}}], indent=1)
+
+
+# _SUCCESS(숨김 파일)는 Hive가 읽지 않으므로 run 경로를 그대로 LOCATION으로 쓴다.
+body(G40, "V47", "47_Build_External_DDL",
+     f"CREATE EXTERNAL TABLE IF NOT EXISTS {STAGE_TBL} (\n  #{{HIVE.STAGE.DDL.COLUMNS}}\n)\n"
+     "STORED AS PARQUET\nLOCATION '${load.hdfs.path}'", 0, 2)
+hive_ql(G40, "V48", "48_Create_External_Table", 1, 2, retry=(["retry"], 3))
+esql(G40, "V49", "49_Query_Stage_Metrics", HIVE, metrics_sql(STAGE_TBL, "STAGE_COUNT"), 2, 2,
+     extra={"Max Wait Time": "#{HIVE.QUERY.TIMEOUT} secs"})
+p(G40, "V4A", "4A_Build_Validations_Body", "JoltTransformJSON", {
+    "Jolt Transform": "jolt-transform-chain", "Jolt Specification": jolt_metrics("STAGING")}, 3, 2)
+invoke(G40, "V4B", "4B_Report_Validations", "/runs/${load.run.id}/validations", 4, 2)
+body(G40, "V4C", "4C_Empty_Json", "{}", 1, 3)
+invoke(G40, "V4D", "4D_Stage_Validated", "/runs/${load.run.id}/stage-validated", 2, 3)
+route(G40, "V4E", "4E_Is_Stage_Validated", {
+    "validated": "${api.response:jsonPath('$.stageValidated'):equals('true')}"}, 3, 3)
 c(G40, ("in", "validate"), [], "V40"); c(G40, "V40", "success", "V41"); c(G40, "V41", "success", "V42")
 c(G40, "V42", "Original", "V43"); c(G40, "V43", "started", "V44")
 c(G40, "V44", "success", "V45"); c(G40, "V45", "success", "V46"); c(G40, "V45", "failure", ("out", "errors"))
+c(G40, "V46", "success", "V47"); c(G40, "V47", "success", "V48"); c(G40, "V47", "failure", ("out", "errors"))
+c(G40, "V48", "success", "V49"); c(G40, "V48", ["failure", "retry"], ("out", "errors"))
+c(G40, "V49", "success", "V4A"); c(G40, "V49", "failure", ("out", "errors"))
+c(G40, "V4A", "success", "V4B"); c(G40, "V4A", "failure", ("out", "errors"))
+c(G40, "V4B", "Original", "V4C"); c(G40, "V4C", "success", "V4D"); c(G40, "V4C", "failure", ("out", "errors"))
+c(G40, "V4D", "Original", "V4E")
+c(G40, "V4E", "validated", ("out", "staging-valid")); c(G40, "V4E", "unmatched", ("out", "errors"))
+
+# ===== PG-50 Publish (가이드 11장). 결과는 57이 직접 보고하므로 PG-90은 이벤트만 남긴다.
+port(G50, "staging-valid", "in", 0, 0)
+port(G50, "errors", "out", 5, 1)
+port(G50, "published", "out", 5, 2)
+ua(G50, "B50", "50_Set_Publish_Token", {"publish.token": "${UUID()}", "load.stage": "PUBLISH"}, 1, 0)
+body(G50, "B51", "51_Build_Claim_Body", '{"publishToken":"${publish.token}"}', 2, 0)
+invoke(G50, "B52", "52_Claim_Publish", "/runs/${load.run.id}/publish/claim", 3, 0)
+route(G50, "B53", "53_Is_Publish_Owner", {"claimed": "${api.response:jsonPath('$.claimed'):equals('true')}"}, 4, 0)
+body(G50, "B54", "54_Build_Insert_Overwrite_SQL",
+     "INSERT OVERWRITE TABLE #{HIVE.TARGET.DB}.#{HIVE.TARGET.TABLE}\n#{TARGET.PARTITION.CLAUSE}\n"
+     f"SELECT #{{HIVE.INSERT.COLUMNS}}\n  FROM {STAGE_TBL}", 0, 1)
+# 재시도 없음. PutClouderaHiveQL은 오류 attribute를 남기지 않아 실행 전 실패(FAILED_PUBLISH)를 가려낼 수 없으므로
+# failure·retry를 모두 PUBLISH_UNKNOWN으로 보고한다(가이드 11.2, 55A·56F 생략).
+hive_ql(G50, "B55", "55_Insert_Overwrite", 1, 1)
+body(G50, "B56", "56_Body_PUBLISHED", '{"publishToken":"${publish.token}","outcome":"PUBLISHED"}', 2, 1)
+body(G50, "B56U", "56U_Body_PUBLISH_UNKNOWN",
+     '{"publishToken":"${publish.token}","outcome":"PUBLISH_UNKNOWN","errorCode":"HIVE_PUBLISH_FAILED",'
+     '"message":"INSERT OVERWRITE routed to failure/retry on ${hostname(true):escapeJson()}; check Hive query history and NiFi bulletin"}',
+     2, 2)
+invoke(G50, "B57", "57_Report_Publish_Result", "/runs/${load.run.id}/publish/result", 3, 1)
+route(G50, "B58", "58_Is_Published", {"published": "${api.response:jsonPath('$.runStatus'):equals('PUBLISHED')}"}, 4, 1)
+c(G50, ("in", "staging-valid"), [], "B50"); c(G50, "B50", "success", "B51"); c(G50, "B51", "success", "B52")
+c(G50, "B52", "Original", "B53"); c(G50, "B53", "claimed", "B54")
+c(G50, "B54", "success", "B55"); c(G50, "B54", "failure", ("out", "errors"))
+c(G50, "B55", "success", "B56"); c(G50, "B55", ["failure", "retry"], "B56U")
+c(G50, "B56", "success", "B57"); c(G50, "B56U", "success", "B57")
+c(G50, "B56", "failure", ("out", "errors")); c(G50, "B56U", "failure", ("out", "errors"))
+c(G50, "B57", "Original", "B58")
+c(G50, "B58", "published", ("out", "published")); c(G50, "B58", "unmatched", ("out", "errors"))
+
+# ===== PG-60 Target Validation (가이드 12장)
+port(G60, "published", "in", 0, 0)
+port(G60, "errors", "out", 5, 1)
+ua(G60, "T60", "60_Set_Target_Stage", {"load.stage": "TARGET_VALIDATION"}, 1, 0)
+esql(G60, "T61", "61_Query_Target_Metrics", HIVE,
+     metrics_sql("#{HIVE.TARGET.DB}.#{HIVE.TARGET.TABLE}\n   WHERE #{TARGET.BUSINESS.WHERE}", "TARGET_COUNT"), 2, 0,
+     extra={"Max Wait Time": "#{HIVE.QUERY.TIMEOUT} secs"})
+p(G60, "T62", "62_Build_Validations_Body", "JoltTransformJSON", {
+    "Jolt Transform": "jolt-transform-chain", "Jolt Specification": jolt_metrics("TARGET")}, 3, 0)
+invoke(G60, "T63", "63_Report_Validations", "/runs/${load.run.id}/validations", 4, 0)
+body(G60, "T64", "64_Empty_Json", "{}", 1, 1)
+invoke(G60, "T65", "65_Report_Success", "/runs/${load.run.id}/success", 2, 1)
+route(G60, "T66", "66_Is_Success", {"success": "${api.response:jsonPath('$.success'):equals('true')}"}, 3, 1)
+c(G60, ("in", "published"), [], "T60"); c(G60, "T60", "success", "T61")
+c(G60, "T61", "success", "T62"); c(G60, "T61", "failure", ("out", "errors"))
+c(G60, "T62", "success", "T63"); c(G60, "T62", "failure", ("out", "errors"))
+c(G60, "T63", "Original", "T64"); c(G60, "T64", "success", "T65"); c(G60, "T64", "failure", ("out", "errors"))
+c(G60, "T65", "Original", "T66"); c(G60, "T66", "unmatched", ("out", "errors"))
 
 # ===== PG-90 Error and Event (가이드 14장). 모든 PG의 errors가 여기로 온다.
 port(G90, "errors", "in", 0, 0)
@@ -574,20 +765,29 @@ ua(G90, "E90", "90_Normalize_Error", {
     "error.event": "${invokehttp.status.code:equals('409'):ifElse(" + BODY_CODE + "," + STAGE_FAILED + ")}",
     "error.class": "${invokehttp.java.exception.class:isEmpty():not():ifElse('TRANSIENT',"
                    "${invokehttp.status.code:matches('4[0-9]{2}'):ifElse('VALIDATION','NON_RETRYABLE')})}",
+    # run 실패 보고 대상 단계의 기대 상태와 실패 상태(가이드 14.2 91 표)
+    "load.fail.expected": "${load.stage:equals('MANIFEST'):ifElse('CREATED',"
+                          "${load.stage:equals('STAGE_VALIDATION'):ifElse('STAGE_VALIDATING','PUBLISHED')})}",
+    "load.fail.status": "${load.stage:equals('MANIFEST'):ifElse('FAILED_MANIFEST',"
+                        "${load.stage:equals('STAGE_VALIDATION'):ifElse('FAILED_STAGE_VALIDATION','FAILED_TARGET_VALIDATION')})}",
     "error.message": f"${{{HTTP_ERR[2:-1]}:ifElse(${{invokehttp.response.body:replaceNull(${{api.response}})}},"
                      "${executesql.error.message:replaceNull(${invokehttp.java.exception.message:replaceNull("
-                     "'processor routed failure; see bulletin and provenance')})})}"},
+                     # 판정 응답(stage-validated·success의 reasons, publish/result의 changed)이 거부 사유를 담고 있다.
+                     "${api.response:matches('(?s).*\"(reasons|changed)\".*'):ifElse(${api.response},"
+                     "'processor routed failure; see bulletin and provenance')})})})}"},
    1, 0)
 route(G90, "E91", "91_Route_Failure_Report", {
-    # manifest 단계 실패는 run을 FAILED_MANIFEST로 보고한다. 422면 API가 이미 기록했다.
-    "report_run": "${load.stage:equals('MANIFEST'):and(${load.run.id:isEmpty():not()})"
-                  ":and(${invokehttp.status.code:equals('422'):not()})}",
+    # manifest·staging 검증·target 검증 단계 실패는 run 실패로 보고한다. manifest 422면 API가 이미 기록했다.
+    # VALIDATION_START(API가 재전송)와 PUBLISH(57이 직접 보고)는 이벤트만 남긴다.
+    "report_run": "${load.run.id:isEmpty():not():and(${load.stage:equals('MANIFEST')"
+                  ":and(${invokehttp.status.code:equals('422'):not()})"
+                  ":or(${load.stage:in('STAGE_VALIDATION','TARGET_VALIDATION')})})}",
     # claim에 성공한 파티션의 추출·기록 실패는 파티션 실패로 보고한다.
     "report_partition": "${load.stage:in('EXTRACT','CHUNK_WRITE'):and(${api.response:jsonPath('$.claimed'):equals('true')})}"},
       2, 0)
 MSG_JSON = "${error.message:replaceAll('(?s)^(.{0,1500}).*$','$1'):escapeJson()}"
 body(G90, "E92", "92_Build_Run_Fail_Body",
-     '{"expectedStatus":"CREATED","failStatus":"FAILED_MANIFEST","errorStage":"${error.stage}",'
+     '{"expectedStatus":"${load.fail.expected}","failStatus":"${load.fail.status}","errorStage":"${error.stage}",'
      '"errorCode":"${error.code}","message":"' + MSG_JSON + '"}', 3, 0)
 p(G90, "E93", "93_Report_Run_Fail", "InvokeHTTP", {
     "HTTP Method": "POST", "HTTP URL": "#{CONTROL.API.URL}/runs/${load.run.id}/fail",
@@ -636,7 +836,9 @@ links = [
     (G10, "partitions", G20, "partitions", {"loadBalanceStrategy": "ROUND_ROBIN"}),  # Coordinator → Worker
     (G05, "reissue", G20, "partitions", {"loadBalanceStrategy": "ROUND_ROBIN"}),
     (G05, "validate", G40, "validate", {}),
-] + [(g, "errors", G90, "errors", {}) for g in (G00, G10, G20, G05, G40)]
+    (G40, "staging-valid", G50, "staging-valid", {}),
+    (G50, "published", G60, "published", {}),
+] + [(g, "errors", G90, "errors", {}) for g in (G00, G10, G20, G05, G40, G50, G60)]
 
 
 def endpoint(g, ref):
@@ -681,5 +883,6 @@ cur = call("GET", f"/processors/{trig}")
 call("PUT", f"/processors/{trig}/run-status", {"revision": cur["revision"], "state": "DISABLED"})
 
 print(json.dumps({"process_group": TOP, "trigger": trig,
-                  "groups": {"PG-00": G00, "PG-10": G10, "PG-20": G20, "PG-05": G05, "PG-40": G40, "PG-90": G90},
+                  "groups": {"PG-00": G00, "PG-10": G10, "PG-20": G20, "PG-05": G05, "PG-40": G40, "PG-50": G50,
+                             "PG-60": G60, "PG-90": G90},
                   "processors": {k: v[0]["component"]["id"] for k, v in procs.items()}}, indent=1))

@@ -368,7 +368,7 @@ run timeout, stale 판정, dispatch 재시도 같은 제어 설정은 NiFi Param
 |---|---|---|
 | `CS_DBCP_ORACLE` | `HikariCPConnectionPool` | Driver Class=`oracle.jdbc.OracleDriver`, URL·계정·Driver 경로=`#{ORACLE.JDBC.*}`, Max Total=`#{ORACLE.POOL.MAX}`, validation query=`SELECT 1 FROM DUAL` |
 | `CS_DBCP_META` | `HikariCPConnectionPool` | 관리 DB(PostgreSQL), `load_event` INSERT 전용(PG-90). Driver Class=`org.postgresql.Driver`, URL·계정·Driver 경로=`#{META.JDBC.*}`, validation query=`SELECT 1`, Max Total 4~8 |
-| `CS_HIVE3_DBCP` | CFM 제공 Hive Connection Pool | HiveServer2의 실제 인증 방식 적용. Apache NiFi 2.x에는 Hive 구성요소가 없으므로 CFM 4.12.0 제공 이름을 확정 |
+| `CS_HIVE3_DBCP` | CFM 4.12 `ClouderaHiveConnectionPool`(`nifi-cdf-hive-nar`) | HiveServer2의 실제 인증 방식 적용. `DBCPService`를 구현하므로 `ExecuteSQLRecord`에도 쓴다. URL에 `hive.resultset.use.unique.column.names=false`(10.3). Apache NiFi 2.x에는 Hive 구성요소가 없다 |
 | `CS_JSON_WRITER_ARRAY` | `JsonRecordSetWriter` | Output Grouping=`Array`, pretty print=false |
 | `CS_PARQUET_WRITER` | `ParquetRecordSetWriter` | Schema=`Inherit Record Schema`, compression=`SNAPPY` |
 | `CS_PARQUET_READER` | `ParquetReader` | ValidateRecord에서 기록 결과 schema를 다시 읽음 |
@@ -1315,7 +1315,7 @@ flowchart TD
     C & G & J & K & L & M & P -.->|실패, 재시도 소진| ERR
 ```
 
-PoC는 40~46(입구와 `_SUCCESS`)까지 검증했다. 47 이후는 Hive가 필요하므로 V3 규칙을 적용한 설계다.
+PoC V4에서 40~4E 전체를 CFM 4.12(NiFi 2.6.0)와 Apache Hive 4.0.1로 검증했다(REVIEW 7.9).
 
 ### 10.2 주요 Processor 설정
 
@@ -1329,8 +1329,8 @@ PoC는 40~46(입구와 `_SUCCESS`)까지 검증했다. 47 이후는 Hive가 필�
 | 45 | `ReplaceText` | All Nodes, 1 | Replacement Value=빈 값 | success→46 |
 | 46 | `PutHDFS` | All Nodes, 1 | Directory=`${load.hdfs.path}`, Write and rename, conflict=replace, Retry Count 기준값 | success→47, failure→`errors` |
 | 47 | `ReplaceText` | All Nodes, 1 | 승인된 external table DDL로 전체 content 치환 | success→48 |
-| 48 | Hive 실행 Processor | All Nodes, 1 | `CS_HIVE3_DBCP`, Query Timeout, DDL 1건 | success→49, failure→`errors` |
-| 49 | Hive 조회 Processor 또는 `ExecuteSQLRecord` | All Nodes, 1 | 지표·기대값·PASS/FAIL을 한 번에 계산하는 SQL(10.3), JSON writer | success→4A, failure→`errors` |
+| 48 | `PutClouderaHiveQL` | All Nodes, 1 | `CS_HIVE3_DBCP`, Query timeout, Batch Size=1, Rollback On Failure=false, DDL 1건, `retry` 재시도 3회 | success→49, failure/retry→`errors` |
+| 49 | `ExecuteSQLRecord` | All Nodes, 1 | `CS_HIVE3_DBCP`, 지표·기대값·PASS/FAIL을 한 번에 계산하는 SQL(10.3), JSON writer | success→4A, failure→`errors` |
 | 4A | `JoltTransformJSON` | All Nodes, 1 | 지표 행 배열을 `{"stage":"STAGING","queryVersion":"v1","metrics":[...]}`로 변환 | success→4B, failure→`errors` |
 | 4B | `InvokeHTTP` | All Nodes, 1 | `POST /runs/${load.run.id}/validations` | Original→4C, No Retry/Retry/Failure→`errors` |
 | 4C | `ReplaceText` | All Nodes, 1 | 본문 `{}` | success→4D |
@@ -1355,7 +1355,10 @@ LOCATION '${load.hdfs.path}'
 
 `load.stage.table`은 `${load.run.id}`에서 하이픈을 제거한 안전한 suffix만 사용하고 정규식으로 검증한다.
 
-Apache NiFi 2.x에는 Hive 번들이 없다. NiFi 2.4.0 배포본의 Processor 목록에서 `PutHive3QL`/`SelectHive3QL`이 없음을 확인했다. 이 문서의 "Hive 실행 Processor", "Hive 조회 Processor", `CS_HIVE3_DBCP`는 CFM이 제공하는 Hive 구성요소를 가리키는 자리표시자다(`PutHive3QL`, `SelectHive3QL`, `PutClouderaHiveQL` 등). 구현 전에 CFM 4.12.0 supported processors 목록(21장)에서 실제 Processor와 Controller Service 이름, 지원 속성(Query Timeout, Rollback On Failure 등)을 확정한다. 제공 구성요소가 없다면 Hive JDBC driver와 `ExecuteSQL`/`ExecuteSQLRecord`로 DDL·DML을 실행할 수 있는지 사전 시험한 뒤 대체한다.
+Apache NiFi 2.x에는 Hive 번들이 없다. CFM 4.12.0의 Hive 구성요소는 `ClouderaHiveConnectionPool`, `PutClouderaHiveQL`, `SelectClouderaHiveQL`이다(`nifi-cdf-hive-nar`). PoC는 DDL·DML(48, 55)에 `PutClouderaHiveQL`을, 지표 조회(49, 61)에 `ExecuteSQLRecord`와 JSON writer를 썼다. `SelectClouderaHiveQL`은 Avro·CSV만 내보내 Jolt 앞에 변환이 하나 더 필요하다. PoC에서 확인한 `PutClouderaHiveQL` 동작:
+
+- SQL 오류(`SemanticException` 등)는 `failure`로 가지만 FlowFile에 오류 attribute를 남기지 않는다. 원인은 bulletin에만 있다
+- HiveServer2에 연결할 수 없으면 `failure`·`retry`로 보내지 않고 세션을 rollback해 FlowFile을 입력 큐에 남긴다. Hive가 돌아오면 그대로 이어서 실행한다
 
 ### 10.3 Stage 지표 SQL
 
@@ -1364,15 +1367,15 @@ Apache NiFi 2.x에는 Hive 번들이 없다. NiFi 2.4.0 배포본의 Processor �
 ```sql
 WITH s AS (
   SELECT COUNT(*) AS cnt,
-         SUM(CASE WHEN INSP_DTL_SEQ IS NULL THEN 1 ELSE 0 END) AS null_cnt,
+         COALESCE(SUM(CASE WHEN INSP_DTL_SEQ IS NULL THEN 1 ELSE 0 END), 0) AS null_cnt,
          COUNT(*) - COUNT(DISTINCT <BUSINESS_PK>) AS dup_cnt,
-         SUM(<BUSINESS_AMOUNT>) AS amount_sum,
-         DATE_FORMAT(MIN(<BUSINESS_TIMESTAMP>), 'yyyy-MM-dd HH:mm:ss') AS min_ts,
-         DATE_FORMAT(MAX(<BUSINESS_TIMESTAMP>), 'yyyy-MM-dd HH:mm:ss') AS max_ts
+         COALESCE(SUM(<BUSINESS_AMOUNT>), 0) AS amount_sum,
+         COALESCE(DATE_FORMAT(MIN(<BUSINESS_TIMESTAMP>), 'yyyy-MM-dd HH:mm:ss'), '') AS min_ts,
+         COALESCE(DATE_FORMAT(MAX(<BUSINESS_TIMESTAMP>), 'yyyy-MM-dd HH:mm:ss'), '') AS max_ts
     FROM #{HIVE.STAGE.DB}.${load.stage.table}
 )
-SELECT 'ROW_COUNT' AS metric_name, '${load.source.count}' AS expected_value, CAST(cnt AS STRING) AS actual_value,
-       IF(cnt = ${load.source.count}, 'PASS', 'FAIL') AS result FROM s
+SELECT 'STAGE_COUNT' AS metric_name, '${load.source.count}' AS expected_value, CAST(cnt AS STRING) AS actual_value,
+       IF(cnt = ${load.source.count} AND cnt = ${load.extracted.count}, 'PASS', 'FAIL') AS result FROM s
 UNION ALL
 SELECT 'NULL_SPLIT_COUNT', '0', CAST(null_cnt AS STRING), IF(null_cnt = 0, 'PASS', 'FAIL') FROM s
 UNION ALL
@@ -1386,7 +1389,7 @@ UNION ALL
 SELECT 'MAX_TS', '${validation.source.MAX_TS}', max_ts, IF(max_ts = '${validation.source.MAX_TS}', 'PASS', 'FAIL') FROM s
 ```
 
-`MIN_TS`/`MAX_TS`는 원천(7.3)과 같은 형식(`yyyy-MM-dd HH:mm:ss`)의 문자열로 비교한다. `CAST(... AS STRING)`은 소수 초를 붙일 수 있어 원천 형식과 달라지므로 `DATE_FORMAT`으로 맞춘다. 시간대 해석이 어긋나면 count는 같아도 이 지표가 불일치한다(4장). Hive는 결과 컬럼 이름을 소문자로 돌려주므로 4A의 Jolt spec은 소문자 이름(`metric_name` 등)을 `metricName` 등으로 옮긴다. CTE가 지표마다 다시 계산되면 `hive.optimize.cte.materialize.threshold`로 한 번만 계산하게 한다.
+`MIN_TS`/`MAX_TS`는 원천(7.3)과 같은 형식(`yyyy-MM-dd HH:mm:ss`)의 문자열로 비교한다. `CAST(... AS STRING)`은 소수 초를 붙일 수 있어 원천 형식과 달라지므로 `DATE_FORMAT`으로 맞춘다. 시간대 해석이 어긋나면 count는 같아도 이 지표가 불일치한다(4장). Hive는 결과 컬럼 이름을 소문자로 돌려주므로 4A의 Jolt spec은 소문자 이름(`metric_name` 등)을 `metricName` 등으로 옮긴다. Hive JDBC는 기본으로 컬럼 이름 앞에 table alias를 붙이므로(`hive.resultset.use.unique.column.names=true`) JDBC URL에 `?hive.resultset.use.unique.column.names=false`를 둔다. 건수 지표 이름은 `STAGE_COUNT`(target은 `TARGET_COUNT`)로 한다. API가 이 이름의 값을 `staging_count`·`target_count`로 저장한다. 빈 결과에서 `SUM`·`MIN`·`MAX`가 NULL이 되어 비교가 어긋나지 않도록 `COALESCE`로 원천(7.3의 `NVL`)과 맞춘다. 실제 SQL에 들어가는 attribute는 PoC 빌더처럼 숫자·허용 문자만 남기도록 EL로 걸러 넣는다. CTE가 지표마다 다시 계산되면 `hive.optimize.cte.materialize.threshold`로 한 번만 계산하게 한다.
 
 4B는 지표별 PASS/FAIL을 모두 보고한다. FAIL이 있어도 먼저 기록한 뒤 4D에서 판정한다. API는 NiFi의 판정을 그대로 믿지 않고, 저장된 STAGING 지표가 모두 PASS일 때만 `STAGE_VALIDATING → STAGING_VALIDATED`로 CAS 갱신하고 `stageValidated=true`를 돌려준다.
 
@@ -1416,7 +1419,7 @@ flowchart TD
     C & RS -.->|실패, 재시도 소진| ERR
 ```
 
-PG-50은 PoC 범위 밖이다(Hive 없음). V3 규칙을 적용한 설계다.
+PoC V4에서 CFM 4.12와 Apache Hive 4.0.1로 검증했다(REVIEW 7.9). 55A·56F는 두지 않았다(아래).
 
 ### 11.2 주요 Processor 설정
 
@@ -1427,7 +1430,7 @@ PG-50은 PoC 범위 밖이다(Hive 없음). V3 규칙을 적용한 설계다.
 | 52 | `InvokeHTTP` | All Nodes, 1 | `POST /runs/${load.run.id}/publish/claim`, `Response Body Attribute Name=api.response` | Original→53, No Retry/Retry/Failure→`errors` |
 | 53 | `RouteOnAttribute` | All Nodes, 1 | `claimed=${api.response:jsonPath('$.claimed'):equals('true')}` | claimed→54, unmatched→auto-terminate |
 | 54 | `ReplaceText` | All Nodes, 1 | 승인된 target/partition/column로 `INSERT OVERWRITE` SQL 생성 | success→55 |
-| 55 | Hive 실행 Processor | All Nodes, 1 | `CS_HIVE3_DBCP`, Query Timeout, 환경 지원 시 Rollback On Failure=true. **재시도 없음** | success→56, failure→55A |
+| 55 | `PutClouderaHiveQL` | All Nodes, 1 | `CS_HIVE3_DBCP`, Query timeout, Batch Size=1, Rollback On Failure=false. **재시도 없음** | success→56, failure/retry→56U(PoC). 오류 attribute가 있는 Processor면 failure→55A |
 | 55A | `RouteOnAttribute` | All Nodes, 1 | 오류 attribute로 실행 전 실패 여부 판별(아래 기준) | pre_execution→56F, unmatched→56U |
 | 56, 56F, 56U | `ReplaceText` | All Nodes, 1 | 본문 `{"publishToken":"${publish.token}","outcome":"PUBLISHED"}`(56). 56F·56U는 `outcome`을 `FAILED_PUBLISH`·`PUBLISH_UNKNOWN`으로 하고 `"errorCode"`, `"message"`(`escapeJson`)를 넣는다 | success→57 |
 | 57 | `InvokeHTTP` | All Nodes, 1 | `POST /runs/${load.run.id}/publish/result`, `Response Body Attribute Name=api.response` | Original→58, No Retry/Retry/Failure→`errors` |
@@ -1458,7 +1461,7 @@ Hive Processor의 `failure` relationship만으로는 "SQL이 실행되지 않은
 - 권한 오류: authorization 실패 메시지
 - 연결 획득 실패: 연결 수립 단계 오류로, 문장 제출 전임이 확실한 경우
 
-timeout, connection reset, 원인 불명 오류는 모두 `PUBLISH_UNKNOWN`이다. CFM Hive Processor가 failure FlowFile에 어떤 오류 attribute(SQLState, message)를 붙이는지는 구현 전에 확인한다. attribute가 없으면 55A와 56F를 두지 않고 모든 failure를 `PUBLISH_UNKNOWN`으로 처리한다.
+timeout, connection reset, 원인 불명 오류는 모두 `PUBLISH_UNKNOWN`이다. CFM 4.12 `PutClouderaHiveQL`은 failure FlowFile에 오류 attribute(SQLState, message)를 붙이지 않는다(PoC에서 `SemanticException`으로 확인). 그래서 PoC는 55A와 56F를 두지 않고 모든 failure·retry를 `PUBLISH_UNKNOWN`으로 보고하며, 운영자가 bulletin과 Hive 이력을 보고 확정한다. 연결 획득 실패는 failure로 오지 않고 FlowFile이 55 앞 큐에 남는다(10.2). 이때 SQL은 제출되지 않았으므로 Hive가 돌아온 뒤 실행돼도 안전하다.
 
 ---
 
@@ -1480,14 +1483,14 @@ flowchart TD
     Q & J & V & S -.->|실패, 재시도 소진| ERR
 ```
 
-PG-60은 PoC 범위 밖이다(Hive 없음). V3 규칙을 적용한 설계다.
+PoC V4에서 CFM 4.12와 Apache Hive 4.0.1로 검증했다(REVIEW 7.9).
 
 ### 12.2 주요 Processor 설정
 
 | ID | Processor | Scheduling | 주요 Properties | Relationship |
 |---|---|---|---|---|
 | 60 | `UpdateAttribute` | All Nodes, 1 | `load.stage=TARGET_VALIDATION` | success→61 |
-| 61 | Hive 조회 Processor 또는 `ExecuteSQLRecord` | All Nodes, 1 | target 업무 범위의 지표·기대값·PASS/FAIL SQL(10.3과 같은 형식, FROM만 target 업무 범위) | success→62, failure→`errors` |
+| 61 | `ExecuteSQLRecord` | All Nodes, 1 | `CS_HIVE3_DBCP`, target 업무 범위의 지표·기대값·PASS/FAIL SQL(10.3과 같은 형식, FROM만 target 업무 범위, 건수 지표는 `TARGET_COUNT`) | success→62, failure→`errors` |
 | 62 | `JoltTransformJSON` | All Nodes, 1 | `{"stage":"TARGET","queryVersion":"v1","metrics":[...]}` | success→63, failure→`errors` |
 | 63 | `InvokeHTTP` | All Nodes, 1 | `POST /runs/${load.run.id}/validations` | Original→64, No Retry/Retry/Failure→`errors` |
 | 64 | `ReplaceText` | All Nodes, 1 | 본문 `{}`(`targetCount`는 선택 필드) | success→65 |

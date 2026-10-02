@@ -259,6 +259,35 @@ V4를 Cloudera CFM 4.12(NiFi 2.6.0.4.12.0.1-9) 2노드 비보안 클러스터(`r
 | 정상 실행(업무일자 `2026-09-28`) | run 1개만 생성, `STAGE_VALIDATING`. 8/8 SUCCESS(0002는 0건), 105,000건. 7개 파티션이 Round Robin으로 vm2 4개·vm3 3개에 나뉘어 추출됨(`worker_node`) |
 | 결과 파일 | `file:///`라 Parquet가 처리한 노드의 로컬 디스크에 나뉘어 생기고 `_SUCCESS`는 검증 요청을 받은 vm2에만 생긴다. 운영처럼 HDFS를 쓰면 한 경로에 모인다 |
 
+### 7.9 Hive 단계: PG-40 나머지, PG-50, PG-60 (2026-10-03)
+
+가이드 10~12장 설계대로 PG-40의 47~4E, PG-50, PG-60을 V4 빌더에 넣고 7.8의 CFM 클러스터에서 run을 `SUCCESS`까지 실행했다. 구성은 PG 9개, Processor 68개, Connection 127개, Port 19개다.
+
+- 시험 환경: `poc/hdfs-hive/compose.yaml`. Apache Hadoop 3.4.1 단일 NameNode·DataNode(권한 검사 끔)와 Apache Hive 4.0.1 HiveServer2(Derby metastore, Tez local, 인증 없음)를 host network의 `192.168.122.1`에 띄웠다. 7.8의 `file:///` 대신 이 HDFS(`/data/nifi/stage`)에 쓴다. Hive `hive.local.time.zone`은 NiFi 노드와 같은 `America/New_York`
+- CFM Hive 구성요소: `ClouderaHiveConnectionPool`(`CS_HIVE3_DBCP`, `DBCPService` 구현), DDL·DML은 `PutClouderaHiveQL`(48, 55), 지표 조회는 `ExecuteSQLRecord` + JSON writer(49, 61). CFM의 Hive 3 JDBC client가 Hive 4.0.1 서버와 문제없이 동작했다
+- target: `dw.insp_dtl`(external, Parquet, `PARTITIONED BY (base_dt STRING)`)을 미리 만들고 `INSERT OVERWRITE ... PARTITION (base_dt='<업무일자>')`로 교체
+- 새 Parameter: 공통 `HIVE.JDBC.URL`·`USER`·`PASSWORD`·`POOL.MAX`·`QUERY.TIMEOUT`, Job `HIVE.STAGE.DB`, `HIVE.STAGE.DDL.COLUMNS`, `HIVE.TARGET.DB`·`TABLE`, `TARGET.PARTITION.CLAUSE`, `HIVE.INSERT.COLUMNS`, `TARGET.BUSINESS.WHERE`, `DQ.PK.COLUMN`
+- PG-90: `STAGE_VALIDATION`(44 이후)과 `TARGET_VALIDATION` 실패도 `report_run`으로 보내고, 기대 상태·실패 상태를 `load.fail.expected`/`load.fail.status`로 정한다(가이드 14.2 91 표). 판정 응답(`reasons`, `changed`)이 있으면 그 응답을 이벤트 메시지로 쓴다
+
+| 시나리오 | 결과 |
+|---|---|
+| 정상 실행 | run `SUCCESS`, `source = extracted = staging = target = 105,000`. STAGING·TARGET 지표 6개씩(`*_COUNT`, `NULL_SPLIT_COUNT`, `DUP_PK_COUNT`, `AMOUNT_SUM` 71,853,075, `MIN_TS` `2026-09-28 00:00:01`, `MAX_TS` `2026-09-29 09:20:00`) 모두 PASS. 검증 시작부터 `RUN_SUCCESS`까지 약 30초. staging table `stg.tmp_insp_dtl_<run_id>`, target 파티션 `base_dt=2026-09-28` 1개 |
+| staging DQ 실패(`DQ.PK.COLUMN=ITEM_CD`) | `DUP_PK_COUNT` 104,983 FAIL → API `STAGING_METRIC_FAILED`(WARN), 4D `stageValidated=false` → PG-90 → run `FAILED_STAGE_VALIDATION`. 게시 없음 |
+| 게시 실패(`HIVE.INSERT.COLUMNS`에 없는 컬럼) | 55 `failure`(`SemanticException`) → 56U → run `PUBLISH_UNKNOWN`. 이후 operator `/publish-unknown/resolve`(`FAILED_PUBLISH`)로 확정 |
+| target 검증 실패(`TARGET.BUSINESS.WHERE`를 다른 날짜로) | 게시 후 `TARGET_COUNT` 0 등 5개 FAIL → API `TARGET_METRIC_FAILED`, 65 `success=false` → run `FAILED_TARGET_VALIDATION`. 이벤트 메시지에 API `reasons`가 남음. 재게시 없음 |
+| HiveServer2 중단 중 실행 | 48이 연결 실패로 세션을 rollback하고 FlowFile을 큐에 남김(failure로 가지 않음). run은 `STAGE_VALIDATING`에서 대기. Hive 재기동(약 1.5분 뒤) 후 이어서 진행해 `SUCCESS` |
+
+확인한 사항:
+
+1. **`PutClouderaHiveQL`은 failure FlowFile에 오류 attribute를 남기지 않는다.** provenance에는 앞 단계의 `executesql.*`와 `query.output.tables`만 있고 Hive 오류는 bulletin에만 있다. 그래서 가이드 11.2에 적은 대로 55A·56F를 두지 않고 failure·retry를 모두 `PUBLISH_UNKNOWN`으로 보고한다
+2. 연결 획득 실패는 failure·retry가 아니라 rollback이다. 48·55 모두 SQL을 제출하기 전이므로 Hive가 돌아온 뒤 실행돼도 안전하다. 대기 시간은 API sweeper(`validation_stale`, `publish_stale`)가 감시한다
+3. Hive JDBC는 기본으로 결과 컬럼 이름에 table alias를 붙인다(beeline에서 `ptest.insp_dtl_seq` 형태로 확인). `HIVE.JDBC.URL`에 `?hive.resultset.use.unique.column.names=false`를 둬서 4A·62 Jolt가 소문자 이름을 그대로 받게 했다
+4. API는 건수 지표 이름 `STAGE_COUNT`·`TARGET_COUNT`의 값을 `staging_count`·`target_count`로 저장한다. 가이드 10.3 예시의 `ROW_COUNT`를 고쳤다
+5. 빈 결과에서 Hive `SUM`은 NULL이라 `NULL_SPLIT_COUNT`가 빈 값으로 FAIL했다(target 검증 실패 시험에서 발견). `COALESCE`로 고쳤다
+6. 시간대: NiFi JVM과 Hive `hive.local.time.zone`이 같으면 Hive에서 읽은 timestamp가 Oracle 값과 같다. JDBC URL hiveconf로 세션 시간대를 `UTC`로 바꾸는 시험은 지표에 영향이 없어 결론을 내지 못했다. 서버 설정(`hive-site.xml`)으로 맞춘다
+7. Hive 4.0.1 컨테이너 운영 주의: PID 파일이 `/opt/hive/conf`에 남아 `docker restart`가 실패하고, Derby metastore 기본 경로가 컨테이너 안이라 컨테이너를 다시 만들면 메타데이터가 사라진다. compose에서 PID를 tmpfs로, metastore를 볼륨으로 옮겼다. 메타데이터가 빈 동안 큐에 있던 run 하나가 `stg` DB가 없어 `FAILED_STAGE_VALIDATION`이 됐다(정상 동작)
+8. Parameter Context를 REST로 바꿀 때 `inheritedParameterContexts`를 빼면 상속 해제로 해석돼 409(사용 중인 Parameter 삭제)가 난다. 클러스터에서 Trigger가 enable된 채 상위 PG를 Start하면 Trigger가 바로 실행된다(매뉴얼 5.3 주의와 같음)
+
 ### 7.5 재현 방법 (V4)
 
 ```bash

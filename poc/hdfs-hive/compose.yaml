@@ -1,0 +1,49 @@
+# Sqoop 대체 PoC용 HDFS + HiveServer2 (CFM NiFi 클러스터에서 192.168.122.1로 접근)
+# 실행: docker compose -f poc/hdfs-hive/compose.yaml up -d
+name: nifi-poc-hdfs-hive
+x-hadoop: &hadoop
+  image: apache/hadoop:3.4.1
+  network_mode: host
+  restart: unless-stopped
+  environment:
+    HADOOP_CONF_DIR: /etc/poc-hadoop
+services:
+  namenode:
+    <<: *hadoop
+    container_name: nifi-poc-namenode
+    user: root
+    command: ["bash", "-c", "[ -d /hadoop/dfs/name/current ] || hdfs namenode -format -nonInteractive; exec hdfs namenode"]
+    volumes:
+      - ./conf:/etc/poc-hadoop:ro
+      - namenode:/hadoop/dfs/name
+  datanode:
+    <<: *hadoop
+    container_name: nifi-poc-datanode
+    user: root
+    command: ["hdfs", "datanode"]
+    depends_on: [namenode]
+    volumes:
+      - ./conf:/etc/poc-hadoop:ro
+      - datanode:/hadoop/dfs/data
+  # 볼륨은 root 소유로 만들어진다. 처음 한 번:
+  #   docker run --rm -u root -v nifi-poc-hdfs-hive_hive:/opt/hive/data --entrypoint chown apache/hive:4.0.1 hive:hive /opt/hive/data
+  hiveserver2:
+    image: apache/hive:4.0.1
+    container_name: nifi-poc-hiveserver2
+    network_mode: host
+    restart: unless-stopped
+    depends_on: [namenode, datanode]
+    environment:
+      SERVICE_NAME: hiveserver2
+      HADOOP_CONF_DIR: /etc/poc-hadoop
+      TZ: America/New_York
+      HIVESERVER2_PID_DIR: /run/hs2   # 기본값(conf)에 PID가 남으면 재시작이 막힌다
+    tmpfs: [/run/hs2]
+    volumes:
+      - ./conf:/etc/poc-hadoop:ro
+      - ./conf/hive-site.xml:/opt/hive/conf/hive-site.xml:ro
+      - hive:/opt/hive/data
+volumes:
+  namenode:
+  datanode:
+  hive:

@@ -225,11 +225,11 @@ error_class, error_code, message
 4. [Load Control API 구현](./load-control-api/README.md)
    - FastAPI 프로젝트(API 설계 12장 1~2단계): 실행, migration, 테스트 방법
 5. [가이드 검토 및 NiFi 2.4.0 PoC 결과](./poc/REVIEW.md)
-   - V1(API 없음, NiFi가 원장 직접 기록, PG-30 Wait/Notify)과 V3(Load Control API 연동, 자식 PG + Port, Processor 41개, PostgreSQL 원천) PoC 결과, V4(V3 구조의 Oracle 원천, Oracle 23ai Free 컨테이너에서 V3 시나리오 재수행). 빌더는 `poc/build_flow_v1.py`, `poc/build_flow_v3.py`, `poc/build_flow_v4.py`
+   - V1(API 없음, NiFi가 원장 직접 기록, PG-30 Wait/Notify)과 V3(Load Control API 연동, 자식 PG + Port, Processor 41개, PostgreSQL 원천) PoC 결과, V4(V3 구조의 Oracle 원천, Oracle 23ai Free 컨테이너에서 V3 시나리오 재수행, CFM 4.12 클러스터와 Hive 4.0.1에서 PG-40~60까지 실행). 빌더는 `poc/build_flow_v1.py`, `poc/build_flow_v3.py`, `poc/build_flow_v4.py`
 6. [V4 Oracle 원천 Flow 사용 매뉴얼](./poc/V4-MANUAL.md)
-   - V4 구성, Oracle·API 사전 준비, 설정 Parameter, 생성·실행·삭제, 결과 확인, 오류 코드와 대응, Oracle 시험 환경
+   - V4 구성, Oracle·Hive·API 사전 준비, 설정 Parameter, 생성·실행·삭제, 결과 확인, 오류 코드와 대응(`PUBLISH_UNKNOWN` 확정 포함), Oracle·HDFS·Hive 시험 환경
 7. [운영 적용 TODO](./TODO.md)
-   - PoC 이후 운영 적용까지 남은 일: 플랫폼 확정, 미구현 PG-40~60, 운영 Oracle·HDFS·Hive, API 배포·보안, cluster 재시험, 전환
+   - PoC 이후 운영 적용까지 남은 일: 플랫폼 확정(CDP Hive 재시험), 운영 Oracle·HDFS·Hive, API 배포·보안, cluster 재시험, 전환
 
 ## 구현 전 확인 항목
 

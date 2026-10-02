@@ -1,0 +1,23 @@
+<?xml version="1.0"?>
+<!-- HiveServer2 4.0.1, embedded Derby metastore, Tez local mode. -->
+<configuration>
+  <property><name>hive.server2.thrift.bind.host</name><value>192.168.122.1</value></property>
+  <property><name>hive.server2.thrift.port</name><value>10000</value></property>
+  <property><name>hive.server2.webui.host</name><value>192.168.122.1</value></property>
+  <!-- Derby metastore를 볼륨(/opt/hive/data)에 둔다. 기본값은 작업 디렉터리라 컨테이너를 다시 만들면 사라진다. -->
+  <property><name>javax.jdo.option.ConnectionURL</name><value>jdbc:derby:;databaseName=/opt/hive/data/metastore_db;create=true</value></property>
+  <property><name>hive.server2.enable.doAs</name><value>false</value></property>
+  <property><name>hive.metastore.warehouse.dir</name><value>/warehouse/tablespace/managed/hive</value></property>
+  <property><name>hive.metastore.warehouse.external.dir</name><value>/warehouse/tablespace/external/hive</value></property>
+  <property><name>hive.exec.scratchdir</name><value>/tmp/hive</value></property>
+  <property><name>hive.user.install.directory</name><value>/user</value></property>
+  <property><name>hive.execution.engine</name><value>tez</value></property>
+  <property><name>tez.local.mode</name><value>true</value></property>
+  <property><name>tez.runtime.optimize.local.fetch</name><value>true</value></property>
+  <property><name>mapreduce.framework.name</name><value>local</value></property>
+  <property><name>hive.exec.submit.local.task.via.child</name><value>false</value></property>
+  <property><name>hive.tez.exec.inplace.progress</name><value>false</value></property>
+  <property><name>metastore.metastore.event.db.notification.api.auth</name><value>false</value></property>
+  <!-- NiFi JVM 시간대(America/New_York)와 맞춘다. Parquet timestamp(UTC 기준)를 원천과 같은 벽시계 값으로 읽는다. -->
+  <property><name>hive.local.time.zone</name><value>America/New_York</value></property>
+</configuration>

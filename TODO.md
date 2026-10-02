@@ -6,37 +6,38 @@ PoC(V3 PostgreSQL 원천, V4 Oracle 원천)에서 검증한 구조를 CFM 4.12.0
 
 | 영역 | 상태 |
 |---|---|
-| PG-00 Trigger, PG-10 Coordinator, PG-20 Worker, PG-05 Receiver, PG-90 Error | NiFi 2.4.0 단일 노드에서 검증(V3, V4) |
-| PG-40 Staging Validation | 입구 7개만 검증. Hive staging DDL·DQ 미구현 |
-| PG-50 Publish, PG-60 Target Validation | 미구현·미검증 |
+| PG-00 Trigger, PG-10 Coordinator, PG-20 Worker, PG-05 Receiver, PG-90 Error | NiFi 2.4.0 단일 노드(V3, V4)와 CFM 4.12 2노드 클러스터(V4)에서 검증 |
+| PG-40 Staging Validation, PG-50 Publish, PG-60 Target Validation | V4에 구현. CFM 4.12 + Apache Hive 4.0.1(시험용 컨테이너)에서 검증(REVIEW 7.9) |
 | Load Control API | 구현·단위 테스트 완료. 단일 인스턴스, 평문 HTTP로만 연동 시험 |
-| 시나리오 | 정상, 0건 파티션, 중복 실행, HDFS 실패, API 중단, 재발행, `NUMBER` 정밀도, `ORA-01555` 통과(REVIEW 6.2, 7.4~7.7) |
+| 시나리오 | 정상, 0건 파티션, 중복 실행, HDFS 실패, API 중단, 재발행, `NUMBER` 정밀도, `ORA-01555`(REVIEW 6.2, 7.4~7.7), staging DQ 실패, 게시 실패(`PUBLISH_UNKNOWN`과 운영자 확정), target 검증 실패, HiveServer2 중단(REVIEW 7.9) 통과 |
 
 PoC와 운영 환경의 차이:
 
 | 항목 | PoC | 운영 |
 |---|---|---|
-| NiFi | Apache NiFi 2.4.0 단일 노드 | CFM 4.12.0(NiFi 2.6.0) cluster |
+| NiFi | Apache NiFi 2.4.0 단일 노드, CFM 4.12.0 2노드(비보안) | CFM 4.12.0(NiFi 2.6.0) cluster |
 | Oracle | 23ai Free 컨테이너 | 운영 Oracle(버전 확인 필요) |
-| HDFS | `fs.defaultFS=file:///` | 실제 HDFS |
-| Hive | 없음 | HiveServer2 |
+| HDFS | `file:///`, 이후 단일 노드 Apache Hadoop 3.4.1 컨테이너(권한 검사 끔) | 실제 HDFS |
+| Hive | Apache Hive 4.0.1 HiveServer2 컨테이너(인증 없음, Derby metastore) | CDP HiveServer2(인증, ACID 정책) |
 | NiFi ↔ API | 평문 HTTP, Bearer 토큰 | mTLS(가이드 4장, API 설계 10.2) |
 | 배포 | `poc/build_flow_v4.py`가 REST API로 생성 | Registry 또는 조직 표준 배포 절차 |
 
 ## 1. 플랫폼과 버전 확정
 
-- [ ] CFM 4.12.0(NiFi 2.6.0)에서 V4 빌더로 Flow를 생성하고 43개 Processor가 VALID인지 확인한다. Processor 속성 이름과 relationship이 2.4.0과 다르면 빌더를 고친다
-- [ ] CFM 4.12.0 배포본에 `nifi-parquet-nar`, `nifi-hadoop-nar`, `nifi-hadoop-libraries-nar`가 포함돼 있는지 확인한다(PoC에서는 따로 설치)
-- [ ] CFM 4.12.0 Hive Processor·Connection Pool의 실제 이름을 확정하고 `CS_HIVE3_DBCP`에 반영한다(가이드 4장·10장, REVIEW 2장 #5)
+- [x] CFM 4.12.0(NiFi 2.6.0)에서 V4 빌더로 Flow를 생성하고 Processor가 모두 VALID인지 확인한다(REVIEW 7.8, 7.9). 2.4.0과 다른 속성 이름은 없었다
+- [x] CFM 4.12.0 배포본에 `nifi-parquet-nar`, `nifi-hadoop-nar`, `nifi-hadoop-libraries-nar`가 포함돼 있는지 확인한다(포함, REVIEW 7.8)
+- [x] CFM 4.12.0 Hive Processor·Connection Pool의 실제 이름을 확정하고 `CS_HIVE3_DBCP`에 반영한다: `ClouderaHiveConnectionPool`, `PutClouderaHiveQL`(가이드 4장·10장)
+- [ ] CDP HiveServer2(Hive 3)와 실제 인증(Kerberos/LDAP)으로 V4를 다시 시험한다. PoC는 Apache Hive 4.0.1, 인증 없음이었다. 특히 target 테이블이 ACID managed table이면 `INSERT OVERWRITE`와 external staging 조합을 확인한다
 - [ ] 운영 Oracle 버전에 맞는 ojdbc 버전을 정하고 모든 노드의 같은 경로에 배포한다(`ORACLE.JDBC.DRIVER.PATH`)
 - [ ] 관리 DB PostgreSQL 버전과 JDBC 드라이버 경로를 정한다(`META.JDBC.DRIVER.PATH`)
 
 ## 2. 미구현 Flow
 
-- [ ] PG-40 Staging Validation 나머지: Hive external staging 테이블 DDL(run root 경로), staging count·`AMOUNT_SUM`·`MIN_TS`/`MAX_TS` DQ, API 보고(가이드 10장)
-- [ ] PG-50 Publish: publish claim CAS, `INSERT OVERWRITE`, `PUBLISH_UNKNOWN` 처리. 55는 재시도하지 않는다(가이드 11장)
-- [ ] PG-60 Target Validation: target 지표를 source·staging과 비교하고 최종 상태를 보고한다(가이드 12장)
-- [ ] 비운영 target에서 `INSERT OVERWRITE`와 `PUBLISH_UNKNOWN` 경로를 시험한다(가이드 19장 7)
+- [x] PG-40 Staging Validation 나머지: Hive external staging 테이블 DDL(run root 경로), staging count·`AMOUNT_SUM`·`MIN_TS`/`MAX_TS` DQ, API 보고(가이드 10장)
+- [x] PG-50 Publish: publish claim CAS, `INSERT OVERWRITE`, `PUBLISH_UNKNOWN` 처리. 55는 재시도하지 않는다(가이드 11장)
+- [x] PG-60 Target Validation: target 지표를 source·staging과 비교하고 최종 상태를 보고한다(가이드 12장)
+- [x] 비운영 target에서 `INSERT OVERWRITE`와 `PUBLISH_UNKNOWN` 경로를 시험한다(가이드 19장 7, REVIEW 7.9)
+- [ ] staging external table과 run 경로 정리 Job(성공 run은 보존 기간 뒤, 실패 run은 원인 확인 뒤)
 - [ ] PG-05 Control Receiver를 root로 옮기고 Job별 Output Port로 나눈다(가이드 2장). 빌더는 현재 Job PG 안에 둔다
 - [ ] 선택: PG-20 `ValidateRecord` + `CS_SCHEMA_REGISTRY`(승인된 target schema), PG-90 DLQ·알림(가이드 8장, 14장)
 - [ ] 선택: PutHDFS 실패가 PG-90에서 `NON_RETRYABLE`로 분류된다. 운영 분류가 필요하면 PG-20의 `load.stage`를 세분한다(REVIEW 6.3 #14)

@@ -27,7 +27,12 @@
   "EXTRACT.FETCH.SIZE": "5000",
   "EXTRACT.ROWS.PER.FILE": "500000",
   "EXTRACT.QUERY.TIMEOUT": "60 min",
-  "PARTITION.RETRY.MAX": "3"
+  "PARTITION.RETRY.MAX": "3",
+  "HIVE.JDBC.URL": "jdbc:hive2://hs2-host:10000/default?hive.resultset.use.unique.column.names=false",
+  "HIVE.JDBC.USER": "nifi",
+  "HIVE.JDBC.PASSWORD": "<secret>",
+  "HIVE.POOL.MAX": "4",
+  "HIVE.QUERY.TIMEOUT": "1800"
  },
  "job_params": {
   "JOB.KEY": "ORACLE_INSP_DTL_DAILY",
@@ -41,6 +46,14 @@
   "DQ.TIMESTAMP.COLUMN": "REG_TS",
   "PARTITION.COUNT": "8",
   "HIVE.STAGE.TABLE.PREFIX": "TMP_INSP_DTL_",
-  "ALLOW.EMPTY.SOURCE": "false"
+  "ALLOW.EMPTY.SOURCE": "false",
+  "HIVE.STAGE.DB": "stg",
+  "HIVE.STAGE.DDL.COLUMNS": "INSP_DTL_SEQ DECIMAL(19,0), BASE_DT TIMESTAMP, ITEM_CD STRING, AMOUNT DECIMAL(18,2), REG_TS TIMESTAMP, NOTE STRING",
+  "HIVE.TARGET.DB": "dw",
+  "HIVE.TARGET.TABLE": "insp_dtl",
+  "TARGET.PARTITION.CLAUSE": "PARTITION (base_dt='${load.business.key}')",
+  "HIVE.INSERT.COLUMNS": "INSP_DTL_SEQ, ITEM_CD, AMOUNT, REG_TS, NOTE",
+  "TARGET.BUSINESS.WHERE": "base_dt = '${load.business.key}'",
+  "DQ.PK.COLUMN": "INSP_DTL_SEQ"
  }
 }

@@ -124,6 +124,14 @@ class DispatchSettings(Section):
     batch: int = Field(default=20, ge=1)
 
 
+class CleanupSettings(Section):
+    """정리 대상 판정 기준(NiFi PG-70 Cleanup이 조회). 끝난 시각(completed_at)부터 센다."""
+
+    success_retention: timedelta = timedelta(days=3)   # SUCCESS run의 staging·run 경로 보존 기간
+    failed_retention: timedelta = timedelta(days=14)   # 실패·TIMED_OUT run(원인 확인용)
+    max_batch: int = Field(default=200, ge=1)          # 한 번에 돌려줄 최대 run 수
+
+
 class WorkerSettings(Section):
     """worker 프로세스(dispatcher, sweeper) 설정."""
 
@@ -173,6 +181,7 @@ class Settings(BaseSettings):
     nifi: NifiSettings = Field(default_factory=NifiSettings)
     recovery: RecoverySettings = Field(default_factory=RecoverySettings)
     dispatch: DispatchSettings = Field(default_factory=DispatchSettings)
+    cleanup: CleanupSettings = Field(default_factory=CleanupSettings)
     worker: WorkerSettings = Field(default_factory=WorkerSettings)
     logging: LoggingSettings = Field(default_factory=LoggingSettings)
 

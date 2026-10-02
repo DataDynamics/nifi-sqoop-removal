@@ -214,6 +214,7 @@ root
     ├── PG-40 Staging Validation
     ├── PG-50 Publish
     ├── PG-60 Target Validation
+    ├── PG-70 Cleanup
     └── PG-90 Error and Event
 ```
 
@@ -227,12 +228,13 @@ flowchart LR
         RI((reissue-in)) -->|Round Robin| W
         S -->|staging-valid| P[PG-50 Publish]
         P -->|published| V[PG-60 Target Validation]
+        CL[PG-70 Cleanup]
         E[PG-90 Error and Event]
     end
     R5 -->|validate| VI
     R5 -->|reissue| RI
-    T & C & W & S & P & V -.->|errors| E
-    C & W & S & P & V -->|InvokeHTTP| API
+    T & C & W & S & P & V & CL -.->|errors| E
+    C & W & S & P & V & CL -->|InvokeHTTP| API
     E -->|run, partition fail| API
     API --- M[(PostgreSQL nifi_ops)]
 ```
@@ -247,7 +249,7 @@ flowchart LR
 | `published` | PG-50 Output Port | PG-60 Input Port | 없음 |
 | `errors` | 각 자식 PG Output Port | PG-90 Input Port | 없음 |
 
-가이드 초안의 PG-30 Partition and Run Gate(Wait/Notify)와 PG-70 Recovery Monitor는 없다. 완료 판정은 API가 하고, 검증 flow는 API의 호출을 PG-05가 받아 시작한다(9장). 복구는 API sweeper가 담당한다(13장).
+가이드 초안의 PG-30 Partition and Run Gate(Wait/Notify)와 PG-70 Recovery Monitor는 없다. 완료 판정은 API가 하고, 검증 flow는 API의 호출을 PG-05가 받아 시작한다(9장). 복구는 API sweeper가 담당한다(13장). PG-70 번호는 보존 기간이 지난 staging table과 run 경로를 지우는 PG-70 Cleanup(13.3)에 쓴다.
 
 참조 구현은 `poc/build_flow_v3.py`(PostgreSQL 원천, NiFi 2.4.0에서 검증)와 `poc/build_flow_v4.py`(같은 구조의 Oracle 원천, Oracle 23ai Free에서 검증)다. 두 빌더는 Job이 하나뿐이라 PG-05를 Job PG 안에 두었다. 운영에서는 위 구조처럼 root로 옮긴다.
 
@@ -272,9 +274,10 @@ flowchart LR
 | PG-10 Run Coordinator | 10 | PostgreSQL 원천 V3(SCN 조회 2개를 뺀 8개)와 Oracle 원천 V4(10개)로 검증 |
 | PG-20 Extract Worker | 9 (+ 선택 `ValidateRecord` 1) | 검증(`ValidateRecord` 제외) |
 | PG-05 Control Receiver | 6 | 검증(Job PG 안에 둔 형태) |
-| PG-40 Staging Validation | 15 | 입구 7개만 검증(Hive 없음) |
-| PG-50 Publish | 12 | 미검증 |
-| PG-60 Target Validation | 7 | 미검증 |
+| PG-40 Staging Validation | 15 | V4로 검증(CFM 4.12, Hive 4.0.1) |
+| PG-50 Publish | 12 (PoC 10: 55A·56F 생략, 11.2) | V4로 검증 |
+| PG-60 Target Validation | 7 | V4로 검증 |
+| PG-70 Cleanup | 11 | V4로 검증 |
 | PG-90 Error and Event | 8 (+ 선택 DLQ·알림 2) | 검증(선택 제외) |
 
 ### 2.3 실행 정책
@@ -284,6 +287,7 @@ flowchart LR
 | PG-00 Trigger, PG-10 Coordinator | Primary Node | 1 |
 | PG-20 Worker(Oracle 조회, PutHDFS, API 보고) | All Nodes | 노드당 `WORKER.CONCURRENT.TASKS` 기준값 |
 | PG-05 Control Receiver, PG-40, PG-50, PG-60 | All Nodes | 1 |
+| PG-70 Cleanup | 70(주기 트리거)은 Primary Node, 나머지는 All Nodes | 1 |
 | PG-90 Error and Event | All Nodes | 2~4 |
 
 API는 NiFi LB 주소 하나로 검증 flow를 호출하므로 어느 노드가 요청을 받을지 정할 수 없다. 그래서 PG-40~60은 All Nodes로 스케줄한다. Primary Node로 제한하면 다른 노드가 받은 FlowFile이 처리되지 않는다. 중복 실행은 Primary Node가 아니라 API의 CAS(`/validation/start`, `/publish/claim`)가 막는다.
@@ -327,8 +331,7 @@ Concurrent Tasks와 Retry Count는 정수 스케줄링 설정이라 Parameter(`#
 | `EXTRACT.QUERY.TIMEOUT` | `60 min` | N | 파티션 query timeout |
 | `PARTITION.RETRY.MAX` | `3` | N | PutHDFS Retry Count 기준값(배포 시 입력). 파티션 쿼리는 재시도하지 않는다(16장) |
 | `ALLOW.EMPTY.SOURCE` | `false` | N | 0건 overwrite 방지. `POST /runs`로 API에도 전달 |
-| `FAILED.RETENTION.DAYS` | `14` | N | 실패 staging 보존 |
-| `SUCCESS.RETENTION.DAYS` | `3` | N | 성공 staging 보존 |
+| `CLEANUP.BATCH` | `50` | N | PG-70이 한 주기에 정리할 최대 run 수. 보존 기간은 API 설정 `cleanup.success_retention`(기본 3일)·`cleanup.failed_retention`(기본 14일)이다(13.3) |
 
 run timeout, stale 판정, dispatch 재시도 같은 제어 설정은 NiFi Parameter가 아니라 API 설정(`config.yaml`, API 설계 9.4)이다. `EXTRACT.QUERY.TIMEOUT`은 NiFi와 API 양쪽에 같은 값을 둔다. API는 이 값으로 stale 여부를 판단한다.
 
@@ -439,6 +442,7 @@ CREATE TABLE nifi_ops.load_run (
     error_stage                  varchar(80),
     error_code                   varchar(100),
     error_message                varchar(2000),
+    cleaned_at                   timestamptz,          -- PG-70이 staging table·run 경로를 지운 시각(13.3)
     CONSTRAINT ck_load_run_status CHECK (status IN (
         'CREATED', 'EXTRACTING',
         'EXTRACTED_VALIDATED', 'STAGE_VALIDATING', 'STAGING_VALIDATED',
@@ -468,6 +472,11 @@ CREATE UNIQUE INDEX uq_load_run_active
 
 CREATE INDEX ix_load_run_status_heartbeat
     ON nifi_ops.load_run (status, heartbeat_at);
+
+-- 정리 대상 조회(13.3). 정리된 run은 인덱스에서 빠진다.
+CREATE INDEX ix_load_run_cleanup
+    ON nifi_ops.load_run (job_key, completed_at)
+    WHERE cleaned_at IS NULL;
 
 CREATE INDEX ix_load_run_job_started
     ON nifi_ops.load_run (job_key, started_at DESC);
@@ -1511,7 +1520,7 @@ API는 65에서 저장된 TARGET 지표가 모두 PASS이고 `status='PUBLISHED'
 
 ## 13. 복구: API Sweeper와 재발행
 
-가이드 초안의 PG-70 Recovery Monitor(NiFi `GenerateFlowFile` 주기 조회 + `PutSQL` CAS)는 두지 않는다. stale 판정과 상태 정리는 Load Control API의 worker 프로세스가 수행한다(API 설계 7장). NiFi는 API가 재발행을 요청할 때만 관여한다.
+가이드 초안의 PG-70 Recovery Monitor(NiFi `GenerateFlowFile` 주기 조회 + `PutSQL` CAS)는 두지 않는다. stale 판정과 상태 정리는 Load Control API의 worker 프로세스가 수행한다(API 설계 7장). NiFi는 API가 재발행을 요청할 때만 관여한다. 끝난 run의 staging table과 HDFS run 경로 삭제는 PG-70 Cleanup이 한다(13.3).
 
 ### 13.1 Sweeper 규칙
 
@@ -1541,6 +1550,46 @@ API는 65에서 저장된 TARGET 지표가 모두 PASS이고 `status='PUBLISHED'
 재발행 수신에는 별도 Processor가 없다. PG-05의 09가 본문 필드를 `load.*`, `partition.*` attribute로 한 번에 추출하고(9.5), 10이 Job PG의 `reissue-in`으로 보낸다. `reissue-in`은 PG-20의 `partitions` Input Port에 Round Robin으로 연결된다. 숫자 검증(SCN, 경계)은 PG-20의 33이 수행한다. 재발행 이벤트(`RECOVERY_REISSUED`)는 API sweeper가 기록한다.
 
 재발행된 FlowFile은 PG-20의 30에서 새 claim token을 만들어 claim한다. 이 claim이 재발행 수신 확인(ACK)이 되며, ACK 없이 `dispatch.ack_timeout`이 지나면 API가 재발행 요청을 다시 보낸다. API는 `RETRY` 상태 파티션만 claim을 허용하므로 이전 Worker가 늦게 살아나도 이전 token의 chunk 보고는 409 `CLAIM_MISMATCH`로 거부된다. API는 재발행 전에 이전 시도의 chunk 기록을 집계에서 빼므로, 새 Worker의 보고만으로 파티션을 판정한다. 같은 `run_id + partition_id`와 같은 SCN, 같은 결정적 파일명을 쓰므로 PutHDFS `replace`로 이전 파일을 덮어쓴다. 재발행은 Oracle UNDO 보존 시간이 run 최대 시간보다 길다는 것을 확인한 뒤 켠다.
+
+
+### 13.3 staging table·run 경로 정리: PG-70 Cleanup
+
+끝난 run의 staging external table과 HDFS run 경로(Parquet chunk, `_SUCCESS`)는 보존 기간이 지나면 지운다. 무엇을 언제 지울지는 원장을 가진 API가 정하고, NiFi는 지우고 결과를 보고한다.
+
+```mermaid
+flowchart TD
+    G[70_Generate_Cleanup_Trigger<br/>1시간, Primary] --> A[71_Set_Cleanup_Stage<br/>UpdateAttribute]
+    A --> Q[72_Get_Cleanup_Candidates<br/>InvokeHTTP GET cleanup/candidates]
+    Q -->|Response| SP[73_Split_Runs<br/>SplitJson]
+    SP --> X[74_Extract_Run_Attrs<br/>EvaluateJsonPath]
+    X --> CK{75_Check_Cleanup_Target<br/>RouteOnAttribute}
+    CK -->|safe| D[76_Build_Drop_SQL<br/>ReplaceText]
+    D --> H[77_Drop_Stage_Table<br/>PutClouderaHiveQL]
+    H --> HD[78_Delete_Run_Path<br/>DeleteHDFS]
+    HD --> B[79_Build_Cleanup_Body<br/>ReplaceText]
+    B --> R[7A_Report_Cleanup<br/>InvokeHTTP POST cleanup]
+    CK & Q & H & HD & R -.->|unmatched, 실패| ERR((errors))
+```
+
+| ID | Processor | Scheduling | 주요 Properties | Relationship |
+|---|---|---|---|---|
+| 70 | `GenerateFlowFile` | Primary Node, 1시간 | 빈 JSON 하나 | success→71 |
+| 71 | `UpdateAttribute` | All Nodes, 1 | `load.stage=CLEANUP`, `cleanup.path.prefix=#{HDFS.STAGE.ROOT}/#{JOB.KEY}/run_id=`, `cleanup.table.prefix=#{HIVE.STAGE.TABLE.PREFIX}` | success→72 |
+| 72 | `InvokeHTTP` | All Nodes, 1 | `GET /cleanup/candidates?jobKey=#{JOB.KEY}&limit=#{CLEANUP.BATCH}`, 응답을 content로 | Response→73, No Retry/Retry/Failure→`errors` |
+| 73 | `SplitJson` | All Nodes, 1 | `$.runs` | split→74 |
+| 74 | `EvaluateJsonPath` | All Nodes, 1 | `load.run.id`, `load.hdfs.path`, `load.stage.table` | matched→75 |
+| 75 | `RouteOnAttribute` | All Nodes, 1 | run ID가 UUID, `load.hdfs.path`가 `cleanup.path.prefix` + run ID와 정확히 같음, table 이름이 `^[a-z0-9_]+$`이고 접두사로 시작 | safe→76, unmatched→`errors` |
+| 76 | `ReplaceText` | All Nodes, 1 | `DROP TABLE IF EXISTS #{HIVE.STAGE.DB}.${load.stage.table}` | success→77 |
+| 77 | `PutClouderaHiveQL` | All Nodes, 1 | `CS_HIVE3_DBCP`, `retry` 재시도 3회 | success→78, failure/retry→`errors` |
+| 78 | `DeleteHDFS` | All Nodes, 1 | Path=`${load.hdfs.path}`, Recursive=true, `failure` 재시도 3회 | success→79, failure→`errors` |
+| 79 | `ReplaceText` | All Nodes, 1 | 본문 `{"droppedTable":"...","deletedPath":"..."}` | success→7A |
+| 7A | `InvokeHTTP` | All Nodes, 1 | `POST /runs/${load.run.id}/cleanup` | Original→종료, No Retry/Retry/Failure→`errors` |
+
+- **대상 판정(API)**: `cleaned_at IS NULL`이고 끝난 시각(`completed_at`)이 보존 기간을 지난 run. `SUCCESS`는 `cleanup.success_retention`(기본 3일), 실패 상태(`FAILED_*`)와 `TIMED_OUT`은 `cleanup.failed_retention`(기본 14일)이다. 진행 중인 run과 `PUBLISH_UNKNOWN`(운영자 확정 전)은 대상이 아니다. `POST /cleanup`도 같은 조건을 다시 확인해 대상이 아니면 409 `CLEANUP_NOT_DUE`로 거부한다.
+- **삭제 범위 고정(75)**: `DeleteHDFS`는 경로 패턴(glob)도 받으므로 API 응답을 그대로 믿지 않는다. 지울 경로가 `#{HDFS.STAGE.ROOT}/#{JOB.KEY}/run_id=<run ID>`와 정확히 같을 때만 진행한다. NiFi는 EL 문자열 리터럴 안의 Parameter 참조(`literal('#{X}')`)를 치환하지 않으므로 비교할 값을 71에서 attribute로 만든다.
+- **순서와 멱등성**: staging은 external table이라 DROP해도 파일이 남는다. 그래서 77(DROP) 뒤 78(경로 삭제)을 한다. `DROP TABLE IF EXISTS`와 없는 경로의 `DeleteHDFS`는 모두 성공으로 끝나므로, 중간에 실패해도 다음 주기에 같은 run을 처음부터 다시 처리하면 된다. target은 `INSERT OVERWRITE`로 복사된 별도 파일이므로 staging을 지워도 영향이 없다.
+- **실패**: `load.stage=CLEANUP` 오류는 PG-90이 이벤트(`CLEANUP_FAILED`, 경로·table 이름 포함)만 남긴다. run 상태는 바꾸지 않는다. 75에서 거부된 run(예: `HDFS.STAGE.ROOT`를 바꾸기 전 run)은 매 주기 다시 거부되므로, 운영자가 경로를 직접 지우고 operator 토큰으로 `POST /runs/{id}/cleanup`을 호출해 기록한다.
+- 정리 기록은 API가 `cleaned_at`과 `RUN_CLEANED` 이벤트로 남긴다.
 
 ---
 

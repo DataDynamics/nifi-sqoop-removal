@@ -51,6 +51,11 @@ recovery:                 # sweeper 기준(가이드 13.1)
   publish_stale: PT2H
   sweeper_interval: PT1M
 
+cleanup:                  # 정리 대상 판정(NiFi PG-70 Cleanup이 GET /v1/cleanup/candidates로 조회)
+  success_retention: P3D  # SUCCESS run의 staging table·run 경로 보존 기간(끝난 시각부터)
+  failed_retention: P14D  # 실패·TIMED_OUT run(원인 확인용). PUBLISH_UNKNOWN은 확정 전까지 대상 아님
+  max_batch: 200          # 한 번에 돌려줄 최대 run 수
+
 dispatch:                 # outbox 전달(API 설계 4장)
   max_attempts: 20
   backoff_min: PT5S

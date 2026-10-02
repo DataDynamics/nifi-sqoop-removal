@@ -46,3 +46,10 @@ ALLOWED_RUN_FAILURES: frozenset[tuple[RunStatus, RunStatus]] = frozenset({
 
 # 이 오류로 파티션이 실패하면 run을 FAILED_SNAPSHOT_EXPIRED로 바꾼다(같은 SCN으로 다시 읽을 수 없음).
 SNAPSHOT_ERROR_CODES = frozenset({"ORA-01555", "ORA-08180"})
+
+# 정리(PG-70) 대상이 되는 끝난 상태. PUBLISH_UNKNOWN은 운영자가 확정하기 전까지 끝난 상태가 아니다.
+CLEANUP_SUCCESS_STATUSES = frozenset({RunStatus.SUCCESS})
+CLEANUP_FAILED_STATUSES = frozenset({
+    RunStatus.FAILED_MANIFEST, RunStatus.FAILED_EXTRACT, RunStatus.FAILED_STAGE_VALIDATION,
+    RunStatus.FAILED_PUBLISH, RunStatus.FAILED_TARGET_VALIDATION, RunStatus.FAILED_SNAPSHOT_EXPIRED,
+    RunStatus.TIMED_OUT})

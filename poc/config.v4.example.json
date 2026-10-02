@@ -32,7 +32,8 @@
   "HIVE.JDBC.USER": "nifi",
   "HIVE.JDBC.PASSWORD": "<secret>",
   "HIVE.POOL.MAX": "4",
-  "HIVE.QUERY.TIMEOUT": "1800"
+  "HIVE.QUERY.TIMEOUT": "1800",
+  "CLEANUP.BATCH": "50"
  },
  "job_params": {
   "JOB.KEY": "ORACLE_INSP_DTL_DAILY",

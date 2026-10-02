@@ -297,6 +297,8 @@ outbox는 최소 1회 전달만 보장하므로, 같은 run에 대한 검증 요
 | GET | `/v1/runs?jobKey=&businessKey=&status=` | 운영 | 목록 조회 |
 | POST | `/v1/runs/{runId}/dispatches/{dispatchId}/resend` | 운영자 | `DEAD`/`SENT` dispatch를 `PENDING`으로 되돌림 |
 | POST | `/v1/runs/{runId}/publish-unknown/resolve` | 운영자 | `PUBLISH_UNKNOWN`을 확인 후 `PUBLISHED` 또는 `FAILED_PUBLISH`로 확정. 사유 필수 |
+| GET | `/v1/cleanup/candidates?jobKey=&limit=` | PG-70, 운영 | 보존 기간(`cleanup.*_retention`)이 지나고 정리하지 않은 끝난 run. run ID, HDFS run 경로, stage table, 상태, 끝난 시각 |
+| POST | `/v1/runs/{runId}/cleanup` | PG-70, 운영자 | 정리 완료 기록(`cleaned_at`, `RUN_CLEANED`). 상태는 바꾸지 않음. 대상이 아니면 409 `CLEANUP_NOT_DUE`, 이미 기록됐으면 `changed=false` |
 
 운영자 엔드포인트는 NiFi 서비스 계정과 다른 권한으로 분리한다.
 
@@ -428,7 +430,7 @@ run이 이미 실패했거나 종료된 상태에서 온 chunk 보고는 409가 
 
 | 테이블 | API에서의 용도 |
 |---|---|
-| `load_run` | run 상태와 행 잠금 대상. `STAGE_VALIDATING` 상태로 검증 flow의 중복 시작을 막는다 |
+| `load_run` | run 상태와 행 잠금 대상. `STAGE_VALIDATING` 상태로 검증 flow의 중복 시작을 막는다. `cleaned_at`은 PG-70 정리 기록 |
 | `load_partition` | 파티션 manifest, claim token, 파티션 판정 결과 |
 | `load_file` | chunk 보고 원장. `(run_id, partition_id, chunk_index)`로 UPSERT |
 | `load_validation` | 검증 flow가 보고한 stage별 지표 |
@@ -603,6 +605,7 @@ logging:
 | `nifi` | worker → NiFi PG-05 호출 주소(HTTP), timeout |
 | `recovery` | sweeper 기준: run timeout, stale, 재발행 모드, 정체 경보 |
 | `dispatch` | outbox 전달: 최대 시도, backoff, ACK timeout, lease, 폴링 주기 |
+| `cleanup` | 정리 대상 판정: `success_retention`(기본 3일), `failed_retention`(기본 14일), `max_batch` |
 | `worker` | worker `/metrics` 포트 |
 | `logging` | 로그 수준, 형식(json/console) |
 

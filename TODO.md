@@ -7,7 +7,7 @@ PoC(V3 PostgreSQL 원천, V4 Oracle 원천)에서 검증한 구조를 CFM 4.12.0
 | 영역 | 상태 |
 |---|---|
 | PG-00 Trigger, PG-10 Coordinator, PG-20 Worker, PG-05 Receiver, PG-90 Error | NiFi 2.4.0 단일 노드(V3, V4)와 CFM 4.12 2노드 클러스터(V4)에서 검증 |
-| PG-40 Staging Validation, PG-50 Publish, PG-60 Target Validation | V4에 구현. CFM 4.12 + Apache Hive 4.0.1(시험용 컨테이너)에서 검증(REVIEW 7.9) |
+| PG-40 Staging Validation, PG-50 Publish, PG-60 Target Validation, PG-70 Cleanup | V4에 구현. CFM 4.12 + Apache Hive 4.0.1(시험용 컨테이너)에서 검증(REVIEW 7.9, 7.10) |
 | Load Control API | 구현·단위 테스트 완료. 단일 인스턴스, HTTP로 연동 시험 |
 | 시나리오 | 정상, 0건 파티션, 중복 실행, HDFS 실패, API 중단, 재발행, `NUMBER` 정밀도, `ORA-01555`(REVIEW 6.2, 7.4~7.7), staging DQ 실패, 게시 실패(`PUBLISH_UNKNOWN`과 운영자 확정), target 검증 실패, HiveServer2 중단(REVIEW 7.9) 통과 |
 
@@ -37,7 +37,7 @@ PoC와 운영 환경의 차이:
 - [x] PG-50 Publish: publish claim CAS, `INSERT OVERWRITE`, `PUBLISH_UNKNOWN` 처리. 55는 재시도하지 않는다(가이드 11장)
 - [x] PG-60 Target Validation: target 지표를 source·staging과 비교하고 최종 상태를 보고한다(가이드 12장)
 - [x] 비운영 target에서 `INSERT OVERWRITE`와 `PUBLISH_UNKNOWN` 경로를 시험한다(가이드 19장 7, REVIEW 7.9)
-- [ ] staging external table과 run 경로 정리 Job(성공 run은 보존 기간 뒤, 실패 run은 원인 확인 뒤)
+- [x] staging external table과 run 경로 정리: PG-70 Cleanup과 API `cleanup` 설정(가이드 13.3, REVIEW 7.10). 운영 보존 기간(기본 SUCCESS 3일, 실패 14일)은 확정 필요
 - [ ] PG-05 Control Receiver를 root로 옮기고 Job별 Output Port로 나눈다(가이드 2장). 빌더는 현재 Job PG 안에 둔다
 - [ ] 선택: PG-20 `ValidateRecord` + `CS_SCHEMA_REGISTRY`(승인된 target schema), PG-90 DLQ·알림(가이드 8장, 14장)
 - [ ] 선택: PutHDFS 실패가 PG-90에서 `NON_RETRYABLE`로 분류된다. 운영 분류가 필요하면 PG-20의 `load.stage`를 세분한다(REVIEW 6.3 #14)
@@ -64,7 +64,7 @@ PoC와 운영 환경의 차이:
 
 - [ ] `HADOOP.CONF.FILES`(core-site, hdfs-site)를 모든 노드의 같은 경로에 배포한다
 - [ ] `HDFS.STAGE.ROOT` 경로를 정한다. HDFS 권한 검사는 하지 않는다(`dfs.permissions.enabled=false`)
-- [ ] 실패 run 경로와 오래된 성공 run 경로의 보존·정리 절차를 정한다
+- [ ] 운영 보존 기간을 정해 API `cleanup.success_retention`·`failed_retention`에 넣는다(정리 자체는 PG-70이 한다)
 
 ## 6. Load Control API 운영 배포
 

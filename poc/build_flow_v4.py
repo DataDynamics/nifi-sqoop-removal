@@ -4,7 +4,7 @@
 
     PG-00 Trigger ─start-run▶ PG-10 Run Coordinator ─partitions(RR)▶ PG-20 Extract Worker
     PG-05 Control Receiver ─validate▶ PG-40 Staging Validation ─staging-valid▶ PG-50 Publish ─published▶ PG-60 Target Validation
-    PG-05 ─reissue(RR)▶ PG-20,  모든 PG ─errors▶ PG-90 Error and Event
+    PG-05 ─reissue(RR)▶ PG-20,  PG-70 Cleanup(주기 실행),  모든 PG ─errors▶ PG-90 Error and Event
 
 V3 대비 변경점
 - 원천 Connection Pool(CS_DBCP_ORACLE): oracle.jdbc.OracleDriver, ORACLE.JDBC.* Parameter(ojdbc 경로 포함),
@@ -21,6 +21,8 @@ V3 대비 변경점
 - PG-40 나머지(47~4E), PG-50, PG-60(가이드 10~12장): Hive staging external table과 지표 검증, INSERT OVERWRITE 게시,
   target 지표 검증으로 run을 SUCCESS까지 끝낸다. Hive 구성요소는 CFM의 ClouderaHiveConnectionPool(CS_HIVE3_DBCP)과
   PutClouderaHiveQL이며, 지표 조회는 ExecuteSQLRecord(JSON)다. Apache NiFi에는 Hive 번들이 없어 이 빌더를 쓸 수 없다.
+- PG-70 Cleanup: 1시간마다 API에 보존 기간이 지난 run을 묻고 staging table을 DROP, HDFS run 경로를 삭제한 뒤
+  API에 기록한다. 보존 기간과 대상 판정은 API(cleanup 설정)가 한다.
 
 Oracle Database 23ai Free에서 V3 시나리오와 NUMBER 정밀도, ORA-01555를 시험했다(REVIEW.md 7.4~7.7).
 Cloudera CFM 4.12(NiFi 2.6.0) 2노드 클러스터에서도 정상 실행을 확인했다(REVIEW.md 7.8). 클러스터에서 trigger가
@@ -214,6 +216,18 @@ COMMENTS = {
     "T65": "API에 최종 성공을 요청한다(POST /success). 저장된 TARGET 지표가 모두 PASS일 때만 SUCCESS로 바꾸고 RUN_SUCCESS를 기록한다.",
     "T66": "success=true면 끝낸다. false면 errors로 보내 run을 FAILED_TARGET_VALIDATION으로 보고한다.",
     # PG-90 Error and Event
+    # PG-70 Cleanup
+    "C70": "정리 주기 트리거(1시간). Primary Node에서만 실행한다. 대상 판정은 API가 하므로 PG 시작과 함께 RUNNING이어도 된다.",
+    "C71": "현재 단계를 CLEANUP으로 표시한다. 이 단계의 실패는 PG-90이 이벤트만 남기고 다음 주기에 다시 시도한다.",
+    "C72": "API에 이 Job의 정리 대상 run을 묻는다(GET /cleanup/candidates). 보존 기간(SUCCESS 3일, 실패 14일 등)은 API 설정이다.",
+    "C73": "정리 대상 목록을 run 하나당 FlowFile 하나로 나눈다. 대상이 없으면 아무것도 내보내지 않는다.",
+    "C74": "run ID, HDFS run 경로, staging table 이름, run 상태를 attribute로 꺼낸다.",
+    "C75": "지우기 전에 경로가 #{HDFS.STAGE.ROOT}/#{JOB.KEY}/run_id=<runId>와 정확히 같은지, table 이름이 접두사·형식에 맞는지 검사한다. 다르면 지우지 않고 errors로 보낸다.",
+    "C76": "staging external table DROP 문을 만든다.",
+    "C77": "staging external table을 DROP한다(IF EXISTS). external table이므로 데이터 파일은 지우지 않는다.",
+    "C78": "HDFS run 경로(Parquet chunk, _SUCCESS)를 재귀 삭제한다.",
+    "C79": "정리 보고 본문(droppedTable, deletedPath)을 만든다.",
+    "C7A": "API에 정리 완료를 기록한다(POST /runs/{id}/cleanup). 이미 기록된 run이면 changed=false로 끝난다.",
     "E90": "모든 PG의 오류를 정규화한다. load.stage와 Processor가 남긴 attribute(HTTP 상태, SQL 오류, 연결 예외)로 오류 단계·코드·분류·메시지와 이벤트 수준·이름을 만든다. 409(중복 실행, claim 불일치)는 정상 경합이므로 WARN이다.",
     "E91": "오류 단계에 따라 run 실패 보고(MANIFEST, STAGE_VALIDATION, TARGET_VALIDATION), 파티션 실패 보고, 이벤트 기록만 중 하나로 나눈다.",
     "E92": "run 실패 보고 본문(load.fail.expected → load.fail.status, 오류 단계·코드·메시지)을 만든다. SCN 조회 실패도 여기로 온다.",
@@ -286,10 +300,10 @@ def body(g, key, name, value, col, row):
                                            "Replacement Value": value}, col, row)
 
 
-def invoke(g, key, name, path, col, row, attr_response=True, tasks=1):
+def invoke(g, key, name, path, col, row, attr_response=True, tasks=1, method="POST"):
     """Load Control API 호출(가이드 9.2). Retry(5xx)·Failure(연결 오류)는 내장 재시도 후 errors로 간다."""
     props = {
-        "HTTP Method": "POST", "HTTP URL": f"#{{CONTROL.API.URL}}{path}",
+        "HTTP Method": method, "HTTP URL": f"#{{CONTROL.API.URL}}{path}",
         "Request Content-Type": "application/json", "Connection Timeout": "5 secs",
         "Socket Read Timeout": "#{CONTROL.API.TIMEOUT}", "Response Generation Required": "false",
         "Authorization": "#{CONTROL.API.AUTHORIZATION}", "X-Request-Id": "${UUID()}", "X-Run-Id": "${load.run.id}"}
@@ -337,6 +351,7 @@ G05 = new_pg(TOP, "PG-05 Control Receiver", 700, 0, "API worker의 validate/reis
 G40 = new_pg(TOP, "PG-40 Staging Validation", 700, 260, "/validation/start, _SUCCESS, Hive staging 테이블과 지표 검증")
 G50 = new_pg(TOP, "PG-50 Publish", 1400, 0, "publish claim, INSERT OVERWRITE, 게시 결과 보고")
 G60 = new_pg(TOP, "PG-60 Target Validation", 1400, 260, "target 지표 검증, 최종 SUCCESS")
+G70 = new_pg(TOP, "PG-70 Cleanup", 1400, 520, "보존 기간이 지난 run의 staging table·HDFS run 경로 정리")
 G90 = new_pg(TOP, "PG-90 Error and Event", 700, 520, "공통 오류 정규화, 실패 보고 API, load_event 기록")
 
 # 각 PG 안 위쪽에 역할·흐름·입출력·주의점을 적은 Label을 둔다. 상위 PG에는 전체 흐름 Label을 둔다.
@@ -385,6 +400,13 @@ PG_LABELS = {
 흐름: 60 load.stage=TARGET_VALIDATION → 61 target 지표·PASS/FAIL → 62·63 지표 기록 → 64·65 success → 66 확인
 입력: published / 출력: errors → PG-90
 주의: SUCCESS와 RUN_SUCCESS 이벤트는 API가 기록한다. 실패해도 재게시하지 않는다(FAILED_TARGET_VALIDATION).""",
+    G70: """PG-70 Cleanup
+역할: 보존 기간이 지난 끝난 run의 staging external table과 HDFS run 경로를 지운다.
+흐름: 70 1시간 주기(Primary) → 71 load.stage=CLEANUP → 72 정리 대상 조회(GET /cleanup/candidates) → 73 run별 분할
+      → 74 attribute → 75 경로·table 이름 검사 → 76·77 DROP TABLE → 78 DeleteHDFS → 79·7A 정리 기록(POST /cleanup)
+출력: errors → PG-90(이벤트만)
+주의: 무엇을 언제 지울지는 API가 정한다(SUCCESS 3일, 실패·TIMED_OUT 14일, PUBLISH_UNKNOWN 제외).
+      75가 경로를 HDFS.STAGE.ROOT/JOB.KEY/run_id=<runId>로 고정해 다른 경로를 지우지 않게 한다. 실패하면 다음 주기에 다시 한다.""",
     G90: """PG-90 Error and Event
 역할: 모든 PG의 실패를 한 곳에서 처리한다.
 흐름: 90 오류 정규화(load.stage, HTTP 상태, SQL 오류, 연결 예외 → 코드·수준·메시지) → 91 분기
@@ -397,7 +419,7 @@ for g, text in PG_LABELS.items():
 label(TOP, """SQOOP_REPLACEMENT_POC_V4 — Load Control API 연동 Sqoop 대체 PoC (Oracle 원천)
 PG-00 →(start-run)→ PG-10 →(partitions, Round Robin)→ PG-20 → API가 완료 판정 → API worker가 PG-05 호출
 PG-05 →(validate)→ PG-40 →(staging-valid)→ PG-50 →(published)→ PG-60,  PG-05 →(reissue, Round Robin)→ PG-20
-모든 PG →(errors)→ PG-90
+PG-70 Cleanup(1시간 주기),  모든 PG →(errors)→ PG-90
 원장 기록·완료 판정은 Load Control API가 하고, NiFi는 데이터 처리와 API 호출만 한다.
 상세: nifi-sqoop-removal-guide.md 2장, poc/REVIEW.md 6장""", 0, -250, 1100, 170)
 
@@ -740,6 +762,46 @@ c(G60, "T62", "success", "T63"); c(G60, "T62", "failure", ("out", "errors"))
 c(G60, "T63", "Original", "T64"); c(G60, "T64", "success", "T65"); c(G60, "T64", "failure", ("out", "errors"))
 c(G60, "T65", "Original", "T66"); c(G60, "T66", "unmatched", ("out", "errors"))
 
+# ===== PG-70 Cleanup. 대상 판정은 API, NiFi는 지우고 기록만 한다.
+port(G70, "errors", "out", 5, 1)
+p(G70, "C70", "70_Generate_Cleanup_Trigger", "GenerateFlowFile",
+  {"generate-ff-custom-text": "{}", "Unique FlowFiles": "false"}, 0, 0, sched="1 hour", primary=True)
+# Parameter는 EL 문자열 리터럴 안(예: literal('#{X}'))에서는 치환되지 않으므로, 75가 비교할 값을 여기서 attribute로 만든다.
+ua(G70, "C71", "71_Set_Cleanup_Stage", {
+    "load.stage": "CLEANUP", "load.job.key": "#{JOB.KEY}",
+    "cleanup.path.prefix": "#{HDFS.STAGE.ROOT}/#{JOB.KEY}/run_id=",
+    "cleanup.table.prefix": "#{HIVE.STAGE.TABLE.PREFIX}"}, 1, 0)
+invoke(G70, "C72", "72_Get_Cleanup_Candidates", "/cleanup/candidates?jobKey=#{JOB.KEY}&limit=#{CLEANUP.BATCH}",
+       2, 0, attr_response=False, method="GET")
+p(G70, "C73", "73_Split_Runs", "SplitJson", {"JsonPath Expression": "$.runs"}, 3, 0)
+p(G70, "C74", "74_Extract_Run_Attrs", "EvaluateJsonPath", {
+    "Destination": "flowfile-attribute", "load.run.id": "$.runId", "load.hdfs.path": "$.hdfsRunPath",
+    "load.stage.table": "$.stageTable", "load.business.key": "$.businessKey",
+    "cleanup.run.status": "$.status"}, 4, 0)
+# DeleteHDFS는 glob도 받으므로 지울 경로를 API 응답 그대로 믿지 않고 이 Job의 run 경로 형식과 정확히 비교한다.
+route(G70, "C75", "75_Check_Cleanup_Target", {
+    "safe": "${load.run.id:matches('^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')"
+            ":and(${load.hdfs.path:equals(${cleanup.path.prefix:replaceAll('/+', '/'):append(${load.run.id})})})"
+            ":and(${load.stage.table:matches('^[a-z0-9_]{1,128}$')})"
+            ":and(${load.stage.table:startsWith(${cleanup.table.prefix:toLower()})})}"}, 0, 1)
+body(G70, "C76", "76_Build_Drop_SQL", "DROP TABLE IF EXISTS #{HIVE.STAGE.DB}.${load.stage.table}", 1, 1)
+hive_ql(G70, "C77", "77_Drop_Stage_Table", 2, 1, retry=(["retry"], 3))
+p(G70, "C78", "78_Delete_Run_Path", "DeleteHDFS", {
+    "Hadoop Configuration Resources": "#{HADOOP.CONF.FILES}", "file_or_directory": "${load.hdfs.path}",
+    "recursive": "true"}, 3, 1, retry=(["failure"], 3))
+body(G70, "C79", "79_Build_Cleanup_Body",
+     '{"droppedTable":"#{HIVE.STAGE.DB}.${load.stage.table}","deletedPath":"${load.hdfs.path:escapeJson()}"}', 4, 1)
+invoke(G70, "C7A", "7A_Report_Cleanup", "/runs/${load.run.id}/cleanup", 1, 2)
+c(G70, "C70", "success", "C71"); c(G70, "C71", "success", "C72")
+c(G70, "C72", "Response", "C73")
+c(G70, "C73", "split", "C74"); c(G70, "C73", "failure", ("out", "errors"))
+c(G70, "C74", "matched", "C75"); c(G70, "C74", ["unmatched", "failure"], ("out", "errors"))
+c(G70, "C75", "safe", "C76"); c(G70, "C75", "unmatched", ("out", "errors"))
+c(G70, "C76", "success", "C77"); c(G70, "C76", "failure", ("out", "errors"))
+c(G70, "C77", "success", "C78"); c(G70, "C77", ["failure", "retry"], ("out", "errors"))
+c(G70, "C78", "success", "C79"); c(G70, "C78", "failure", ("out", "errors"))
+c(G70, "C79", "success", "C7A"); c(G70, "C79", "failure", ("out", "errors"))
+
 # ===== PG-90 Error and Event (가이드 14장). 모든 PG의 errors가 여기로 온다.
 port(G90, "errors", "in", 0, 0)
 # 같은 UpdateAttribute 안에서는 방금 만든 값을 참조할 수 없으므로 식마다 원천 attribute를 직접 쓴다.
@@ -774,7 +836,11 @@ ua(G90, "E90", "90_Normalize_Error", {
                      "${executesql.error.message:replaceNull(${invokehttp.java.exception.message:replaceNull("
                      # 판정 응답(stage-validated·success의 reasons, publish/result의 changed)이 거부 사유를 담고 있다.
                      "${api.response:matches('(?s).*\"(reasons|changed)\".*'):ifElse(${api.response},"
-                     "'processor routed failure; see bulletin and provenance')})})})}"},
+                     # 정리 실패는 어느 경로·테이블인지 남긴다(75 검사 거부, DROP·DeleteHDFS 실패).
+                     "${load.stage:equals('CLEANUP'):ifElse(${literal('cleanup not done (target check, Hive DROP or "
+                     "HDFS delete failed; see bulletin): path='):append(${load.hdfs.path}):append(' table=')"
+                     ":append(${load.stage.table})},"
+                     "'processor routed failure; see bulletin and provenance')})})})})}"},
    1, 0)
 route(G90, "E91", "91_Route_Failure_Report", {
     # manifest·staging 검증·target 검증 단계 실패는 run 실패로 보고한다. manifest 422면 API가 이미 기록했다.
@@ -838,7 +904,7 @@ links = [
     (G05, "validate", G40, "validate", {}),
     (G40, "staging-valid", G50, "staging-valid", {}),
     (G50, "published", G60, "published", {}),
-] + [(g, "errors", G90, "errors", {}) for g in (G00, G10, G20, G05, G40, G50, G60)]
+] + [(g, "errors", G90, "errors", {}) for g in (G00, G10, G20, G05, G40, G50, G60, G70)]
 
 
 def endpoint(g, ref):
@@ -884,5 +950,5 @@ call("PUT", f"/processors/{trig}/run-status", {"revision": cur["revision"], "sta
 
 print(json.dumps({"process_group": TOP, "trigger": trig,
                   "groups": {"PG-00": G00, "PG-10": G10, "PG-20": G20, "PG-05": G05, "PG-40": G40, "PG-50": G50,
-                             "PG-60": G60, "PG-90": G90},
+                             "PG-60": G60, "PG-70": G70, "PG-90": G90},
                   "processors": {k: v[0]["component"]["id"] for k, v in procs.items()}}, indent=1))

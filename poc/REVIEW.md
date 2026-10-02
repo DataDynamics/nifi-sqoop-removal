@@ -288,6 +288,28 @@ V4를 Cloudera CFM 4.12(NiFi 2.6.0.4.12.0.1-9) 2노드 비보안 클러스터(`r
 7. Hive 4.0.1 컨테이너 운영 주의: PID 파일이 `/opt/hive/conf`에 남아 `docker restart`가 실패하고, Derby metastore 기본 경로가 컨테이너 안이라 컨테이너를 다시 만들면 메타데이터가 사라진다. compose에서 PID를 tmpfs로, metastore를 볼륨으로 옮겼다. 메타데이터가 빈 동안 큐에 있던 run 하나가 `stg` DB가 없어 `FAILED_STAGE_VALIDATION`이 됐다(정상 동작)
 8. Parameter Context를 REST로 바꿀 때 `inheritedParameterContexts`를 빼면 상속 해제로 해석돼 409(사용 중인 Parameter 삭제)가 난다. 클러스터에서 Trigger가 enable된 채 상위 PG를 Start하면 Trigger가 바로 실행된다(매뉴얼 5.3 주의와 같음)
 
+### 7.10 staging table·run 경로 정리: PG-70 Cleanup (2026-10-03)
+
+끝난 run의 staging external table과 HDFS run 경로를 보존 기간 뒤에 지우는 PG-70을 V4에 넣었다(가이드 13.3). 대상 판정은 API, 삭제는 NiFi가 한다. 구성은 PG 10개, Processor 79개, Connection 147개, Port 20개다.
+
+- API: migration `0002_run_cleanup`(`load_run.cleaned_at`, 정리 후보 인덱스), 설정 `cleanup.success_retention`(기본 3일)·`failed_retention`(기본 14일)·`max_batch`, `GET /v1/cleanup/candidates`, `POST /v1/runs/{id}/cleanup`(role `nifi`, `operator`). 진행 중 run과 `PUBLISH_UNKNOWN`은 대상이 아니고, 기록 요청도 같은 조건을 다시 확인한다(409 `CLEANUP_NOT_DUE`). 테스트 3개 추가, 전체 119개 통과(서버 전체의 LISTEN 연결 수를 세는 dispatcher 테스트 1개는 같은 서버에서 CFM용 worker가 돌고 있어 제외)
+- NiFi: 70 `GenerateFlowFile`(1시간, Primary) → 72 후보 조회 → 75 경로·table 이름 검사 → 77 `DROP TABLE IF EXISTS` → 78 `DeleteHDFS` → 7A 정리 기록. 실패는 PG-90이 `CLEANUP_FAILED` 이벤트(경로·table 이름 포함)만 남긴다
+
+| 시나리오(시험 중 API 보존 기간 2분) | 결과 |
+|---|---|
+| 끝난 run 11개 정리 | 10개 `RUN_CLEANED`(SUCCESS 6, `FAILED_*` 4). HDFS run 경로 10개와 staging table이 지워지고 target `dw.insp_dtl` 105,000건은 그대로 |
+| 7.8의 `file:///` 시절 run(`/var/lib/nifi-poc/stage/...`) | 경로가 현재 `HDFS.STAGE.ROOT`와 달라 75가 거부, 아무것도 지우지 않고 `CLEANUP_FAILED`. 운영자가 노드의 경로를 지우고 operator 토큰으로 `POST /cleanup` 기록 |
+| manifest 단계에서 실패한 run(HDFS 경로·staging table 없음) | `DROP TABLE IF EXISTS`와 없는 경로의 `DeleteHDFS` 모두 success. `RUN_CLEANED` |
+| 정리 후 후보 조회 | 빈 목록. 보존 기간 안의 최근 SUCCESS run은 대상이 아님 |
+| 정상 run(PG-70 추가 후) | `SUCCESS`, 105,000건 |
+
+확인한 사항:
+
+1. **NiFi는 EL 문자열 리터럴 안의 Parameter 참조를 치환하지 않는다.** `${literal('#{HDFS.STAGE.ROOT}')}`는 `#{HDFS.STAGE.ROOT}` 글자 그대로였고(`toLower()` 뒤에는 `#{hive.stage.table.prefix}`), 첫 시험에서 75가 모든 run을 거부했다(삭제 없음). 비교할 값을 71 `UpdateAttribute`에서 attribute로 만들도록 고쳤다. EL 밖(SQL 문자열 등)의 `'#{X}'`는 치환된다
+2. `DeleteHDFS`는 `Path`에 glob을 받는다. 그래서 API가 돌려준 경로를 그대로 쓰지 않고 75에서 `#{HDFS.STAGE.ROOT}/#{JOB.KEY}/run_id=<runId>`와 정확히 같은지 검사한다
+3. `DeleteHDFS`는 없는 경로를 success로 보낸다. 정리는 중간에 실패해도 다음 주기에 처음부터 다시 하면 된다
+4. `GenerateFlowFile`의 Custom Text는 빈 값이면 INVALID다
+
 ### 7.5 재현 방법 (V4)
 
 ```bash

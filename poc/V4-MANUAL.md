@@ -14,21 +14,23 @@ flowchart LR
     S -->|staging-valid| P[PG-50 Publish]
     P -->|published| V[PG-60 Target Validation]
     R -->|reissue| W
-    C & W & S & R & P & V -.->|errors| E[PG-90 Error and Event]
-    C & W & S & P & V & E -->|InvokeHTTP| API[[Load Control API]]
+    CL[PG-70 Cleanup<br/>1시간 주기]
+    C & W & S & R & P & V & CL -.->|errors| E[PG-90 Error and Event]
+    C & W & S & P & V & CL & E -->|InvokeHTTP| API[[Load Control API]]
     API -->|POST /validate, /reissue| R
     C & W -->|AS OF SCN| O[(Oracle)]
     W -->|Parquet| H[(HDFS)]
-    S & P & V -->|HiveQL| HV[(Hive)]
+    S & P & V & CL -->|HiveQL| HV[(Hive)]
+    CL -->|DeleteHDFS| H
 ```
 
 | 항목 | 내용 |
 |---|---|
-| 구현 범위 | 가이드 2장의 전 단계: 추출(PG-00, 10, 20), API 호출 수신(PG-05), staging 검증(PG-40), 게시(PG-50), target 검증(PG-60), 오류 처리(PG-90) |
+| 구현 범위 | 가이드 2장의 전 단계: 추출(PG-00, 10, 20), API 호출 수신(PG-05), staging 검증(PG-40), 게시(PG-50), target 검증(PG-60), staging·run 경로 정리(PG-70), 오류 처리(PG-90) |
 | 미구현 | PG-05를 root로 옮겨 Job끼리 공유, PG-20 `ValidateRecord`, PG-90 DLQ·알림(가이드 2장, 8장, 14장 선택 항목) |
 | 필요 NiFi | **Cloudera CFM**(Hive 구성요소 `ClouderaHiveConnectionPool`, `PutClouderaHiveQL`). Apache NiFi에는 Hive 번들이 없어 빌더가 멈춘다 |
 | 검증 환경 | Cloudera CFM 4.12(NiFi 2.6.0) 2노드 클러스터, Oracle Database 23ai Free, ojdbc11 21.15, PostgreSQL 16, Apache Hadoop 3.4.1 HDFS, Apache Hive 4.0.1 HiveServer2(REVIEW.md 7.9). 추출 단계는 Apache NiFi 2.4.0에서도 검증(7.4~7.7) |
-| 구성 | PG 9개(상위 1 + 자식 8), Processor 68개, Connection 127개, Port 19개 |
+| 구성 | PG 10개(상위 1 + 자식 9), Processor 79개, Connection 147개, Port 20개 |
 
 운영 적용에 남은 일은 `TODO.md`에 있다.
 
@@ -59,6 +61,9 @@ flowchart LR
 | | 54_Build_Insert_Overwrite_SQL, 55_Insert_Overwrite | target 파티션을 `INSERT OVERWRITE`로 교체한다. **재시도하지 않는다** |
 | | 56_Body_PUBLISHED, 56U_Body_PUBLISH_UNKNOWN, 57_Report_Publish_Result, 58_Is_Published | 결과를 API에 직접 보고한다. 55의 failure·retry는 모두 `PUBLISH_UNKNOWN`(7.1) |
 | PG-60 Target Validation | 60_Set_Target_Stage ~ 66_Is_Success | target 업무 범위의 지표를 같은 형식으로 기록하고 `/success`를 요청한다 |
+| PG-70 Cleanup | 70_Generate_Cleanup_Trigger ~ 74_Extract_Run_Attrs | 1시간마다(Primary Node) API에 보존 기간이 지난 run을 묻고 run별로 나눈다 |
+| | 75_Check_Cleanup_Target | 지울 경로가 `#{HDFS.STAGE.ROOT}/#{JOB.KEY}/run_id=<runId>`와 정확히 같고 table 이름이 접두사·형식에 맞을 때만 진행한다 |
+| | 76_Build_Drop_SQL ~ 7A_Report_Cleanup | staging table DROP, HDFS run 경로 삭제, API에 정리 기록 |
 | PG-90 Error and Event | 90_Normalize_Error ~ 97_LogMessage | 모든 실패를 오류 코드로 정리하고, run·파티션 실패를 API에 보고하고, `load_event`에 기록한다 |
 
 ### 2.2 Controller Service
@@ -81,6 +86,7 @@ flowchart LR
 6. PG-40이 staging 테이블 `#{HIVE.STAGE.DB}.<HIVE.STAGE.TABLE.PREFIX><run_id 하이픈 제거>`를 만들고 지표를 비교한다. 모두 PASS면 `STAGING_VALIDATED`.
 7. PG-50이 `INSERT OVERWRITE TABLE #{HIVE.TARGET.DB}.#{HIVE.TARGET.TABLE} #{TARGET.PARTITION.CLAUSE}`로 게시한다. `PUBLISHED`.
 8. PG-60이 target 지표를 비교하고 `/success`를 요청한다. 모두 PASS면 API가 `SUCCESS`와 `RUN_SUCCESS`를 기록한다.
+9. 보존 기간(SUCCESS 3일, 실패·`TIMED_OUT` 14일)이 지나면 PG-70이 staging table과 run 경로를 지우고 API가 `cleaned_at`과 `RUN_CLEANED`를 남긴다(7.6).
 
 HDFS 결과 경로:
 
@@ -155,7 +161,7 @@ python -m load_control.server --config config.yaml
 python -m load_control.worker --config config.yaml
 ```
 
-`config.yaml`의 `nifi.receiver_url`은 `http(s)://<nifi-host>:<CONTROL.LISTEN.PORT>`로 둔다. `curl <API>/readyz`가 `{"status":"ok"}`면 준비된 것이다.
+`config.yaml`의 `nifi.receiver_url`은 `http://<nifi-host>:<CONTROL.LISTEN.PORT>`로 둔다. 정리 보존 기간은 `cleanup.success_retention`(기본 `P3D`)과 `cleanup.failed_retention`(기본 `P14D`)이다. migration `0002_run_cleanup`이 `load_run.cleaned_at`을 추가한다. `curl <API>/readyz`가 `{"status":"ok"}`면 준비된 것이다.
 
 ## 4. 설정 파일
 
@@ -178,6 +184,7 @@ python -m load_control.worker --config config.yaml
 | `CONTROL.API.TIMEOUT` | `30 secs` | `InvokeHTTP` 타임아웃 |
 | `CONTROL.API.RETRY.MAX` | `5` | API 호출 재시도 기준값. Retry Count는 Parameter를 참조할 수 없어 V4 빌더는 이 값을 읽지 않고 5회로 고정한다(7.1) |
 | `CONTROL.LISTEN.PORT` | `9443` | PG-05 수신 포트 |
+| `CLEANUP.BATCH` | `50` | PG-70이 한 주기에 정리할 최대 run 수 |
 | `META.JDBC.URL`, `META.JDBC.USER`, `META.JDBC.PASSWORD`, `META.JDBC.DRIVER.PATH` | | 관리 DB(PostgreSQL). NiFi 계정은 `load_event` INSERT 권한만 있으면 된다 |
 | `ORACLE.JDBC.URL` | `jdbc:oracle:thin:@//host:1521/SERVICE` | 원천 Oracle |
 | `ORACLE.JDBC.USER`, `ORACLE.JDBC.PASSWORD`, `ORACLE.JDBC.DRIVER.PATH` | | 조회 계정과 ojdbc 경로 |
@@ -253,6 +260,8 @@ Trigger(00)는 DISABLED라 PG를 시작해도 실행되지 않는다.
 
 00은 Primary Node에서만 실행되도록 만들어지므로 클러스터에서도 Run Once 한 번에 run 하나만 생긴다.
 
+PG-70의 70(정리 트리거)은 DISABLED가 아니므로 상위 PG를 Start하면 바로 한 번 실행된다. 무엇을 지울지는 API가 정하므로 안전하다.
+
 > **주의**: 00을 enable한 상태로 상위 PG를 다시 Start하면 00도 RUNNING이 되어 바로 한 번 실행된다(스케줄 1일). 같은 업무일자의 run이 진행 중이면 `DUPLICATE_ACTIVE_RUN`으로 거부되어 데이터에는 영향이 없지만, PG를 다시 시작하기 전에 00을 STOPPED 또는 DISABLED로 둔다.
 
 ### 5.4 정기 실행
@@ -326,7 +335,7 @@ SELECT count(*), sum(amount), min(reg_ts), max(reg_ts) FROM dw.insp_dtl WHERE ba
 SHOW TABLES IN stg;   -- run마다 tmp_<prefix><run_id> external table이 남는다
 ```
 
-staging 테이블과 run 경로는 run이 끝나도 지우지 않는다. 보존·정리 절차는 `TODO.md` 5장.
+staging 테이블과 run 경로는 보존 기간이 지나면 PG-70이 지운다(7.6). 정리된 run은 `load_run.cleaned_at`이 채워진다.
 
 ### 6.4 같은 업무일자 다시 실행
 
@@ -349,6 +358,7 @@ NiFi 오류는 PG-90이 `load_event`(process_group=상위 PG 이름)와 NiFi 로
 | `API_UNREACHABLE`, `HTTP_<code>` | ERROR | API 호출 재시도를 모두 소진 | API 상태를 확인한다. 진행 중 run은 sweeper가 `TIMED_OUT`으로 정리한다 |
 | `INVALID_SCN`(SQL 오류 메시지 안) | ERROR | SCN 속성이 숫자가 아님 | 14·15 결과를 확인한다 |
 | `STAGING_METRIC_FAILED`(API, WARN) → `STAGE_VALIDATION_FAILED` | ERROR | staging 지표 FAIL. 메시지에 API의 `reasons`(예: `FAIL DUP_PK_COUNT`) | `load_validation`의 STAGING 행을 보고 원인(데이터, DDL 타입, 시간대)을 고친 뒤 새로 Trigger한다 |
+| `CLEANUP_FAILED` | ERROR | PG-70이 지우지 못함. 메시지에 경로·table 이름. 75 검사 거부(경로가 현재 `HDFS.STAGE.ROOT`와 다름), Hive DROP·DeleteHDFS 실패 | 다음 주기에 자동으로 다시 한다. 75 거부는 계속 반복되므로 7.6의 수동 정리를 한다 |
 | `STAGE_VALIDATION_FAILED`(메시지 `processor routed failure`) | ERROR | 48 DDL 또는 49 조회 실패(문법, 권한, 테이블 이름 형식) | NiFi bulletin에서 Hive 오류를 확인한다. PutClouderaHiveQL은 오류 attribute를 남기지 않는다 |
 | `PUBLISH_UNKNOWN`(API) + `PUBLISH_FAILED`(NiFi) | ERROR | 55 failure·retry | 7.5 |
 | `TARGET_METRIC_FAILED`(API, WARN) → `TARGET_VALIDATION_FAILED` | ERROR | target 지표 FAIL | `TARGET.BUSINESS.WHERE`와 `TARGET.PARTITION.CLAUSE`가 같은 범위인지, 다른 run이 같은 파티션을 덮었는지 확인한다. 자동 재게시하지 않는다 |
@@ -401,6 +411,22 @@ curl -X POST -H "Authorization: Bearer <operator-token>" -H 'Content-Type: appli
 ```
 
 target이 실제로 바뀌었고 지표가 맞으면 `"resolution":"PUBLISHED"`로 확정한다. 이 경우 PG-60이 실행되지 않으므로 target 검증은 운영자가 따로 한다.
+
+### 7.6 정리(PG-70)
+
+- 대상: 끝난 run 중 보존 기간이 지나고 아직 정리하지 않은 run. `SUCCESS`는 3일, `FAILED_*`·`TIMED_OUT`은 14일(API `cleanup` 설정). 진행 중인 run과 `PUBLISH_UNKNOWN`은 지우지 않는다
+- 지우는 것: `#{HIVE.STAGE.DB}.<stage table>`(external table이라 DROP만으로는 파일이 남음)과 HDFS run 경로 전체. target 테이블은 건드리지 않는다
+- 실패하면 다음 주기(1시간)에 같은 run을 처음부터 다시 처리한다. DROP `IF EXISTS`와 없는 경로 삭제는 성공으로 끝난다
+- 대상 확인: `curl -H "Authorization: Bearer <token>" "<API>/v1/cleanup/candidates?jobKey=<JOB.KEY>"`
+
+75에서 거부된 run(예: `HDFS.STAGE.ROOT`를 바꾸기 전 run)은 운영자가 직접 지우고 기록한다.
+
+```bash
+hdfs dfs -rm -r '<hdfsRunPath>'                       # 경로를 두 번 확인한다
+beeline -e "DROP TABLE IF EXISTS <HIVE.STAGE.DB>.<stageTable>"
+curl -X POST -H "Authorization: Bearer <operator-token>" -H 'Content-Type: application/json' \
+  -d '{"droppedTable":"<db.table>","deletedPath":"<hdfsRunPath>"}' <API>/v1/runs/<run_id>/cleanup
+```
 
 ## 8. Oracle 시험 환경 구성
 

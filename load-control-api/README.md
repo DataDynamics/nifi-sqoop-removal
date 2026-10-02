@@ -12,6 +12,7 @@ API 설계 12장 전환 순서 중 API 쪽 작업을 모두 구현했다. NiFi F
 | 검증·게시 | `POST /validation/start`, `/validations`, `/stage-validated`, `/publish/claim`, `/publish/result`, `/success` |
 | 조회 | `GET /v1/runs`, `GET /v1/runs/{id}` (role `nifi`, `operator`) |
 | 운영자 | `POST /dispatches/{id}/resend`, `/publish-unknown/resolve` (role `operator`만) |
+| 정리 | `GET /v1/cleanup/candidates`, `POST /v1/runs/{id}/cleanup` (NiFi PG-70, 운영자 수동 기록) |
 | worker | outbox dispatcher(LISTEN/NOTIFY, lease, backoff, DEAD), sweeper(stale 파티션, run timeout, ACK timeout 재전송, 검증 정체 경보, 게시 결과 불명) |
 
 ## 구조
@@ -33,6 +34,7 @@ src/load_control/
 ├── routers/          # 인증, 입력 검증, 트랜잭션 시작
 └── worker/           # python -m load_control.worker: dispatcher + sweeper
 alembic/versions/0001_nifi_ops_baseline.py   # 가이드 4.1 DDL
+alembic/versions/0002_run_cleanup.py         # load_run.cleaned_at(정리 기록)
 tests/                                       # 실제 PostgreSQL 대상 통합·동시성 테스트
 ```
 
@@ -50,8 +52,9 @@ tests/                                       # 실제 PostgreSQL 대상 통합·
 | `server` | API bind address(`host`), `port`, 프로세스 수(`workers`), 프록시 헤더, graceful shutdown, 선택적 TLS/mTLS |
 | `database` | DB URL(런타임, migration, LISTEN), pool |
 | `auth` | role별 토큰 digest |
-| `nifi` | worker가 NiFi PG-05를 호출할 주소와 mTLS |
+| `nifi` | worker가 NiFi PG-05를 호출할 주소(HTTP) |
 | `recovery`, `dispatch` | sweeper·outbox 기준 |
+| `cleanup` | 정리 대상 보존 기간(`success_retention` 3일, `failed_retention` 14일), `max_batch` |
 | `worker` | worker `/metrics` bind address와 port |
 | `logging` | 수준, 형식(json/console), 표준출력, 회전 파일, access 로그 on/off, logger별 수준 |
 

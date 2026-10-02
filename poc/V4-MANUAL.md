@@ -10,7 +10,7 @@ V4는 V3(PostgreSQL 원천)와 같은 구조와 Load Control API 계약을 쓰�
 flowchart LR
     T[PG-00 Trigger] -->|start-run| C[PG-10 Run Coordinator]
     C -->|partitions<br/>Round Robin| W[PG-20 Extract Worker]
-    R[PG-05 Control Receiver] -->|validate| S[PG-40 Staging Validation]
+    R[PG-05 Control Receiver<br/>root 공통] -->|validate| S[PG-40 Staging Validation]
     S -->|staging-valid| P[PG-50 Publish]
     P -->|published| V[PG-60 Target Validation]
     R -->|reissue| W
@@ -27,10 +27,10 @@ flowchart LR
 | 항목 | 내용 |
 |---|---|
 | 구현 범위 | 가이드 2장의 전 단계: 추출(PG-00, 10, 20), API 호출 수신(PG-05), staging 검증(PG-40), 게시(PG-50), target 검증(PG-60), staging·run 경로 정리(PG-70), 오류 처리(PG-90) |
-| 미구현 | PG-05를 root로 옮겨 Job끼리 공유, PG-20 `ValidateRecord`, PG-90 DLQ·알림(가이드 2장, 8장, 14장 선택 항목) |
+| 미구현 | PG-20 `ValidateRecord`, PG-90 DLQ·알림(가이드 8장, 14장 선택 항목) |
 | 필요 NiFi | **Cloudera CFM**(Hive 구성요소 `ClouderaHiveConnectionPool`, `PutClouderaHiveQL`). Apache NiFi에는 Hive 번들이 없어 빌더가 멈춘다 |
 | 검증 환경 | Cloudera CFM 4.12(NiFi 2.6.0) 2노드 클러스터, Oracle Database 23ai Free, ojdbc11 21.15, PostgreSQL 16, Apache Hadoop 3.4.1 HDFS, Apache Hive 4.0.1 HiveServer2(REVIEW.md 7.9). 추출 단계는 Apache NiFi 2.4.0에서도 검증(7.4~7.7) |
-| 구성 | PG 10개(상위 1 + 자식 9), Processor 79개, Connection 147개, Port 20개 |
+| 구성 | Job PG(상위 1 + 자식 8): Processor 73개, Connection 136개, Port 19개. root PG-05(Job 공통): Processor 6개, Job마다 Output Port 2개와 root 연결 2개 |
 
 운영 적용에 남은 일은 `TODO.md`에 있다.
 
@@ -52,7 +52,7 @@ flowchart LR
 | | 34_Execute_Partition_Query | `AS OF SCN`으로 파티션 범위를 조회해 Parquet chunk로 만든다. **재시도하지 않는다** |
 | | 35_Set_Chunk_Attrs, 36_PutHDFS | `part-<파티션>-<chunk>.parquet`을 run 경로에 기록한다 |
 | | 37_Build_Chunk_Report, 38_Report_Chunk | chunk마다 API에 보고한다. 파티션·run 완료 판정은 API가 한다 |
-| PG-05 Control Receiver | 05_Listen_Control, 06_Validate_Request, 07_Respond_400, 08_Respond_202, 09_Extract_Control_Body, 10_Route_By_Action | API worker의 `POST /validate/<JOB.KEY>`, `POST /reissue/<JOB.KEY>`를 받아 PG-40 또는 PG-20으로 보낸다 |
+| PG-05 Control Receiver(root) | 05_Listen_Control, 06_Validate_Request, 07_Respond_400, 08_Respond_202, 09_Extract_Control_Body, 10_Route_By_Job_Action | 모든 Job이 공유한다. API worker의 `POST /validate/<JOB.KEY>`, `POST /reissue/<JOB.KEY>`를 받아 해당 Job PG의 `validate-in`(→PG-40), `reissue-in`(→PG-20)으로 보낸다. 등록된 Job만 받고 나머지는 404 |
 | PG-40 Staging Validation | 40_Set_Validation_Stage ~ 46_PutHDFS_SUCCESS_Marker | API `/validation/start` CAS에 성공한 요청만 원천 기대값을 받아 run 경로에 `_SUCCESS`를 쓴다 |
 | | 47_Build_External_DDL, 48_Create_External_Table | run 경로를 LOCATION으로 하는 external staging 테이블을 만든다 |
 | | 49_Query_Stage_Metrics, 4A_Build_Validations_Body, 4B_Report_Validations | staging 지표(`STAGE_COUNT`, `NULL_SPLIT_COUNT`, `DUP_PK_COUNT`, `AMOUNT_SUM`, `MIN_TS`, `MAX_TS`)와 PASS/FAIL을 SQL 한 문장으로 계산해 API에 기록한다 |
@@ -73,7 +73,7 @@ flowchart LR
 | `CS_DBCP_ORACLE` | 원천 Oracle. `oracle.jdbc.OracleDriver`, 검사 쿼리 `SELECT 1 FROM DUAL`, 최대 연결 `#{ORACLE.POOL.MAX}` |
 | `CS_DBCP_META` | 관리 DB(PostgreSQL). PG-90의 `load_event` INSERT 전용 |
 | JSON/Parquet Reader·Writer | manifest JSON 처리, Parquet chunk 기록 |
-| `StandardHttpContextMap` | PG-05 `HandleHttpRequest`/`HandleHttpResponse` |
+| `CS_HTTP_CONTEXT_MAP`(`StandardHttpContextMap`) | root PG-05 안에 있다. `HandleHttpRequest`/`HandleHttpResponse` |
 | `CS_HIVE3_DBCP` | HiveServer2(`ClouderaHiveConnectionPool`). 48·55(`PutClouderaHiveQL`)와 49·61(`ExecuteSQLRecord`, JSON)이 같이 쓴다 |
 
 ### 2.3 데이터 흐름과 결과
@@ -105,7 +105,7 @@ HDFS 결과 경로:
 - Hive 구성요소(`nifi-cdf-hive-nar`)가 있는 Cloudera CFM이어야 한다
 - `CONTROL.LISTEN.PORT`(PG-05 수신 포트)가 비어 있어야 한다
 - Cloudera CFM 4.12(NiFi 2.6.0)는 기본 배포본에 필요한 NAR가 모두 있다
-- 클러스터에서는 PG-05가 모든 노드에서 `CONTROL.LISTEN.PORT`를 연다. API `nifi.receiver_url`은 노드 하나 또는 그 앞의 LB로 둔다
+- 클러스터에서는 PG-05가 모든 노드에서 `CONTROL.LISTEN.PORT`를 연다. API `nifi.receiver_url`은 노드 하나 또는 그 앞의 LB로 둔다. PG-05는 root에 하나뿐이므로 Job이 여러 개여도 포트는 하나다
 
 ### 3.2 Oracle
 
@@ -167,13 +167,16 @@ python -m load_control.worker --config config.yaml
 
 `poc/config.v4.example.json`을 복사해 값을 채운다. 암호와 토큰이 들어가므로 권한을 `600`으로 두고 저장소에 넣지 않는다.
 
-### 4.1 `names`
+### 4.1 `names` (선택)
+
+이름은 가이드 2장·3장 규칙으로 정해지므로 보통 `names`를 두지 않는다. 바꿀 때만 키를 적는다.
 
 | 키 | 기본값 | 의미 |
 |---|---|---|
-| `process_group` | `SQOOP_REPLACEMENT_POC_V4` | 상위 PG 이름 |
-| `common_context` | `PC_SQOOP_REPLACEMENT_COMMON_V4` | 공통 Parameter Context |
-| `job_context` | `PC_JOB_ORACLE_INSP_DTL_DAILY_V4` | Job Parameter Context(상위·자식 PG 모두에 지정됨) |
+| `process_group` | `JOB_<JOB.KEY>` (예: `JOB_ORACLE_INSP_DTL_DAILY`) | Job PG 이름. PG-90이 `load_event.process_group`에 기록한다 |
+| `job_context` | `PC_JOB_<JOB.KEY>` | Job Parameter Context(Job PG와 자식 PG 모두에 지정됨) |
+| `common_context` | `PC_SQOOP_REPLACEMENT_COMMON` | 공통 Parameter Context. root PG-05와 모든 Job이 쓴다. 바꾼다면 모든 Job config에 같게 둔다 |
+| `control_receiver` | `PG-05 Control Receiver` | root 공통 PG-05 이름 |
 
 ### 4.2 `common_params`
 
@@ -234,15 +237,17 @@ python -m load_control.worker --config config.yaml
 python3 poc/build_flow_v4.py http://<nifi-host>:<port>/nifi-api my-config.v4.json > flow_ids.json
 ```
 
-- NiFi root 아래에 상위 PG, 자식 PG 8개, Parameter Context 2개, Controller Service를 만들고 Controller Service를 enable한다
-- 표준 출력은 생성한 PG·Processor id(JSON)다. 이후 조작에 쓰므로 저장해 둔다
+- NiFi root 아래에 상위 PG(Job PG), 자식 PG 8개, Job Parameter Context, Controller Service를 만들고 Controller Service를 enable한다
+- 공통 Parameter Context는 없으면 만들고, 있으면 값만 config로 맞춘다(다른 Job이 쓰고 있으므로 지우지 않는다)
+- root에 PG-05가 없으면 만든다. 그다음 PG-05를 몇 초 멈추고 이 Job의 route·Output Port·root 연결을 추가한 뒤 Allowed Paths를 갱신하고 다시 시작한다. PG-05는 빌더가 시작하므로 따로 Start하지 않는다
+- 표준 출력은 생성한 PG·Processor id와 `receiver`(PG-05 id), `receiver_jobs`(등록된 Job 목록)다. 이후 조작에 쓰므로 저장해 둔다
 - 같은 이름의 PG가 이미 있으면 먼저 5.5로 지운다
 
 생성 직후 Controller Service가 enable되는 동안 34 등이 잠시 INVALID로 보인다. 몇 초 뒤 모두 VALID가 되는지 확인한다.
 
 ### 5.2 시작
 
-NiFi UI에서 상위 PG `SQOOP_REPLACEMENT_POC_V4`를 Start한다. REST API로는 다음과 같다.
+NiFi UI에서 Job PG `JOB_<JOB.KEY>`(예: `JOB_ORACLE_INSP_DTL_DAILY`)를 Start한다. REST API로는 다음과 같다.
 
 ```bash
 curl -X PUT -H 'Content-Type: application/json' \
@@ -274,7 +279,18 @@ PG-70의 70(정리 트리거)은 DISABLED가 아니므로 상위 PG를 Start하�
 python3 poc/teardown_flow.py http://<nifi-host>:<port>/nifi-api my-config.v4.json
 ```
 
-`names`에 적힌 PG와 Parameter Context를 지운다. 관리 DB 기록과 HDFS 파일은 지우지 않는다.
+`names`에 적힌 Job PG와 Job Parameter Context를 지운다. root PG-05에서는 이 Job의 route·Output Port·연결만 지우고 Allowed Paths를 갱신한다. 마지막 Job이었으면 PG-05와 공통 Parameter Context도 지운다. 관리 DB 기록과 HDFS 파일은 지우지 않는다.
+
+### 5.6 Job 추가
+
+같은 NiFi에 다른 Job을 올릴 때는 config를 하나 더 만들어 5.1을 실행한다. 바꿀 값:
+
+| 키 | 예 |
+|---|---|
+| `job_params.JOB.KEY` | `ORACLE_INSP_DTL_DAILY_B`(대문자·숫자·`_`). Job PG `JOB_ORACLE_INSP_DTL_DAILY_B`와 Context `PC_JOB_ORACLE_INSP_DTL_DAILY_B`가 이 값으로 정해진다 |
+| `job_params` 원천·target | `SRC.*`, `HIVE.STAGE.TABLE.PREFIX`, `HIVE.TARGET.TABLE` 등 |
+
+`common_params`는 기존 Job과 같게 둔다. 빌더가 공통 Context 값을 이 config로 덮어쓰기 때문이다. 등록되면 API의 `/validate/<JOB.KEY>` 호출이 그 Job PG로 간다. 두 Job을 동시에 실행해 각자 검증·게시까지 끝나는 것을 확인했다(REVIEW 7.11).
 
 ## 6. 실행 확인
 

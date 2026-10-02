@@ -2,9 +2,10 @@
 """NiFi 2.4 REST API로 Sqoop 대체 PoC Flow V4를 만든다. V3(build_flow_v3.py)와 같은 구조(Load Control API 연동,
 자식 PG + Port)에서 원천을 PostgreSQL 대신 Oracle로 바꾼 버전이다. 가이드 7.2~7.3, 8.4의 Oracle 기준을 따른다.
 
-    PG-00 Trigger ─start-run▶ PG-10 Run Coordinator ─partitions(RR)▶ PG-20 Extract Worker
-    PG-05 Control Receiver ─validate▶ PG-40 Staging Validation ─staging-valid▶ PG-50 Publish ─published▶ PG-60 Target Validation
-    PG-05 ─reissue(RR)▶ PG-20,  PG-70 Cleanup(주기 실행),  모든 PG ─errors▶ PG-90 Error and Event
+    root: PG-05 Control Receiver(모든 Job 공통) ─validate-<JOB>▶ Job PG validate-in,  ─reissue-<JOB>▶ reissue-in
+    Job PG: PG-00 Trigger ─start-run▶ PG-10 Run Coordinator ─partitions(RR)▶ PG-20 Extract Worker
+            validate-in ▶ PG-40 Staging Validation ─staging-valid▶ PG-50 Publish ─published▶ PG-60 Target Validation
+            reissue-in ─(RR)▶ PG-20,  PG-70 Cleanup(주기 실행),  모든 PG ─errors▶ PG-90 Error and Event
 
 V3 대비 변경점
 - 원천 Connection Pool(CS_DBCP_ORACLE): oracle.jdbc.OracleDriver, ORACLE.JDBC.* Parameter(ojdbc 경로 포함),
@@ -30,21 +31,34 @@ Cloudera CFM 4.12(NiFi 2.6.0) 2노드 클러스터에서도 정상 실행을 확
 (poc/hdfs-hive)에서 정상·staging DQ 실패·게시 실패·target 검증 실패·Hive 중단을 시험했다(REVIEW.md 7.9).
 사용 방법은 V4-MANUAL.md.
 
+PG-05는 root에 하나 두고 Job끼리 공유한다(가이드 2장, 9.5). 없으면 만들고, 있으면 이 Job의 route(10의
+validate.<JOB>/reissue.<JOB>), Output Port, root 연결을 추가하고 Allowed Paths를 갱신한다. 이때 PG-05를 몇 초
+멈췄다가 다시 시작한다. 공통 Parameter Context도 지우지 않고 값만 config로 맞춘다. 지울 때는 teardown_flow.py가
+이 Job의 등록만 지우고, 마지막 Job이면 PG-05와 공통 Context를 지운다(REVIEW.md 7.11).
+
 사용법: build_flow_v4.py <nifi-api-url> <config.json>
-config.json 형식은 config.v4.example.json. `names.process_group` 기본값은 SQOOP_REPLACEMENT_POC_V4.
+config.json 형식은 config.v4.example.json. 이름은 `names`로 바꿀 수 있고 기본값은 다음과 같다.
+Job PG `JOB_<JOB.KEY>`, Job Context `PC_JOB_<JOB.KEY>`, 공통 Context `PC_SQOOP_REPLACEMENT_COMMON`,
+root PG-05 `PG-05 Control Receiver`. Job을 추가할 때는 JOB.KEY와 job_params만 다르게 한다.
 Trigger(00_Generate_Trigger)는 DISABLED로 만든다. 실행하려면 enable 후 Run Once 한다.
 """
 import json
 import sys
+import time
 import urllib.error
 import urllib.request
 
 API = sys.argv[1].rstrip("/")
 CFG = json.load(open(sys.argv[2]))
 NAMES = CFG.get("names", {})
-TOP_NAME = NAMES.get("process_group", "SQOOP_REPLACEMENT_POC_V4")
-PC_COMMON = NAMES.get("common_context", "PC_SQOOP_REPLACEMENT_COMMON_V4")
-PC_JOB = NAMES.get("job_context", "PC_JOB_ORACLE_INSP_DTL_DAILY_V4")
+JOB_KEY = CFG["job_params"]["JOB.KEY"]
+if not __import__("re").fullmatch(r"[A-Z0-9_]{1,200}", JOB_KEY):
+    raise SystemExit(f"JOB.KEY must match [A-Z0-9_]+: {JOB_KEY}")
+# 이름은 가이드 2장·3장과 같다. Job PG와 Job Context는 JOB.KEY로 정하고, 공통 Context와 PG-05는 모든 Job이 공유한다.
+TOP_NAME = NAMES.get("process_group", f"JOB_{JOB_KEY}")
+PC_COMMON = NAMES.get("common_context", "PC_SQOOP_REPLACEMENT_COMMON")
+PC_JOB = NAMES.get("job_context", f"PC_JOB_{JOB_KEY}")
+RECEIVER_NAME = NAMES.get("control_receiver", "PG-05 Control Receiver")  # root에 하나, 모든 Job이 공유
 REV = {"version": 0, "clientId": "poc-builder-v4"}
 
 
@@ -92,18 +106,37 @@ for g in call("GET", f"/flow/process-groups/{root}")["processGroupFlow"]["flow"]
     if g["component"]["name"] == TOP_NAME:
         raise SystemExit(f"{TOP_NAME} already exists ({g['id']}); delete it first")
 
+def ensure_common(params):
+    """공통 Context는 root PG-05와 다른 Job이 함께 쓰므로 지우지 않는다. 있으면 값만 이 config로 맞춘다."""
+    for pc in call("GET", "/flow/parameter-contexts")["parameterContexts"]:
+        if pc["component"]["name"] != PC_COMMON:
+            continue
+        cur = call("GET", f"/parameter-contexts/{pc['id']}")
+        req = call("POST", f"/parameter-contexts/{pc['id']}/update-requests", {
+            "revision": cur["revision"], "id": pc["id"], "component": {"id": pc["id"], "parameters": [
+                {"parameter": {"name": k, "value": v, "sensitive": k.endswith(("PASSWORD", "AUTHORIZATION"))}}
+                for k, v in params.items()]}})["request"]
+        while not req["complete"]:
+            time.sleep(1)
+            req = call("GET", f"/parameter-contexts/{pc['id']}/update-requests/{req['requestId']}")["request"]
+        call("DELETE", f"/parameter-contexts/{pc['id']}/update-requests/{req['requestId']}")
+        if req.get("failureReason"):
+            raise SystemExit(f"update {PC_COMMON}: {req['failureReason']}")
+        return pc["id"]
+    return param_ctx(PC_COMMON, params)
+
+
 drop_param_ctx(PC_JOB)
-drop_param_ctx(PC_COMMON)
-common = param_ctx(PC_COMMON, CFG["common_params"])
+common = ensure_common(CFG["common_params"])
 job = param_ctx(PC_JOB, CFG["job_params"], inherited=common)
 
 
-def new_pg(parent, name, x, y, comments=""):
+def new_pg(parent, name, x, y, comments="", ctx=None):
     """자식 PG는 Parameter Context를 상속하지 않으므로 매번 지정한다."""
     ent = call("POST", f"/process-groups/{parent}/process-groups",
                {"revision": REV, "component": {"name": name, "position": {"x": x, "y": y}, "comments": comments}})
     call("PUT", f"/process-groups/{ent['id']}", {"revision": ent["revision"], "component": {
-        "id": ent["id"], "parameterContext": {"id": job}}})
+        "id": ent["id"], "parameterContext": {"id": ctx or job}}})
     return ent["id"]
 
 
@@ -113,9 +146,9 @@ TOP = new_pg(root, TOP_NAME, 1000, 300, "Sqoop 대체 PoC V4: Oracle 원천, 자
 services = {}
 
 
-def cs(name, short, props):
+def cs(name, short, props, group=None):
     b, t = bundle(short)
-    ent = call("POST", f"/process-groups/{TOP}/controller-services",
+    ent = call("POST", f"/process-groups/{group or TOP}/controller-services",
                {"revision": REV, "component": {"type": t, "bundle": b, "name": name, "properties": props}})
     services[name] = ent
     return ent["id"]
@@ -137,7 +170,6 @@ SRC = cs("CS_DBCP_ORACLE", "HikariCPConnectionPool",
          hikari("ORACLE", "oracle.jdbc.OracleDriver", "SELECT 1 FROM DUAL", "#{ORACLE.POOL.MAX}"))
 JARR = cs("CS_JSON_WRITER_ARRAY", "JsonRecordSetWriter", {"output-grouping": "output-array"})
 PARQ = cs("CS_PARQUET_WRITER", "ParquetRecordSetWriter", {"compression-type": "SNAPPY"})
-HTTPCTX = cs("CS_HTTP_CONTEXT_MAP", "StandardHttpContextMap", {"Request Expiration": "1 min"})
 # Hive(가이드 10~12장). 지표 조회 SQL의 결과 컬럼 이름이 table alias 없이 오도록 HIVE.JDBC.URL에
 # hive.resultset.use.unique.column.names=false를 둔다.
 HIVE = cs("CS_HIVE3_DBCP", "ClouderaHiveConnectionPool", {
@@ -179,7 +211,7 @@ COMMENTS = {
     "R07": "형식이 잘못된 요청에 400으로 응답한다. API가 ACK timeout 뒤 다시 보낸다.",
     "R08": "정상 요청에 바로 202로 응답한다. 검증은 오래 걸리므로 HTTP 연결을 붙잡지 않는다.",
     "R09": "요청 본문에서 runId, dispatchId와 재발행에 필요한 파티션 정보·SCN을 attribute로 꺼낸다.",
-    "R10": "요청 경로로 검증(validate)과 재발행(reissue)을 나눈다. 재발행은 PG-20 Worker로 보낸다.",
+    "R10": "요청 경로의 Job·동작별로 해당 Job PG의 validate-in(PG-40), reissue-in(PG-20)으로 보낸다. route와 Output Port는 Job 빌더가 등록한다.",
     # PG-40 Staging Validation
     "V40": "현재 단계를 VALIDATION_START로 표시한다.",
     "V41": "검증 시작 요청 본문(dispatchId, node)을 만든다.",
@@ -347,7 +379,12 @@ N = "#{PARTITION.COUNT}"
 G00 = new_pg(TOP, "PG-00 Trigger", 0, 0, "스케줄 트리거와 업무일자 형식 검증")
 G10 = new_pg(TOP, "PG-10 Run Coordinator", 0, 260, "run 생성, 원천 지표·manifest 계산, manifest 등록")
 G20 = new_pg(TOP, "PG-20 Extract Worker", 0, 520, "claim, 파티션 추출, PutHDFS, chunk 보고")
-G05 = new_pg(TOP, "PG-05 Control Receiver", 700, 0, "API worker의 validate/reissue 호출 수신")
+# PG-05는 root에 하나 두고 모든 Job이 공유한다(가이드 2장, 9.5). 이미 있으면 이 Job만 등록한다(맨 아래 register_job).
+G05 = next((g["id"] for g in call("GET", f"/flow/process-groups/{root}")["processGroupFlow"]["flow"]["processGroups"]
+            if g["component"]["name"] == RECEIVER_NAME), None)
+RECEIVER_NEW = G05 is None
+if RECEIVER_NEW:
+    G05 = new_pg(root, RECEIVER_NAME, 300, 300, "공통: API worker의 validate/reissue 호출 수신, Job별 Output Port", ctx=common)
 G40 = new_pg(TOP, "PG-40 Staging Validation", 700, 260, "/validation/start, _SUCCESS, Hive staging 테이블과 지표 검증")
 G50 = new_pg(TOP, "PG-50 Publish", 1400, 0, "publish claim, INSERT OVERWRITE, 게시 결과 보고")
 G60 = new_pg(TOP, "PG-60 Target Validation", 1400, 260, "target 지표 검증, 최종 SUCCESS")
@@ -375,12 +412,6 @@ PG_LABELS = {
 입력: partitions(PG-10 manifest, PG-05 재발행) / 출력: errors → PG-90
 주의: 파티션·run 완료 판정과 검증 호출 예약은 API가 한다. claimed=false는 정상 경합이므로 조용히 끝낸다.
       34는 재시도하지 않는다. ORA-01555면 API가 run을 FAILED_SNAPSHOT_EXPIRED로 바꾼다(UNDO 보존 시간 확인).""",
-    G05: """PG-05 Control Receiver
-역할: Load Control API worker가 보내는 검증 시작·파티션 재발행 요청을 받는다.
-흐름: 05 HTTP 수신(/validate·/reissue/<Job>) → 06 헤더 검증(07: 400 응답) → 08 202 응답 → 09 본문 추출 → 10 동작별 분기
-출력: validate → PG-40, reissue → PG-20, errors → PG-90
-주의: 202를 먼저 응답한다. 처리 확인(ACK)은 PG-40의 /validation/start 또는 PG-20의 재 claim이다.
-      운영에서는 root에 두고 여러 Job이 공유한다(가이드 9.5).""",
     G40: """PG-40 Staging Validation
 역할: API에 검증 시작을 알리고, _SUCCESS를 쓴 뒤 Hive staging 테이블로 원천 지표와 비교한다.
 흐름: 40 load.stage=VALIDATION_START → 41·42 검증 시작(POST /validation/start) → 43 started 확인
@@ -416,9 +447,9 @@ PG_LABELS = {
 }
 for g, text in PG_LABELS.items():
     label(g, text, 0, -2 * ROWH, 5 * COLW, 170)
-label(TOP, """SQOOP_REPLACEMENT_POC_V4 — Load Control API 연동 Sqoop 대체 PoC (Oracle 원천)
+label(TOP, TOP_NAME + """ — Load Control API 연동 Sqoop 대체 PoC V4 (Oracle 원천)
 PG-00 →(start-run)→ PG-10 →(partitions, Round Robin)→ PG-20 → API가 완료 판정 → API worker가 PG-05 호출
-PG-05 →(validate)→ PG-40 →(staging-valid)→ PG-50 →(published)→ PG-60,  PG-05 →(reissue, Round Robin)→ PG-20
+root PG-05 →(validate-in)→ PG-40 →(staging-valid)→ PG-50 →(published)→ PG-60,  root PG-05 →(reissue-in, Round Robin)→ PG-20
 PG-70 Cleanup(1시간 주기),  모든 PG →(errors)→ PG-90
 원장 기록·완료 판정은 Load Control API가 하고, NiFi는 데이터 처리와 API 호출만 한다.
 상세: nifi-sqoop-removal-guide.md 2장, poc/REVIEW.md 6장""", 0, -250, 1100, 170)
@@ -580,37 +611,46 @@ c(G20, "P32", "Original", "P33"); c(G20, "P33", "owner", "P34")
 c(G20, "P34", "success", "P35"); c(G20, "P34", "failure", ("out", "errors"))
 c(G20, "P35", "success", "P36"); c(G20, "P36", "success", "P37"); c(G20, "P37", "success", "P38")
 
-# ===== PG-05 Control Receiver (가이드 9.5). 등록된 Job 경로만 받는다(그 외는 HandleHttpRequest가 404).
-port(G05, "validate", "out", 4, 0)
-port(G05, "reissue", "out", 4, 1)
-port(G05, "errors", "out", 4, 2)
-p(G05, "R05", "05_Listen_Control", "HandleHttpRequest", {
-    "Listening Port": "#{CONTROL.LISTEN.PORT}", "HTTP Context Map": HTTPCTX,
-    "Allowed Paths": "/(validate|reissue)/#{JOB.KEY}",
-    "Allow GET": "false", "Allow POST": "true", "Allow PUT": "false", "Allow DELETE": "false",
-    "Allow HEAD": "false", "Allow OPTIONS": "false"}, 0, 0)
-route(G05, "R06", "06_Validate_Request", {
-    "valid": "${http.method:equals('POST'):and(${http.headers.X-Dispatch-Id:matches("
-             "'^[0-9a-fA-F-]{36}$')}):and(${http.headers.X-Run-Id:matches('^[0-9a-fA-F-]{36}$')})}"}, 1, 0)
-p(G05, "R07", "07_Respond_400", "HandleHttpResponse", {"HTTP Status Code": "400", "HTTP Context Map": HTTPCTX}, 1, 1)
-# 검증은 오래 걸릴 수 있으므로 먼저 202를 응답하고 HTTP 연결을 붙잡지 않는다.
-p(G05, "R08", "08_Respond_202", "HandleHttpResponse", {"HTTP Status Code": "202", "HTTP Context Map": HTTPCTX}, 2, 0)
-# validate·reissue 본문을 한 번에 추출한다(없는 경로는 빈 값).
-p(G05, "R09", "09_Extract_Control_Body", "EvaluateJsonPath", {
-    "Destination": "flowfile-attribute", "Path Not Found Behavior": "ignore",
-    "load.run.id": "$.runId", "load.dispatch.id": "$.dispatchId",
-    "partition.id": "$.partitionId", "load.business.key": "$.businessKey", "load.hdfs.path": "$.hdfsRunPath",
-    "partition.lower": "$.lowerBound", "partition.upper": "$.upperBound",
-    "partition.upper.inclusive": "$.upperInclusive", "partition.is.null": "$.isNullPartition",
-    "partition.expected.rows": "$.expectedRowCount", "load.snapshot.scn": "$.snapshotScn"}, 3, 0)
-route(G05, "R10", "10_Route_By_Action", {
-    "validate": "${http.request.uri:startsWith('/validate/')}",
-    "reissue": "${http.request.uri:startsWith('/reissue/')}"}, 3, 1)
-c(G05, "R05", "success", "R06"); c(G05, "R06", "valid", "R08"); c(G05, "R06", "unmatched", "R07")
-c(G05, "R07", "success", ("out", "errors")); c(G05, "R08", "success", "R09")
-c(G05, "R09", "matched", "R10"); c(G05, "R09", ["unmatched", "failure"], ("out", "errors"))
-c(G05, "R10", "validate", ("out", "validate")); c(G05, "R10", "reissue", ("out", "reissue"))
-c(G05, "R10", "unmatched", ("out", "errors"))
+# ===== PG-05 Control Receiver (가이드 9.5). root 공통 PG. 처음 만들 때만 Processor를 둔다.
+# Job별 route(10의 validate.<JOB>/reissue.<JOB>), Output Port, Allowed Paths는 register_job이 추가한다.
+# 오류 기록 Processor는 두지 않는다. 400·unmatched는 API가 ACK timeout 뒤 다시 보내고, 계속 실패하면 DEAD로 알린다.
+if RECEIVER_NEW:
+    HTTPCTX = cs("CS_HTTP_CONTEXT_MAP", "StandardHttpContextMap", {"Request Expiration": "1 min"}, group=G05)
+    label(G05, """PG-05 Control Receiver (root 공통)
+역할: Load Control API worker가 보내는 검증 시작·파티션 재발행 요청을 받아 Job PG로 보낸다.
+흐름: 05 HTTP 수신(/validate·/reissue/<JOB.KEY>, 등록된 Job만) → 06 헤더 검증(07: 400 응답) → 08 202 응답
+      → 09 본문 추출 → 10 Job·동작별 분기 → Output Port validate-<JOB>, reissue-<JOB> → Job PG validate-in, reissue-in
+주의: Job PG 빌더가 실행될 때 이 PG를 잠깐 멈추고 route·Port·Allowed Paths를 추가한다. Job을 지우면 그 Job 것만 지운다.
+      202를 먼저 응답한다. 처리 확인(ACK)은 PG-40의 /validation/start 또는 PG-20의 재 claim이다.""",
+          0, -2 * ROWH, 5 * COLW, 170)
+    p(G05, "R05", "05_Listen_Control", "HandleHttpRequest", {
+        "Listening Port": "#{CONTROL.LISTEN.PORT}", "HTTP Context Map": HTTPCTX,
+        "Allowed Paths": f"/(validate|reissue)/({JOB_KEY})",
+        "Allow GET": "false", "Allow POST": "true", "Allow PUT": "false", "Allow DELETE": "false",
+        "Allow HEAD": "false", "Allow OPTIONS": "false"}, 0, 0)
+    route(G05, "R06", "06_Validate_Request", {
+        "valid": "${http.method:equals('POST'):and(${http.headers.X-Dispatch-Id:matches("
+                 "'^[0-9a-fA-F-]{36}$')}):and(${http.headers.X-Run-Id:matches('^[0-9a-fA-F-]{36}$')})}"}, 1, 0)
+    p(G05, "R07", "07_Respond_400", "HandleHttpResponse", {"HTTP Status Code": "400", "HTTP Context Map": HTTPCTX},
+      1, 1)
+    # 검증은 오래 걸릴 수 있으므로 먼저 202를 응답하고 HTTP 연결을 붙잡지 않는다.
+    p(G05, "R08", "08_Respond_202", "HandleHttpResponse", {"HTTP Status Code": "202", "HTTP Context Map": HTTPCTX},
+      2, 0)
+    # validate·reissue 본문을 한 번에 추출한다(없는 경로는 빈 값).
+    p(G05, "R09", "09_Extract_Control_Body", "EvaluateJsonPath", {
+        "Destination": "flowfile-attribute", "Path Not Found Behavior": "ignore",
+        "load.run.id": "$.runId", "load.dispatch.id": "$.dispatchId",
+        "partition.id": "$.partitionId", "load.business.key": "$.businessKey", "load.hdfs.path": "$.hdfsRunPath",
+        "partition.lower": "$.lowerBound", "partition.upper": "$.upperBound",
+        "partition.upper.inclusive": "$.upperInclusive", "partition.is.null": "$.isNullPartition",
+        "partition.expected.rows": "$.expectedRowCount", "load.snapshot.scn": "$.snapshotScn"}, 3, 0)
+    route(G05, "R10", "10_Route_By_Job_Action", {}, 4, 0)
+    c(G05, "R05", "success", "R06"); c(G05, "R06", "valid", "R08"); c(G05, "R06", "unmatched", "R07")
+    c(G05, "R08", "success", "R09"); c(G05, "R09", "matched", "R10")
+
+# Job PG 입구. root PG-05의 Job별 Output Port가 여기로 연결된다.
+port(TOP, "validate-in", "in", -1, 1)
+port(TOP, "reissue-in", "in", -1, 3)
 
 # ===== PG-40 Staging Validation (가이드 10장)
 port(G40, "validate", "in", 0, 0)
@@ -900,11 +940,9 @@ c(G90, "E96", ["success", "failure", "retry"], "E97")
 links = [
     (G00, "start-run", G10, "start-run", {}),
     (G10, "partitions", G20, "partitions", {"loadBalanceStrategy": "ROUND_ROBIN"}),  # Coordinator → Worker
-    (G05, "reissue", G20, "partitions", {"loadBalanceStrategy": "ROUND_ROBIN"}),
-    (G05, "validate", G40, "validate", {}),
     (G40, "staging-valid", G50, "staging-valid", {}),
     (G50, "published", G60, "published", {}),
-] + [(g, "errors", G90, "errors", {}) for g in (G00, G10, G20, G05, G40, G50, G60, G70)]
+] + [(g, "errors", G90, "errors", {}) for g in (G00, G10, G20, G40, G50, G60, G70)]
 
 
 def endpoint(g, ref):
@@ -924,6 +962,14 @@ for g, src, rels, dst, extra in conns:
 
 for sg, sname, dg, dname, extra in links:
     comp = {"source": {"id": ports[(sg, sname, "out")], "groupId": sg, "type": "OUTPUT_PORT"},
+            "destination": {"id": ports[(dg, dname, "in")], "groupId": dg, "type": "INPUT_PORT"},
+            "backPressureObjectThreshold": 10000, "backPressureDataSizeThreshold": "1 GB", **extra}
+    call("POST", f"/process-groups/{TOP}/connections", {"revision": REV, "component": comp})
+
+# Job PG 입구 → 자식 PG. 재발행은 Worker에 Round Robin으로 나눈다.
+for name, dg, dname, extra in (("validate-in", G40, "validate", {}),
+                               ("reissue-in", G20, "partitions", {"loadBalanceStrategy": "ROUND_ROBIN"})):
+    comp = {"source": {"id": ports[(TOP, name, "in")], "groupId": TOP, "type": "INPUT_PORT"},
             "destination": {"id": ports[(dg, dname, "in")], "groupId": dg, "type": "INPUT_PORT"},
             "backPressureObjectThreshold": 10000, "backPressureDataSizeThreshold": "1 GB", **extra}
     call("POST", f"/process-groups/{TOP}/connections", {"revision": REV, "component": comp})
@@ -948,7 +994,65 @@ trig = procs["P00"][0]["component"]["id"]
 cur = call("GET", f"/processors/{trig}")
 call("PUT", f"/processors/{trig}/run-status", {"revision": cur["revision"], "state": "DISABLED"})
 
-print(json.dumps({"process_group": TOP, "trigger": trig,
-                  "groups": {"PG-00": G00, "PG-10": G10, "PG-20": G20, "PG-05": G05, "PG-40": G40, "PG-50": G50,
+
+
+def stop_pg(pg):
+    """PG를 멈추고 실행 중인 thread가 끝날 때까지 기다린다(속성·연결을 바꾸기 전)."""
+    call("PUT", f"/flow/process-groups/{pg}", {"id": pg, "state": "STOPPED"})
+    for _ in range(60):
+        procs_ = call("GET", f"/process-groups/{pg}/processors")["processors"]
+        if all(x["status"]["aggregateSnapshot"]["activeThreadCount"] == 0
+               and x["component"]["state"] != "RUNNING" for x in procs_):
+            return
+        time.sleep(1)
+    raise SystemExit(f"{pg} did not stop")
+
+
+def receiver_proc(name_prefix):
+    return next(x for x in call("GET", f"/process-groups/{G05}/processors")["processors"]
+                if x["component"]["name"].startswith(name_prefix))
+
+
+def register_job():
+    """root PG-05에 이 Job의 route·Output Port·연결을 추가하고 Allowed Paths를 갱신한다. PG-05를 잠깐 멈춘다."""
+    stop_pg(G05)
+    r10 = receiver_proc("10_")
+    call("PUT", f"/processors/{r10['id']}", {"revision": r10["revision"], "component": {"id": r10["id"], "config": {
+        "properties": {f"validate.{JOB_KEY}": f"${{http.request.uri:equals('/validate/{JOB_KEY}')}}",
+                       f"reissue.{JOB_KEY}": f"${{http.request.uri:equals('/reissue/{JOB_KEY}')}}"}}}})
+    r10 = call("GET", f"/processors/{r10['id']}")
+    jobs = sorted({k.split(".", 1)[1] for k in r10["component"]["config"]["properties"]
+                   if k.startswith(("validate.", "reissue."))})
+    r05 = receiver_proc("05_")
+    call("PUT", f"/processors/{r05['id']}", {"revision": r05["revision"], "component": {"id": r05["id"], "config": {
+        "properties": {"Allowed Paths": f"/(validate|reissue)/({'|'.join(jobs)})"}}}})
+    row = 2 * jobs.index(JOB_KEY)
+    for action, top_port in (("validate", "validate-in"), ("reissue", "reissue-in")):
+        out = call("POST", f"/process-groups/{G05}/output-ports", {"revision": REV, "component": {
+            "name": f"{action}-{JOB_KEY}",
+            "position": {"x": 5 * COLW, "y": (row + (action == "reissue")) * ROWH}}})
+        call("POST", f"/process-groups/{G05}/connections", {"revision": REV, "component": {
+            "source": {"id": r10["id"], "groupId": G05, "type": "PROCESSOR"},
+            "destination": {"id": out["id"], "groupId": G05, "type": "OUTPUT_PORT"},
+            "selectedRelationships": [f"{action}.{JOB_KEY}"],
+            "backPressureObjectThreshold": 10000, "backPressureDataSizeThreshold": "1 GB"}})
+        call("POST", f"/process-groups/{root}/connections", {"revision": REV, "component": {
+            "source": {"id": out["id"], "groupId": G05, "type": "OUTPUT_PORT"},
+            "destination": {"id": ports[(TOP, top_port, "in")], "groupId": TOP, "type": "INPUT_PORT"},
+            "backPressureObjectThreshold": 10000, "backPressureDataSizeThreshold": "1 GB"}})
+    # 연결된 route 외(unmatched, 지워진 Job)는 auto-terminate
+    used_rels = {rel for cn in call("GET", f"/process-groups/{G05}/connections")["connections"]
+                 if cn["component"]["source"]["id"] == r10["id"] for rel in cn["component"]["selectedRelationships"]}
+    r10 = call("GET", f"/processors/{r10['id']}")
+    call("PUT", f"/processors/{r10['id']}", {"revision": r10["revision"], "component": {"id": r10["id"], "config": {
+        "autoTerminatedRelationships": sorted({x["name"] for x in r10["component"]["relationships"]} - used_rels)}}})
+    call("PUT", f"/flow/process-groups/{G05}", {"id": G05, "state": "RUNNING"})
+    return jobs
+
+
+registered = register_job()
+
+print(json.dumps({"process_group": TOP, "trigger": trig, "receiver": G05, "receiver_jobs": registered,
+                  "groups": {"PG-00": G00, "PG-10": G10, "PG-20": G20, "PG-40": G40, "PG-50": G50,
                              "PG-60": G60, "PG-70": G70, "PG-90": G90},
                   "processors": {k: v[0]["component"]["id"] for k, v in procs.items()}}, indent=1))

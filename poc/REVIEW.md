@@ -310,6 +310,30 @@ V4를 Cloudera CFM 4.12(NiFi 2.6.0.4.12.0.1-9) 2노드 비보안 클러스터(`r
 3. `DeleteHDFS`는 없는 경로를 success로 보낸다. 정리는 중간에 실패해도 다음 주기에 처음부터 다시 하면 된다
 4. `GenerateFlowFile`의 Custom Text는 빈 값이면 INVALID다
 
+### 7.11 PG-05 root 이동과 Job 공유 (2026-10-03)
+
+가이드 2장·9.5 구조대로 PG-05 Control Receiver를 Job PG 밖 root에 하나 두고 Job끼리 공유하게 했다.
+
+- 빌더: root에 PG-05가 없으면 만든다(공통 Parameter Context, `CS_HTTP_CONTEXT_MAP`, Processor 6개). 있으면 PG-05를 멈추고 10에 `validate.<JOB>`·`reissue.<JOB>` route, Output Port `validate-<JOB>`·`reissue-<JOB>`, root 연결(→ Job PG `validate-in`·`reissue-in`)을 추가한 뒤 05의 Allowed Paths를 등록된 Job 목록으로 다시 쓰고 시작한다. Job PG 안에서는 `validate-in`→PG-40, `reissue-in`→PG-20(Round Robin)이다. PG-05에는 errors Port를 두지 않는다(가이드 9.5)
+- 공통 Parameter Context는 지우고 다시 만들지 않고, 있으면 update request로 값만 맞춘다
+- teardown: Job PG와 PG-05를 멈추고 이 Job의 root 연결·Output Port·route를 지운 뒤 Allowed Paths를 갱신한다. 마지막 Job이면 PG-05를 지우고, 공통 Context는 쓰는 PG나 상속하는 Context가 없을 때만 지운다
+
+| 시나리오 | 결과 |
+|---|---|
+| Job A 생성(PG-05 새로 만듦) | root에 PG-05와 Job PG, root 연결 2개. run `SUCCESS`, 검증 dispatch `ACKED`(202) |
+| Job B 추가(`ORACLE_INSP_DTL_DAILY_B`, target `dw.insp_dtl_b`) | PG-05에 route·Port 추가, Allowed Paths `/(validate|reissue)/(ORACLE_INSP_DTL_DAILY|ORACLE_INSP_DTL_DAILY_B)`. 실행 중이던 Job A는 영향 없음 |
+| A·B 동시 실행 | 둘 다 `SUCCESS`(각 105,000건). B의 검증 호출은 B Job PG로 가서 `tmp_insp_dtl_b_*` staging과 `dw.insp_dtl_b`에 적재 |
+| Job B 삭제 | B 등록만 지워짐. `/validate/ORACLE_INSP_DTL_DAILY_B`는 404, A 경로는 계속 수신(형식 오류 요청에 400). 공통 Context 유지 |
+| Job A(마지막) 삭제 후 재생성 | PG-05와 공통 Context까지 삭제되어 root가 비었고, 다시 만든 Flow에서 run `SUCCESS` |
+
+확인한 사항:
+
+1. root 연결을 지우려면 양 끝(PG-05 Output Port와 Job PG Input Port)이 모두 멈춰 있어야 한다(409 `Destination of Connection ... is running`). 첫 teardown이 이 때문에 실패해 PG-05가 멈춘 채 남았다. Job PG를 먼저 멈추도록 고쳤다
+2. Job을 추가하거나 지우는 동안 PG-05가 몇 초 멈춘다. 그동안 온 호출은 연결 실패가 되고 API dispatcher가 backoff 후 다시 보낸다
+3. 재발행(`reissue-in`) 경로는 검증 경로와 같은 방식으로 연결했지만 이 구조에서 재발행 시나리오를 다시 돌리지는 않았다(7.4에서 PG-05가 Job PG 안에 있을 때 확인)
+
+이름 변경: 가이드 2장·3장 이름으로 맞췄다. Job PG `SQOOP_REPLACEMENT_POC_V4` → `JOB_<JOB.KEY>`(`JOB_ORACLE_INSP_DTL_DAILY`), Job Context `PC_JOB_ORACLE_INSP_DTL_DAILY_V4` → `PC_JOB_<JOB.KEY>`, 공통 Context `PC_SQOOP_REPLACEMENT_COMMON_V4` → `PC_SQOOP_REPLACEMENT_COMMON`. 빌더와 teardown이 `JOB.KEY`로 이름을 정하므로 config에 `names`를 두지 않아도 된다. 새 이름으로 다시 만든 Flow에서 run `SUCCESS`, Job B(`JOB_ORACLE_INSP_DTL_DAILY_B`) 생성·삭제도 확인했다. 7.10 이전 기록의 이름은 당시 이름이다. V1 설정 예시에는 teardown이 V1 이름을 찾도록 `names`를 적었다(V1 빌더는 이름을 코드에 고정해 쓴다).
+
 ### 7.5 재현 방법 (V4)
 
 ```bash

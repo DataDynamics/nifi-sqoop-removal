@@ -251,7 +251,7 @@ flowchart LR
 
 가이드 초안의 PG-30 Partition and Run Gate(Wait/Notify)와 PG-70 Recovery Monitor는 없다. 완료 판정은 API가 하고, 검증 flow는 API의 호출을 PG-05가 받아 시작한다(9장). 복구는 API sweeper가 담당한다(13장). PG-70 번호는 보존 기간이 지난 staging table과 run 경로를 지우는 PG-70 Cleanup(13.3)에 쓴다.
 
-참조 구현은 `poc/build_flow_v3.py`(PostgreSQL 원천, NiFi 2.4.0에서 검증)와 `poc/build_flow_v4.py`(같은 구조의 Oracle 원천, Oracle 23ai Free에서 검증)다. 두 빌더는 Job이 하나뿐이라 PG-05를 Job PG 안에 두었다. 운영에서는 위 구조처럼 root로 옮긴다.
+참조 구현은 `poc/build_flow_v3.py`(PostgreSQL 원천, NiFi 2.4.0에서 검증)와 `poc/build_flow_v4.py`(같은 구조의 Oracle 원천, Oracle 23ai Free·CFM 4.12에서 검증)다. V3는 PG-05를 Job PG 안에 두었고, V4는 위 구조대로 root에 두고 Job끼리 공유한다(9.5).
 
 ### 2.1 구현 규칙
 
@@ -273,7 +273,7 @@ flowchart LR
 | PG-00 Trigger | 3 | 검증 |
 | PG-10 Run Coordinator | 10 | PostgreSQL 원천 V3(SCN 조회 2개를 뺀 8개)와 Oracle 원천 V4(10개)로 검증 |
 | PG-20 Extract Worker | 9 (+ 선택 `ValidateRecord` 1) | 검증(`ValidateRecord` 제외) |
-| PG-05 Control Receiver | 6 | 검증(Job PG 안에 둔 형태) |
+| PG-05 Control Receiver | 6 (root 공통, Job 수와 무관) | V4로 검증(root, Job 2개 동시 실행) |
 | PG-40 Staging Validation | 15 | V4로 검증(CFM 4.12, Hive 4.0.1) |
 | PG-50 Publish | 12 (PoC 10: 55A·56F 생략, 11.2) | V4로 검증 |
 | PG-60 Target Validation | 7 | V4로 검증 |
@@ -1285,12 +1285,13 @@ flowchart LR
 | 07 | `HandleHttpResponse` | All Nodes, 1 | HTTP Status Code=400 | success→auto-terminate |
 | 08 | `HandleHttpResponse` | All Nodes, 1 | HTTP Status Code=202 | success→09 |
 | 09 | `EvaluateJsonPath` | All Nodes, 1 | Path Not Found Behavior=ignore. `load.run.id=$.runId`, `load.dispatch.id=$.dispatchId`와 재발행 필드(`partition.id`, `load.business.key`, `load.snapshot.scn`, `load.hdfs.path`, `partition.lower`, `partition.upper`, `partition.upper.inclusive`, `partition.is.null`, `partition.expected.rows`)를 한 번에 추출. 검증 요청에는 없는 필드가 빈 값이 된다 | matched→10, unmatched/failure→auto-terminate |
-| 10 | `RouteOnAttribute` | All Nodes, 1 | Job·동작별 route. 예: `INSP_DTL_validate=${http.request.uri:equals('/validate/ORACLE_INSP_DTL_DAILY')}`, `INSP_DTL_reissue=${http.request.uri:equals('/reissue/ORACLE_INSP_DTL_DAILY')}` | Job별 Output Port, unmatched→auto-terminate |
+| 10 | `RouteOnAttribute` | All Nodes, 1 | Job·동작별 route. 예: `validate.ORACLE_INSP_DTL_DAILY=${http.request.uri:equals('/validate/ORACLE_INSP_DTL_DAILY')}`, `reissue.ORACLE_INSP_DTL_DAILY=${http.request.uri:equals('/reissue/ORACLE_INSP_DTL_DAILY')}` | Job별 Output Port(`validate-<JOB>`, `reissue-<JOB>`), unmatched→auto-terminate |
 
 - 검증은 수십 분 걸릴 수 있으므로 08에서 먼저 202를 응답하고 HTTP 연결을 붙잡지 않는다. API는 2xx를 받으면 dispatch를 `SENT`로 바꾸고, 검증 flow가 `/validation/start`를 호출해야 `ACKED`가 된다. 202 응답 직후 노드가 죽어 FlowFile이 사라지면 API가 ACK timeout 뒤 다시 보낸다.
 - 등록되지 않은 `jobKey`는 05의 Allowed Paths에서 걸러져 `HandleHttpRequest`가 404로 응답한다. 07·09·10의 unmatched도 API 쪽에서 ACK timeout 후 재전송되고, 계속 실패하면 dispatch가 `DEAD`가 되어 API가 `DISPATCH_DEAD` 이벤트로 알린다. 그래서 PG-05는 별도 오류 기록 Processor를 두지 않는다. 원인은 NiFi Bulletin과 Provenance로 확인한다.
 - `HandleHttpRequest`는 모든 노드에서 동작한다. API는 NiFi LB 주소(`nifi.receiver_url`)로 호출하며, 어느 노드가 받든 Job PG의 첫 단계 CAS가 중복 실행을 막는다. 그래서 PG-40~60은 All Nodes로 스케줄한다(2.3).
-- 새 Job을 추가하면 05의 Allowed Paths에 `jobKey`를 넣고, 10에 route 두 개(validate, reissue)와 Output Port를 추가해 새 Job PG의 Input Port에 연결한다.
+- 새 Job을 추가하면 05의 Allowed Paths에 `jobKey`를 넣고, 10에 route 두 개(validate, reissue)와 Output Port를 추가해 새 Job PG의 Input Port에 연결한다. V4 빌더는 이 등록을 자동으로 한다. PG-05가 없으면 만들고, 있으면 PG-05를 멈춘 뒤 route·Port·root 연결을 추가하고 Allowed Paths를 등록된 Job 목록으로 다시 쓴 다음 시작한다. 멈춘 몇 초 동안 온 호출은 연결 실패가 되어 API dispatcher가 backoff 후 다시 보낸다. Job을 지울 때는 그 Job의 것만 지우고(`poc/teardown_flow.py`), 마지막 Job이면 PG-05도 지운다.
+- PG-05는 공통 Parameter Context(`PC_SQOOP_REPLACEMENT_COMMON`, `CONTROL.LISTEN.PORT`)를 쓴다. 이 Context는 모든 Job Context가 상속하므로 Job을 만들거나 지울 때 지우지 않는다.
 - 05는 HTTP로 받는다. 방화벽으로 수신 포트를 API worker 호스트에만 연다. 06이 `X-Run-Id`, `X-Dispatch-Id` 형식을 검사하고, 실제 처리 여부는 PG-40의 `/validation/start` CAS가 정한다.
 
 ---

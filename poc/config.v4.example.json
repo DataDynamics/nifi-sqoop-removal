@@ -1,9 +1,5 @@
 {
- "names": {
-  "process_group": "SQOOP_REPLACEMENT_POC_V4",
-  "common_context": "PC_SQOOP_REPLACEMENT_COMMON_V4",
-  "job_context": "PC_JOB_ORACLE_INSP_DTL_DAILY_V4"
- },
+ "_comment": "이름 기본값: Job PG JOB_<JOB.KEY>, Job Context PC_JOB_<JOB.KEY>, 공통 Context PC_SQOOP_REPLACEMENT_COMMON, root PG-05 'PG-05 Control Receiver'. 바꿀 때만 names를 둔다",
  "common_params": {
   "CONTROL.API.URL": "http://127.0.0.1:8080/v1",
   "CONTROL.API.AUTHORIZATION": "Bearer <nifi-token>",

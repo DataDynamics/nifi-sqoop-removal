@@ -1,4 +1,10 @@
 {
+ "_comment": "names는 teardown_flow.py용. build_flow_v1.py는 이 이름을 코드에 고정해 쓴다",
+ "names": {
+  "process_group": "SQOOP_REPLACEMENT_POC",
+  "common_context": "PC_SQOOP_REPLACEMENT_COMMON",
+  "job_context": "PC_JOB_PG_INSP_DTL_DAILY"
+ },
  "common_params": {
   "META.JDBC.URL": "jdbc:postgresql://localhost:5432/nifiops",
   "META.JDBC.USER": "nifi_ops",

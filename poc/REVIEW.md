@@ -211,7 +211,7 @@ NULL split 파티션(`SPLIT.NULL.POLICY=SEPARATE`)은 만들지 않는다. split
 | 2 | 16 SQL 실행 계획: 지표 CTE와 파티션별 상관 서브쿼리가 모두 `(BASE_DT, INSP_DTL_SEQ)` 인덱스 범위 스캔. 105,000건에서 0.06초. 이 인덱스가 없는 운영 테이블은 다시 확인한다 |
 | 3 | Parquet 타입: `NUMBER(19)` → `decimal(19,0)`(Hive DDL도 `DECIMAL(19,0)` 또는 `CAST`로 `BIGINT`), `CAST(AMOUNT AS NUMBER(18,2))` → `decimal(18,2)`, `DATE`·`TIMESTAMP` → `timestamp[ms, UTC]`. V3와 같이 JVM 시간대(KST) 기준으로 UTC로 바뀐다(`2026-09-28 00:00:01` → `2026-09-27T15:00:01Z`, 2장 #6). Oracle `DATE`는 날짜 컬럼이어도 timestamp가 된다. 정밀도 없는 `NUMBER`를 CAST 없이 읽는 경우는 7.6 |
 | 4 | JSON writer가 대문자 컬럼명과 `TO_CHAR` 문자열을 그대로 내보냈고, 17 Jolt와 API manifest 등록이 통과 |
-| 5 | **시험하지 않음.** 컨테이너 `UNDO_RETENTION`은 900초. `ORA-01555` → `FAILED_SNAPSHOT_EXPIRED` 경로는 운영 Oracle에서 확인한다 |
+| 5 | `ORA-01555` → `FAILED_SNAPSHOT_EXPIRED` 경로는 7.7에서 확인. `UNDO_RETENTION`이 run 최대 소요시간보다 긴지는 운영 Oracle에서 확인한다(컨테이너 기본값 900초) |
 | 6 | 위 표와 같이 V3 시나리오 모두 V3와 같은 결과 |
 
 ### 7.6 정밀도 없는 `NUMBER` (2026-10-02)
@@ -225,6 +225,24 @@ NULL split 파티션(`SPLIT.NULL.POLICY=SEPARATE`)은 만들지 않는다. split
 | `SCALE=0` | **오류 없이 run 성공.** 모든 컬럼이 `decimal(38,0)`, `AMOUNT` 1.37 → 1, 2.74 → 3, 1368.63 → 1369(반올림). `AMOUNT` 합계 71,853,600(원천 71,853,075). 추출 단계 검증(건수)은 통과하므로 stage·target의 `AMOUNT_SUM` 비교(가이드 10.3)에서만 드러난다 |
 
 정리: 원천 컬럼은 `CAST(... AS NUMBER(p,s))`로 정밀도를 명시하고(가이드 3.2), Default Decimal Precision/Scale은 그 밖의 컬럼을 위한 안전망으로만 둔다. scale을 작게 잡으면 소리 없이 값이 바뀐다. 가이드 3.1·4장에 반영했다.
+
+### 7.7 `ORA-01555` (2026-10-02)
+
+같은 SCN의 undo를 지워 34 파티션 쿼리에서 `ORA-01555`를 일으켰다.
+
+1. PDB(local undo)의 undo를 8MB 고정 크기 `UNDO_TINY`, `UNDO_RETENTION=1`로 바꿈
+2. 34를 멈춘 채 Trigger → SCN 2304014 고정, manifest 등록, 7개 파티션 claim 후 34 앞에서 대기
+3. 원천 105,000행을 같은 값으로 갱신(`SET ITEM_CD = ITEM_CD`, 500행씩 commit)하고 다른 테이블 갱신으로 undo를 여러 번 순환. 이후 `AS OF SCN 2304014`로 테이블 블록을 읽는 조회가 `ORA-01555`. 인덱스만 읽는 `COUNT(*)`는 성공했다(인덱스 블록은 바뀌지 않음)
+4. 34 시작
+
+| 항목 | 결과 |
+|---|---|
+| 34 | 7개 파티션 모두 1회만 실행하고 `failure` → `errors`(재시도 없음, 가이드 16장) |
+| PG-90 | `executesql.error.message`에서 `ORA-01555` 추출, `class=NON_RETRYABLE`, NiFi `EXTRACT_FAILED` 이벤트 7건, 파티션 실패 API 호출 7건 |
+| API | 첫 실패에서 run `FAILED_SNAPSHOT_EXPIRED`(`error_stage=EXTRACT`, `error_code=ORA-01555`), 7개 파티션 `FAILED`(0건 파티션 0002는 `SUCCESS`). 검증 dispatch 0건, HDFS run 경로 없음 |
+| 재실행 | undo를 되돌린 뒤 Trigger → 새 run이 새 SCN(2310932)으로 8/8 성공. 실패한 run은 그대로 남음 |
+
+Oracle 메시지는 NLS 설정에 따라 한글로 나왔지만(`ORA-01555: 너무 이전 스냅샷: ...`) 코드 추출(`ORA-[0-9]{5}`)에는 영향이 없다.
 
 ### 7.5 재현 방법 (V4)
 

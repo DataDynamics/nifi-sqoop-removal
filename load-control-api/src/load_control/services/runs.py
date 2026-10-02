@@ -26,7 +26,7 @@ log = structlog.get_logger(__name__)
 
 
 def build_run_paths(req: RunCreateRequest, run_id: UUID) -> tuple[str, str]:
-    """run 전용 HDFS 경로와 stage table 이름(가이드 1장 경로 원칙)."""
+    """run 전용 HDFS 경로와 stage table 이름."""
     hdfs_run_path = f"{req.hdfs_root.rstrip('/')}/{req.job_key}/run_id={run_id}"
     stage_table = f"{req.stage_table_prefix}{run_id.hex}".lower()
     return hdfs_run_path, stage_table

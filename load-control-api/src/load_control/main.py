@@ -96,7 +96,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.exception_handler(DBAPIError)
     async def db_error(request: Request, exc: DBAPIError) -> JSONResponse:
-        """연결 장애·일시 오류: 503으로 응답해 NiFi InvokeHTTP가 Retry로 보내게 한다(API 설계 5.4)."""
+        """연결 장애·일시 오류: 503으로 응답해 NiFi InvokeHTTP가 Retry로 보내게 한다."""
         log.error("db_error", sqlstate=sqlstate(exc), error=type(exc.orig).__name__,
                   connection=isinstance(exc, OperationalError | InterfaceError), exc_info=exc)
         return _error(request, 503, "DATABASE_UNAVAILABLE", "database error, retry later")

@@ -1,7 +1,7 @@
 """worker 진입점: python -m load_control.worker [--config PATH]
 
 dispatcher(검증·재발행 호출 전달)와 sweeper(stale·timeout 정리)를 한 프로세스에서 실행한다.
-여러 인스턴스를 띄워도 lease(SKIP LOCKED)와 advisory lock이 중복 처리를 막는다(API 설계 9.2).
+여러 인스턴스를 띄워도 lease(SKIP LOCKED)와 advisory lock이 중복 처리를 막는다.
 """
 
 import argparse

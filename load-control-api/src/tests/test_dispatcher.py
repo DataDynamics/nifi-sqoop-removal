@@ -112,7 +112,7 @@ async def test_client_error_marks_dead_immediately(client: httpx.AsyncClient, db
 
 async def test_ack_before_mark_sent_keeps_acked(client: httpx.AsyncClient, db: Db, engine: AsyncEngine,
                                                 worker_settings: Settings) -> None:
-    """NiFi가 202 직후 /validation/start를 먼저 호출해도 ACKED가 SENT로 덮이지 않는다(API 설계 9.8)."""
+    """NiFi가 202 직후 /validation/start를 먼저 호출해도 ACKED가 SENT로 덮이지 않는다."""
     run, dispatch_id = await complete_run(client)
     leased = await in_tx(engine, lambda c: dispatch.lease_due(c, batch=10, lease=timedelta(seconds=60)))
     assert [str(d.dispatch_id) for d in leased] == [dispatch_id]

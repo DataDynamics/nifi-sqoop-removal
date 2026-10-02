@@ -1,46 +1,26 @@
 #!/usr/bin/env python3
-"""NiFi 2.4 REST API로 Sqoop 대체 PoC Flow V4를 만든다. V3(build_flow_v3.py)와 같은 구조(Load Control API 연동,
-자식 PG + Port)에서 원천을 PostgreSQL 대신 Oracle로 바꾼 버전이다. 가이드 7.2~7.3, 8.4의 Oracle 기준을 따른다.
+"""Sqoop 대체 NiFi Flow를 REST API로 만든다(Cloudera CFM 4.12 / NiFi 2.6).
 
+사용법: build_flow_v4.py <nifi-api-url> <config.json>      (형식: config.v4.example.json)
+
+만드는 것
     root: PG-05 Control Receiver(모든 Job 공통) ─validate-<JOB>▶ Job PG validate-in,  ─reissue-<JOB>▶ reissue-in
-    Job PG: PG-00 Trigger ─start-run▶ PG-10 Run Coordinator ─partitions(RR)▶ PG-20 Extract Worker
-            validate-in ▶ PG-40 Staging Validation ─staging-valid▶ PG-50 Publish ─published▶ PG-60 Target Validation
-            reissue-in ─(RR)▶ PG-20,  PG-70 Cleanup(주기 실행),  모든 PG ─errors▶ PG-90 Error and Event
+    Job PG(JOB_<JOB.KEY>):
+        PG-00 Trigger ─start-run▶ PG-10 Run Coordinator ─partitions(RR)▶ PG-20 Extract Worker
+        validate-in ▶ PG-40 Staging Validation ─staging-valid▶ PG-50 Publish ─published▶ PG-60 Target Validation
+        reissue-in ─(RR)▶ PG-20,  PG-70 Cleanup(1시간 주기),  모든 PG ─errors▶ PG-90 Error and Event
 
-V3 대비 변경점
-- 원천 Connection Pool(CS_DBCP_ORACLE): oracle.jdbc.OracleDriver, ORACLE.JDBC.* Parameter(ojdbc 경로 포함),
-  검사 쿼리 SELECT 1 FROM DUAL. 이름은 가이드 3.1·4장과 같다.
-  관리 DB(load_event)는 PostgreSQL 그대로이므로 드라이버 경로를 META.JDBC.DRIVER.PATH로 나눈다.
-- PG-10: SCN 조회(14)·추출(15)을 추가해 모든 원천 SQL이 같은 SCN(AS OF SCN)을 읽는다. 원천 지표+manifest SQL(16)은
-  Oracle 문법(CONNECT BY, TO_CHAR, 문자열 boolean)이며 결과 컬럼은 대문자다. SCN과 timestamp 지표(MIN_TS/MAX_TS)도
-  함께 반환한다. Processor 번호는 가이드 7.2(11~20)와 같다.
-- PG-20: 33에서 SCN도 숫자 검사, 34는 AS OF SCN으로 조회하고 재시도하지 않는다(같은 SCN으로 긴 쿼리를 반복하지
-  않도록, 가이드 16장). 정밀도 없는 NUMBER는 ORACLE.NUMBER.DEFAULT.PRECISION/SCALE로 기록된다(SRC.COLUMNS에서
-  CAST로 정밀도를 명시하는 것을 권장).
-- PG-05: 재발행 본문의 snapshotScn을 load.snapshot.scn으로 꺼낸다.
-- NULL split 파티션(SPLIT.NULL.POLICY=SEPARATE)은 만들지 않는다. NULL이 있으면 API가 manifest를 거부한다.
-- PG-40 나머지(47~4E), PG-50, PG-60(가이드 10~12장): Hive staging external table과 지표 검증, INSERT OVERWRITE 게시,
-  target 지표 검증으로 run을 SUCCESS까지 끝낸다. Hive 구성요소는 CFM의 ClouderaHiveConnectionPool(CS_HIVE3_DBCP)과
-  PutClouderaHiveQL이며, 지표 조회는 ExecuteSQLRecord(JSON)다. Apache NiFi에는 Hive 번들이 없어 이 빌더를 쓸 수 없다.
-- PG-70 Cleanup: 1시간마다 API에 보존 기간이 지난 run을 묻고 staging table을 DROP, HDFS run 경로를 삭제한 뒤
-  API에 기록한다. 보존 기간과 대상 판정은 API(cleanup 설정)가 한다.
+동작 요약
+- PG-10이 Oracle SCN을 하나 고정하고, 원천 지표·파티션 계산과 모든 파티션 추출이 같은 SCN(AS OF SCN)을 읽는다.
+- 완료 판정·상태 기록은 Load Control API가 하고, NiFi는 데이터 처리와 API 호출만 한다.
+- Hive 단계는 CFM의 ClouderaHiveConnectionPool(CS_HIVE3_DBCP), PutClouderaHiveQL을 쓴다. Apache NiFi에는 없다.
+- PG-05가 없으면 만들고, 있으면 이 Job의 route·Output Port·root 연결만 추가한다(PG-05를 몇 초 멈춘다).
+  공통 Parameter Context는 지우지 않고 값만 config로 맞춘다. 지우기는 teardown_flow.py.
+- 이름: Job PG JOB_<JOB.KEY>, Job Context PC_JOB_<JOB.KEY>, 공통 Context PC_SQOOP_REPLACEMENT_COMMON.
+  config의 names로 바꿀 수 있다.
+- Trigger(00_Generate_Trigger)는 DISABLED로 만든다. 실행하려면 enable 후 Run Once 한다.
 
-Oracle Database 23ai Free에서 V3 시나리오와 NUMBER 정밀도, ORA-01555를 시험했다(REVIEW.md 7.4~7.7).
-Cloudera CFM 4.12(NiFi 2.6.0) 2노드 클러스터에서도 정상 실행을 확인했다(REVIEW.md 7.8). 클러스터에서 trigger가
-노드마다 생기지 않도록 00은 Primary Node에서만 실행한다. Hive 단계(PG-40~60)는 같은 클러스터와 Apache Hive 4.0.1
-(poc/hdfs-hive)에서 정상·staging DQ 실패·게시 실패·target 검증 실패·Hive 중단을 시험했다(REVIEW.md 7.9).
-사용 방법은 V4-MANUAL.md.
-
-PG-05는 root에 하나 두고 Job끼리 공유한다(가이드 2장, 9.5). 없으면 만들고, 있으면 이 Job의 route(10의
-validate.<JOB>/reissue.<JOB>), Output Port, root 연결을 추가하고 Allowed Paths를 갱신한다. 이때 PG-05를 몇 초
-멈췄다가 다시 시작한다. 공통 Parameter Context도 지우지 않고 값만 config로 맞춘다. 지울 때는 teardown_flow.py가
-이 Job의 등록만 지우고, 마지막 Job이면 PG-05와 공통 Context를 지운다(REVIEW.md 7.11).
-
-사용법: build_flow_v4.py <nifi-api-url> <config.json>
-config.json 형식은 config.v4.example.json. 이름은 `names`로 바꿀 수 있고 기본값은 다음과 같다.
-Job PG `JOB_<JOB.KEY>`, Job Context `PC_JOB_<JOB.KEY>`, 공통 Context `PC_SQOOP_REPLACEMENT_COMMON`,
-root PG-05 `PG-05 Control Receiver`. Job을 추가할 때는 JOB.KEY와 job_params만 다르게 한다.
-Trigger(00_Generate_Trigger)는 DISABLED로 만든다. 실행하려면 enable 후 Run Once 한다.
+자세한 사용법은 poc/V4-MANUAL.md, 설계는 nifi-sqoop-removal-guide.md.
 """
 import json
 import sys
@@ -54,7 +34,7 @@ NAMES = CFG.get("names", {})
 JOB_KEY = CFG["job_params"]["JOB.KEY"]
 if not __import__("re").fullmatch(r"[A-Z0-9_]{1,200}", JOB_KEY):
     raise SystemExit(f"JOB.KEY must match [A-Z0-9_]+: {JOB_KEY}")
-# 이름은 가이드 2장·3장과 같다. Job PG와 Job Context는 JOB.KEY로 정하고, 공통 Context와 PG-05는 모든 Job이 공유한다.
+# Job PG와 Job Context는 JOB.KEY로 정하고, 공통 Context와 PG-05는 모든 Job이 공유한다.
 TOP_NAME = NAMES.get("process_group", f"JOB_{JOB_KEY}")
 PC_COMMON = NAMES.get("common_context", "PC_SQOOP_REPLACEMENT_COMMON")
 PC_JOB = NAMES.get("job_context", f"PC_JOB_{JOB_KEY}")
@@ -140,7 +120,7 @@ def new_pg(parent, name, x, y, comments="", ctx=None):
     return ent["id"]
 
 
-TOP = new_pg(root, TOP_NAME, 1000, 300, "Sqoop 대체 PoC V4: Oracle 원천, 자식 PG + Port 구조")
+TOP = new_pg(root, TOP_NAME, 1000, 300, "Sqoop 대체 적재 Job: Oracle 원천, 자식 PG + Port 구조")
 
 # ---------------------------------------------------------------- Controller Services (TOP에 두고 자식 PG가 공유)
 services = {}
@@ -170,7 +150,7 @@ SRC = cs("CS_DBCP_ORACLE", "HikariCPConnectionPool",
          hikari("ORACLE", "oracle.jdbc.OracleDriver", "SELECT 1 FROM DUAL", "#{ORACLE.POOL.MAX}"))
 JARR = cs("CS_JSON_WRITER_ARRAY", "JsonRecordSetWriter", {"output-grouping": "output-array"})
 PARQ = cs("CS_PARQUET_WRITER", "ParquetRecordSetWriter", {"compression-type": "SNAPPY"})
-# Hive(가이드 10~12장). 지표 조회 SQL의 결과 컬럼 이름이 table alias 없이 오도록 HIVE.JDBC.URL에
+# Hive. 지표 조회 SQL의 결과 컬럼 이름이 table alias 없이 오도록 HIVE.JDBC.URL에
 # hive.resultset.use.unique.column.names=false를 둔다.
 HIVE = cs("CS_HIVE3_DBCP", "ClouderaHiveConnectionPool", {
     "hive-db-connect-url": "#{HIVE.JDBC.URL}", "hive-db-user": "#{HIVE.JDBC.USER}",
@@ -234,7 +214,7 @@ COMMENTS = {
     "B52": "API에 게시 소유권을 요청한다(POST /publish/claim). STAGING_VALIDATED → PUBLISHING CAS에 성공하거나 같은 token이면 claimed=true.",
     "B53": "claimed=true인 경우만 게시한다. 중복 요청은 오류 없이 종료한다.",
     "B54": "승인된 target·partition·column으로 INSERT OVERWRITE SQL을 만든다. FlowFile에서 받은 값은 stage table 이름(형식 검사)만 쓴다.",
-    "B55": "target에 INSERT OVERWRITE를 실행한다. 재시도하지 않는다. failure·retry는 실행 여부를 알 수 없으므로 PUBLISH_UNKNOWN으로 보고한다(가이드 11.2).",
+    "B55": "target에 INSERT OVERWRITE를 실행한다. 재시도하지 않는다. failure·retry는 실행 여부를 알 수 없으므로 PUBLISH_UNKNOWN으로 보고한다.",
     "B56": "게시 결과 PUBLISHED 본문을 만든다.",
     "B56U": "게시 결과 PUBLISH_UNKNOWN 본문을 만든다. 운영자가 Hive 이력과 target을 확인해 /publish-unknown/resolve로 확정한다.",
     "B57": "API에 게시 결과를 보고한다(POST /publish/result). token이 일치할 때만 run 상태가 바뀐다.",
@@ -333,7 +313,7 @@ def body(g, key, name, value, col, row):
 
 
 def invoke(g, key, name, path, col, row, attr_response=True, tasks=1, method="POST"):
-    """Load Control API 호출(가이드 9.2). Retry(5xx)·Failure(연결 오류)는 내장 재시도 후 errors로 간다."""
+    """Load Control API 호출. Retry(5xx)·Failure(연결 오류)는 내장 재시도 후 errors로 간다."""
     props = {
         "HTTP Method": method, "HTTP URL": f"#{{CONTROL.API.URL}}{path}",
         "Request Content-Type": "application/json", "Connection Timeout": "5 secs",
@@ -379,7 +359,7 @@ N = "#{PARTITION.COUNT}"
 G00 = new_pg(TOP, "PG-00 Trigger", 0, 0, "스케줄 트리거와 업무일자 형식 검증")
 G10 = new_pg(TOP, "PG-10 Run Coordinator", 0, 260, "run 생성, 원천 지표·manifest 계산, manifest 등록")
 G20 = new_pg(TOP, "PG-20 Extract Worker", 0, 520, "claim, 파티션 추출, PutHDFS, chunk 보고")
-# PG-05는 root에 하나 두고 모든 Job이 공유한다(가이드 2장, 9.5). 이미 있으면 이 Job만 등록한다(맨 아래 register_job).
+# PG-05는 root에 하나 두고 모든 Job이 공유한다. 이미 있으면 이 Job만 등록한다(맨 아래 register_job).
 G05 = next((g["id"] for g in call("GET", f"/flow/process-groups/{root}")["processGroupFlow"]["flow"]["processGroups"]
             if g["component"]["name"] == RECEIVER_NAME), None)
 RECEIVER_NEW = G05 is None
@@ -447,12 +427,12 @@ PG_LABELS = {
 }
 for g, text in PG_LABELS.items():
     label(g, text, 0, -2 * ROWH, 5 * COLW, 170)
-label(TOP, TOP_NAME + """ — Load Control API 연동 Sqoop 대체 PoC V4 (Oracle 원천)
+label(TOP, TOP_NAME + """ — Load Control API 연동 Sqoop 대체 적재 (Oracle 원천)
 PG-00 →(start-run)→ PG-10 →(partitions, Round Robin)→ PG-20 → API가 완료 판정 → API worker가 PG-05 호출
 root PG-05 →(validate-in)→ PG-40 →(staging-valid)→ PG-50 →(published)→ PG-60,  root PG-05 →(reissue-in, Round Robin)→ PG-20
 PG-70 Cleanup(1시간 주기),  모든 PG →(errors)→ PG-90
 원장 기록·완료 판정은 Load Control API가 하고, NiFi는 데이터 처리와 API 호출만 한다.
-상세: nifi-sqoop-removal-guide.md 2장, poc/REVIEW.md 6장""", 0, -250, 1100, 170)
+상세: nifi-sqoop-removal-guide.md, poc/V4-MANUAL.md""", 0, -250, 1100, 170)
 
 # ===== PG-00 Trigger
 port(G00, "start-run", "out", 3, 0)
@@ -469,7 +449,7 @@ route(G00, "P02", "02_Validate_Trigger", {
 c(G00, "P00", "success", "P01"); c(G00, "P01", "success", "P02")
 c(G00, "P02", "valid", ("out", "start-run")); c(G00, "P02", "unmatched", ("out", "errors"))
 
-# ===== PG-10 Run Coordinator (가이드 7장)
+# ===== PG-10 Run Coordinator
 port(G10, "start-run", "in", 0, 0)
 port(G10, "partitions", "out", 4, 2)
 port(G10, "errors", "out", 4, 1)
@@ -482,17 +462,17 @@ ua(G10, "P13", "13_Set_Run_Attrs", {
     "load.hdfs.path": "${api.response:jsonPath('$.hdfsRunPath')}",
     "load.stage.table": "${api.response:jsonPath('$.stageTable')}",
     "load.stage": "MANIFEST"}, 3, 0)
-# 14·15: Oracle SCN을 고정한다. 이후 모든 원천 조회(16, PG-20 34)가 같은 SCN을 읽는다(가이드 7.2).
+# 14·15: Oracle SCN을 고정한다. 이후 모든 원천 조회(16, PG-20 34)가 같은 SCN을 읽는다.
 # V$DATABASE 조회 권한이 없으면 SELECT TO_CHAR(DBMS_FLASHBACK.GET_SYSTEM_CHANGE_NUMBER) AS SNAPSHOT_SCN FROM DUAL로 바꾼다.
 esql(G10, "P14", "14_Query_Current_SCN", SRC, "SELECT TO_CHAR(CURRENT_SCN) AS SNAPSHOT_SCN FROM V$DATABASE", 0, 1)
 p(G10, "P15", "15_Extract_SCN", "EvaluateJsonPath", {
     "Destination": "flowfile-attribute", "load.snapshot.scn": "$[0].SNAPSHOT_SCN"}, 1, 1)
-# 16: 원천 지표와 파티션 경계·건수를 같은 SCN에서 한 문장으로 계산한다(가이드 7.3).
+# 16: 원천 지표와 파티션 경계·건수를 같은 SCN에서 한 문장으로 계산한다.
 # - SCN이 숫자가 아니면 INVALID_SCN이 들어가 SQL 오류로 실패한다(별도 RouteOnAttribute 없음).
 # - 경계·건수·SCN은 TO_CHAR로 문자열 반환: NUMBER(38)이 JSON 숫자로 바뀌며 정밀도를 잃지 않게 한다.
 #   API는 숫자 문자열을 정수로 받아들인다. boolean은 19c 이하에 SQL 타입이 없어 'true'/'false' 문자열이다.
 # - Oracle은 따옴표 없는 별칭을 대문자로 돌려주므로 결과 컬럼을 대문자로 두고 17의 Jolt도 대문자 키를 쓴다.
-# - MIN_TS/MAX_TS는 stage 검증에서 시간대 해석 차이를 잡기 위한 지표다(가이드 4장, 10.3).
+# - MIN_TS/MAX_TS는 stage 검증에서 시간대 해석 차이를 잡기 위한 지표다.
 SCN = "${load.snapshot.scn:matches('^[0-9]+$'):ifElse(${load.snapshot.scn},'INVALID_SCN')}"
 MANIFEST_SQL = """WITH m AS (
   SELECT COUNT(*) AS source_count, COUNT(*) - COUNT(@SPLIT@) AS null_cnt,
@@ -569,7 +549,7 @@ c(G10, "P18", "Response", "P19")
 c(G10, "P19", "split", "P20"); c(G10, "P19", "failure", ("out", "errors"))
 c(G10, "P20", "matched", ("out", "partitions")); c(G10, "P20", ["unmatched", "failure"], ("out", "errors"))
 
-# ===== PG-20 Extract Worker (가이드 8장). 입력은 PG-10 manifest와 PG-05 reissue 두 곳
+# ===== PG-20 Extract Worker. 입력은 PG-10 manifest와 PG-05 reissue 두 곳
 port(G20, "partitions", "in", 0, 0)
 port(G20, "errors", "out", 4, 2)
 # UpdateAttribute는 들어온 attribute 기준으로 평가하므로 token 생성과 사용(31 본문)을 다른 Processor에 둔다.
@@ -582,7 +562,7 @@ route(G20, "P33", "33_Is_Owner", {
     "owner": f"${{api.response:jsonPath('$.claimed'):equals('true'):and(${{partition.lower:matches({NUM})}})"
              f":and(${{partition.upper:matches({NUM})}}):and(${{load.snapshot.scn:matches({NUM})}})}}"}, 4, 0)
 # 고정 SCN으로 조회한다. 재시도하지 않는다: ORA-01555처럼 같은 SCN으로 다시 해도 실패할 오류에 긴 쿼리를
-# 반복하지 않도록 바로 실패 보고하고 새 run으로 재실행한다(가이드 16장).
+# 반복하지 않도록 바로 실패 보고하고 새 run으로 재실행한다.
 # 정밀도 없는 NUMBER 컬럼은 Default Decimal Precision/Scale로 기록된다. 기본값(10, 0)이면 소수점 이하가 잘리거나
 # 큰 값이 깨질 수 있으므로 Parameter로 지정하고, 가능하면 SRC.COLUMNS에서 CAST(col AS NUMBER(p,s))로 명시한다.
 esql(G20, "P34", "34_Execute_Partition_Query", SRC,
@@ -611,7 +591,7 @@ c(G20, "P32", "Original", "P33"); c(G20, "P33", "owner", "P34")
 c(G20, "P34", "success", "P35"); c(G20, "P34", "failure", ("out", "errors"))
 c(G20, "P35", "success", "P36"); c(G20, "P36", "success", "P37"); c(G20, "P37", "success", "P38")
 
-# ===== PG-05 Control Receiver (가이드 9.5). root 공통 PG. 처음 만들 때만 Processor를 둔다.
+# ===== PG-05 Control Receiver. root 공통 PG. 처음 만들 때만 Processor를 둔다.
 # Job별 route(10의 validate.<JOB>/reissue.<JOB>), Output Port, Allowed Paths는 register_job이 추가한다.
 # 오류 기록 Processor는 두지 않는다. 400·unmatched는 API가 ACK timeout 뒤 다시 보내고, 계속 실패하면 DEAD로 알린다.
 if RECEIVER_NEW:
@@ -652,7 +632,7 @@ if RECEIVER_NEW:
 port(TOP, "validate-in", "in", -1, 1)
 port(TOP, "reissue-in", "in", -1, 3)
 
-# ===== PG-40 Staging Validation (가이드 10장)
+# ===== PG-40 Staging Validation
 port(G40, "validate", "in", 0, 0)
 port(G40, "errors", "out", 5, 1)
 port(G40, "staging-valid", "out", 5, 3)
@@ -661,7 +641,7 @@ body(G40, "V41", "41_Build_Start_Body", '{"dispatchId":"${load.dispatch.id}","no
 invoke(G40, "V42", "42_Validation_Start", "/runs/${load.run.id}/validation/start", 3, 0)
 # started=false는 중복 dispatch이므로 조용히 끝낸다.
 route(G40, "V43", "43_Is_Started", {"started": "${api.response:jsonPath('$.started'):equals('true')}"}, 4, 0)
-# 검증 flow는 API 호출로 새로 시작되므로 기대값(원천 건수·지표)을 /validation/start 응답에서 받는다(가이드 10.2).
+# 검증 flow는 API 호출로 새로 시작되므로 기대값(원천 건수·지표)을 /validation/start 응답에서 받는다.
 # 여기부터 load.stage=STAGE_VALIDATION: 실패하면 PG-90이 run을 FAILED_STAGE_VALIDATION으로 보고한다.
 ua(G40, "V44", "44_Set_Run_Attrs", {
     "load.hdfs.path": "${api.response:jsonPath('$.hdfsRunPath')}",
@@ -691,7 +671,7 @@ def str_attr(a):
 
 
 def metrics_sql(table_where, count_name):
-    """지표마다 (metric_name, expected_value, actual_value, result) 한 행(가이드 10.3).
+    """지표마다 (metric_name, expected_value, actual_value, result) 한 행.
     MIN_TS/MAX_TS는 원천 TO_CHAR와 같은 형식의 문자열로 비교한다. AMOUNT_SUM은 DECIMAL(38,2)로 맞춰 비교한다."""
     return f"""WITH s AS (
   SELECT COUNT(*) AS cnt,
@@ -753,7 +733,7 @@ c(G40, "V4B", "Original", "V4C"); c(G40, "V4C", "success", "V4D"); c(G40, "V4C",
 c(G40, "V4D", "Original", "V4E")
 c(G40, "V4E", "validated", ("out", "staging-valid")); c(G40, "V4E", "unmatched", ("out", "errors"))
 
-# ===== PG-50 Publish (가이드 11장). 결과는 57이 직접 보고하므로 PG-90은 이벤트만 남긴다.
+# ===== PG-50 Publish. 결과는 57이 직접 보고하므로 PG-90은 이벤트만 남긴다.
 port(G50, "staging-valid", "in", 0, 0)
 port(G50, "errors", "out", 5, 1)
 port(G50, "published", "out", 5, 2)
@@ -765,7 +745,7 @@ body(G50, "B54", "54_Build_Insert_Overwrite_SQL",
      "INSERT OVERWRITE TABLE #{HIVE.TARGET.DB}.#{HIVE.TARGET.TABLE}\n#{TARGET.PARTITION.CLAUSE}\n"
      f"SELECT #{{HIVE.INSERT.COLUMNS}}\n  FROM {STAGE_TBL}", 0, 1)
 # 재시도 없음. PutClouderaHiveQL은 오류 attribute를 남기지 않아 실행 전 실패(FAILED_PUBLISH)를 가려낼 수 없으므로
-# failure·retry를 모두 PUBLISH_UNKNOWN으로 보고한다(가이드 11.2, 55A·56F 생략).
+# failure·retry를 모두 PUBLISH_UNKNOWN으로 보고한다.
 hive_ql(G50, "B55", "55_Insert_Overwrite", 1, 1)
 body(G50, "B56", "56_Body_PUBLISHED", '{"publishToken":"${publish.token}","outcome":"PUBLISHED"}', 2, 1)
 body(G50, "B56U", "56U_Body_PUBLISH_UNKNOWN",
@@ -783,7 +763,7 @@ c(G50, "B56", "failure", ("out", "errors")); c(G50, "B56U", "failure", ("out", "
 c(G50, "B57", "Original", "B58")
 c(G50, "B58", "published", ("out", "published")); c(G50, "B58", "unmatched", ("out", "errors"))
 
-# ===== PG-60 Target Validation (가이드 12장)
+# ===== PG-60 Target Validation
 port(G60, "published", "in", 0, 0)
 port(G60, "errors", "out", 5, 1)
 ua(G60, "T60", "60_Set_Target_Stage", {"load.stage": "TARGET_VALIDATION"}, 1, 0)
@@ -842,7 +822,7 @@ c(G70, "C77", "success", "C78"); c(G70, "C77", ["failure", "retry"], ("out", "er
 c(G70, "C78", "success", "C79"); c(G70, "C78", "failure", ("out", "errors"))
 c(G70, "C79", "success", "C7A"); c(G70, "C79", "failure", ("out", "errors"))
 
-# ===== PG-90 Error and Event (가이드 14장). 모든 PG의 errors가 여기로 온다.
+# ===== PG-90 Error and Event. 모든 PG의 errors가 여기로 온다.
 port(G90, "errors", "in", 0, 0)
 # 같은 UpdateAttribute 안에서는 방금 만든 값을 참조할 수 없으므로 식마다 원천 attribute를 직접 쓴다.
 # - 4xx/5xx 응답: invokehttp.status.code (2xx 값은 앞 단계 성공 흔적이므로 무시)
@@ -850,7 +830,7 @@ port(G90, "errors", "in", 0, 0)
 # - SQL 실패: executesql.error.message
 # - 그 밖(PutHDFS, 형식 검증, Control Receiver 400): load.stage로 식별
 HTTP_ERR = "${invokehttp.status.code:matches('[3-5][0-9]{2}')}"
-# 409는 정상 경합(DUPLICATE_ACTIVE_RUN, CLAIM_MISMATCH, CHUNK_CONFLICT)이므로 API 오류 코드를 이름으로 쓰고 WARN으로 남긴다(가이드 9.3).
+# 409는 정상 경합(DUPLICATE_ACTIVE_RUN, CLAIM_MISMATCH, CHUNK_CONFLICT)이므로 API 오류 코드를 이름으로 쓰고 WARN으로 남긴다.
 # Response Body Attribute Name을 쓰면 4xx/5xx 본문도 api.response로 들어간다.
 BODY_CODE = "${invokehttp.response.body:replaceNull(${api.response}):jsonPath('$.code'):replaceEmpty('HTTP_409')}"
 STAGE_FAILED = "${load.stage:replaceNull('CONTROL_RECEIVER'):append('_FAILED')}"
@@ -867,7 +847,7 @@ ua(G90, "E90", "90_Normalize_Error", {
     "error.event": "${invokehttp.status.code:equals('409'):ifElse(" + BODY_CODE + "," + STAGE_FAILED + ")}",
     "error.class": "${invokehttp.java.exception.class:isEmpty():not():ifElse('TRANSIENT',"
                    "${invokehttp.status.code:matches('4[0-9]{2}'):ifElse('VALIDATION','NON_RETRYABLE')})}",
-    # run 실패 보고 대상 단계의 기대 상태와 실패 상태(가이드 14.2 91 표)
+    # run 실패 보고 대상 단계의 기대 상태와 실패 상태
     "load.fail.expected": "${load.stage:equals('MANIFEST'):ifElse('CREATED',"
                           "${load.stage:equals('STAGE_VALIDATION'):ifElse('STAGE_VALIDATING','PUBLISHED')})}",
     "load.fail.status": "${load.stage:equals('MANIFEST'):ifElse('FAILED_MANIFEST',"

@@ -1,10 +1,10 @@
-"""상태 값과 허용 전이(가이드 4.1 CHECK 제약, 17장 상태도)."""
+"""상태 값과 허용 전이."""
 
 from enum import StrEnum
 
 
 class RunStatus(StrEnum):
-    """load_run.status. 가이드 17장 상태도의 값과 같다."""
+    """load_run.status. ck_load_run_status 제약과 같은 값."""
 
     CREATED = "CREATED"
     EXTRACTING = "EXTRACTING"

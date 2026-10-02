@@ -43,7 +43,7 @@ nifi:                     # worker → NiFi PG-05 호출
   receiver_url: http://nifi-lb.internal:9443   # NiFi↔API는 HTTP만 쓴다(client_cert/client_key/ca_bundle 설정 안 함)
   timeout_seconds: 10
 
-recovery:                 # sweeper 기준(가이드 13.1)
+recovery:                 # sweeper 기준
   run_timeout: PT6H
   extract_query_timeout: PT60M   # NiFi EXTRACT.QUERY.TIMEOUT과 같은 값
   stale: PT90M                   # extract_query_timeout보다 커야 한다
@@ -58,7 +58,7 @@ cleanup:                  # 정리 대상 판정(NiFi PG-70 Cleanup이 GET /v1/c
   failed_retention: P14D  # 실패·TIMED_OUT run(원인 확인용). PUBLISH_UNKNOWN은 확정 전까지 대상 아님
   max_batch: 200          # 한 번에 돌려줄 최대 run 수
 
-dispatch:                 # outbox 전달(API 설계 4장)
+dispatch:                 # outbox 전달
   max_attempts: 20
   backoff_min: PT5S
   backoff_max: PT5M

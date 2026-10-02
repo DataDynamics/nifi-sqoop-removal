@@ -1,4 +1,4 @@
-"""Alembic async 환경. ORM 모델이 없으므로 autogenerate는 쓰지 않고 SQL을 직접 작성한다(API 설계 9.9)."""
+"""Alembic async 환경. ORM 모델이 없으므로 autogenerate는 쓰지 않고 SQL을 직접 작성한다."""
 
 import asyncio
 from logging.config import fileConfig

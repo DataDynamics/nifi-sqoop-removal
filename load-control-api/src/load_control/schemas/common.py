@@ -18,7 +18,7 @@ Message = Annotated[str, StringConstraints(max_length=2000)]
 
 
 class ApiModel(BaseModel):
-    """JSON은 camelCase, Python 속성은 snake_case(API 설계 9.4).
+    """JSON은 camelCase, Python 속성은 snake_case.
 
     - lax 모드: NiFi AttributesToJSON의 "5000", "false" 같은 문자열을 int/bool로 받는다.
     - coerce_numbers_to_str: 경계값이 JSON 숫자로 와도 DecimalStr로 받는다.

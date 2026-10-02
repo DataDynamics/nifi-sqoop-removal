@@ -1,4 +1,4 @@
-"""파티션 claim, chunk 보고 판정, 파티션 실패(API 설계 3장, 9.6).
+"""파티션 claim, chunk 보고 판정, 파티션 실패.
 
 이 모듈이 "모든 파티션이 끝났는가"를 판정하는 핵심이다. 모든 함수는 run 행을 먼저 잠가
 같은 run의 판정을 직렬화한다. 그래서 마지막 파티션들이 동시에 끝나도 run 완료와 검증 호출 예약은
@@ -30,7 +30,7 @@ log = structlog.get_logger(__name__)
 
 async def _lock_run_and_partition(conn: AsyncConnection, run_id: UUID,
                                   partition_id: str) -> tuple[RunRow, PartitionRow]:
-    # 잠금 순서 고정: load_run → load_partition (API 설계 9.5)
+    # 잠금 순서 고정: load_run → load_partition
     with metrics.RUN_LOCK_WAIT.time():
         run = await runs.lock(conn, run_id)
     if run is None:
@@ -60,7 +60,7 @@ async def claim(conn: AsyncConnection, run_id: UUID, partition_id: str,
         log.info("partition_claim_refused", reason="run_not_extracting", runStatus=run.status, **ctx)
         return response(False, part.status, part.attempt_count)
     if part.status == PartitionStatus.RUNNING and part.claim_token == req.claim_token:
-        # 응답 유실 후 같은 token 재요청: 소유권 유지(가이드 4.1 "Claim과 상태 전이")
+        # 응답 유실 후 같은 token 재요청: 소유권 유지
         await partitions.touch(conn, run_id, partition_id)
         log.debug("partition_claim_replayed", attempt=part.attempt_count, **ctx)
         return response(True, part.status, part.attempt_count)
@@ -72,7 +72,7 @@ async def claim(conn: AsyncConnection, run_id: UUID, partition_id: str,
     attempt = await partitions.claim(conn, run_id, partition_id, claim_token=req.claim_token,
                                      worker_node=req.worker_node)
     if part.status == PartitionStatus.RETRY:
-        await dispatch.ack_reissue(conn, run_id, partition_id)  # 재발행 수신 확인(가이드 13.2)
+        await dispatch.ack_reissue(conn, run_id, partition_id)  # 재발행 수신 확인
     await runs.touch(conn, run_id)
     await events.record(conn, "PARTITION_STARTED", run, partition_id=partition_id,
                         details={"workerNode": req.worker_node, "attempt": attempt})
@@ -82,7 +82,7 @@ async def claim(conn: AsyncConnection, run_id: UUID, partition_id: str,
 
 async def report_chunk(conn: AsyncConnection, run_id: UUID, partition_id: str,
                        req: ChunkReport) -> ChunkResult:
-    """chunk 보고를 기록하고 파티션·run 완료를 판정한다(API 설계 3.2).
+    """chunk 보고를 기록하고 파티션·run 완료를 판정한다.
 
     1. run·파티션 잠금, claim token과 HDFS 경로 확인
     2. load_file UPSERT(같은 chunk 재보고는 멱등), heartbeat 갱신

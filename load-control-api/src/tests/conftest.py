@@ -1,6 +1,6 @@
 """테스트 DB: LCA_TEST_DATABASE_URL이 있으면 그 DB를, 없으면 testcontainers로 PostgreSQL 16을 띄운다.
 
-동시성 규칙(run 행 잠금, CAS, partial unique index)은 실제 PostgreSQL에서만 검증할 수 있다(API 설계 11.1).
+동시성 규칙(run 행 잠금, CAS, partial unique index)은 실제 PostgreSQL에서만 검증할 수 있다.
 """
 
 import os

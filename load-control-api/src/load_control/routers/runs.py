@@ -39,7 +39,7 @@ async def register_manifest(run_id: UUID, body: ManifestRequest, request: Reques
     """
     outcome = await run_tx(request, lambda conn: manifest.register_manifest(conn, run_id, body))
     if outcome.response is None:
-        # FAILED_MANIFEST는 이미 commit됐다(API 설계 9.5).
+        # FAILED_MANIFEST는 이미 commit됐다.
         raise Unprocessable("MANIFEST_INVALID", "; ".join(outcome.violations),
                             violations=outcome.violations)
     return outcome.response

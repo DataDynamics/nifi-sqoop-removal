@@ -1,4 +1,4 @@
-"""동시성 규칙 검증(API 설계 11.1). 요청마다 다른 DB 연결을 쓰므로 실제 잠금 경합이 일어난다."""
+"""동시성 규칙 검증. 요청마다 다른 DB 연결을 쓰므로 실제 잠금 경합이 일어난다."""
 
 import asyncio
 import uuid
@@ -58,7 +58,7 @@ async def test_concurrent_failure_and_completion(client: httpx.AsyncClient, db: 
 
 
 async def test_race_between_last_two_partitions(client: httpx.AsyncClient, db: Db) -> None:
-    """API 설계 3.2: 마지막 두 파티션이 동시에 끝나도 run은 정확히 한 번 완료된다."""
+    """마지막 두 파티션이 동시에 끝나도 run은 정확히 한 번 완료된다(run 행 잠금)."""
     for _ in range(10):
         run = await start_run(client, [3, 3])
         t0 = await claim(client, run, "0000")

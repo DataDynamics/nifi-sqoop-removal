@@ -1,4 +1,4 @@
-"""outbox(load_dispatch) SQL. 상태: PENDING → SENT → ACKED, 실패 누적 시 DEAD(API 설계 4.2)."""
+"""outbox(load_dispatch) SQL. 상태: PENDING → SENT → ACKED, 실패 누적 시 DEAD."""
 
 import uuid
 from dataclasses import dataclass
@@ -44,7 +44,7 @@ async def _notify(conn: AsyncConnection, run_id: UUID) -> None:
 
 
 async def enqueue_validation(conn: AsyncConnection, run_id: UUID) -> bool:
-    """검증 호출을 outbox에 예약하고 dispatcher를 깨운다(API 설계 4장, 9.6).
+    """검증 호출을 outbox에 예약하고 dispatcher를 깨운다.
 
     uq_load_dispatch_validate가 run당 1행을 보장하는 마지막 방어선이다.
     """
@@ -88,7 +88,7 @@ async def get_for_update(conn: AsyncConnection, dispatch_id: UUID) -> tuple[UUID
 
 
 async def lease_due(conn: AsyncConnection, *, batch: int, lease: timedelta) -> list[LeasedDispatch]:
-    """전송할 행을 lease로 선점한다. 전송 동안 트랜잭션을 열어 두지 않기 위해서다(API 설계 4.3)."""
+    """전송할 행을 lease로 선점한다. 전송 동안 트랜잭션을 열어 두지 않기 위해서다."""
     rows = (await conn.execute(text("""
         UPDATE nifi_ops.load_dispatch d
            SET attempt_count   = d.attempt_count + 1,
@@ -181,7 +181,7 @@ async def resend(conn: AsyncConnection, run_id: UUID, dispatch_id: UUID) -> bool
 
 
 async def build_body(conn: AsyncConnection, d: LeasedDispatch) -> dict[str, Any]:
-    """API→NiFi 호출 본문(API 설계 5.3). 재발행은 Worker 실행에 필요한 값을 모두 담는다."""
+    """API→NiFi 호출 본문. 재발행은 Worker 실행에 필요한 값을 모두 담는다."""
     body: dict[str, Any] = {"runId": str(d.run_id), "dispatchId": str(d.dispatch_id)}
     if d.dispatch_type != "REISSUE_PARTITION":
         return body

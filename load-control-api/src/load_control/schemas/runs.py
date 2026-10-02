@@ -51,7 +51,7 @@ class ManifestPartition(ApiModel):
 
 
 class ManifestRequest(ApiModel):
-    """manifest 등록 요청(가이드 7.2의 Jolt spec 결과)."""
+    """manifest 등록 요청."""
 
     snapshot_scn: DecimalStr | None = None  # PostgreSQL 원천(불변 마감 조건)이면 null
     source_count: int = Field(ge=0)

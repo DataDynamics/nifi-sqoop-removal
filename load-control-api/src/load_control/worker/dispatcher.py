@@ -1,4 +1,4 @@
-"""outbox(load_dispatch)를 NiFi PG-05로 전달한다(API 설계 4장, 9.8)."""
+"""outbox(load_dispatch)를 NiFi PG-05로 전달한다."""
 
 import asyncio
 import contextlib

@@ -1,4 +1,4 @@
-"""설정: config.yaml(API 설계 9.4).
+"""설정: config.yaml.
 
 로드 순서(앞이 우선): 생성자 인자 > 환경변수 > config.yaml > 기본값.
 - 파일 위치: LCA_CONFIG 환경변수, 없으면 현재 디렉터리의 config/config.yaml.
@@ -48,7 +48,7 @@ class ServerSettings(Section):
     timeout_keep_alive: int = Field(default=5, ge=1)  # 초
     timeout_graceful_shutdown: int = Field(default=30, ge=1)  # SIGTERM 후 진행 중 요청을 기다리는 초
     limit_concurrency: int | None = Field(default=None, ge=1)  # 프로세스당 동시 연결 상한, 초과 시 503
-    # TLS를 앱에서 직접 종료할 때만 설정한다. 보통은 LB/ingress에서 mTLS를 종료한다(API 설계 9.7).
+    # TLS를 앱에서 직접 종료할 때만 설정한다. 보통은 LB/ingress에서 mTLS를 종료한다.
     ssl_certfile: str | None = None
     ssl_keyfile: str | None = None
     ssl_ca_certs: str | None = None  # 클라이언트 인증서 검증용 CA
@@ -94,7 +94,7 @@ class NifiSettings(Section):
 
 
 class RecoverySettings(Section):
-    """sweeper의 stale·timeout 기준(가이드 13.1, API 설계 7장)."""
+    """sweeper의 stale·timeout 기준."""
 
     run_timeout: timedelta = timedelta(hours=6)
     extract_query_timeout: timedelta = timedelta(minutes=60)  # NiFi EXTRACT.QUERY.TIMEOUT과 같은 값
@@ -107,14 +107,14 @@ class RecoverySettings(Section):
 
     @model_validator(mode="after")
     def _check_stale(self) -> "RecoverySettings":
-        # heartbeat는 쿼리 실행 중 갱신되지 않으므로 stale 기준은 query timeout보다 커야 한다(가이드 13.1).
+        # heartbeat는 쿼리 실행 중 갱신되지 않으므로 stale 기준은 query timeout보다 커야 한다.
         if self.stale <= self.extract_query_timeout:
             raise ValueError("recovery.stale must be greater than recovery.extract_query_timeout")
         return self
 
 
 class DispatchSettings(Section):
-    """outbox(load_dispatch) 전달 정책(API 설계 4장)."""
+    """outbox(load_dispatch) 전달 정책."""
 
     max_attempts: int = Field(default=20, ge=1)
     backoff_min: timedelta = timedelta(seconds=5)

@@ -19,7 +19,7 @@ class FileAggregate:
     counts: int  # 서로 다른 fragment_count(=chunkCount) 값의 수
 
     def is_complete(self, chunk_count: int) -> bool:
-        """chunk 0..n-1이 모두 있고 모든 보고의 chunkCount가 같다(API 설계 3.2의 4단계)."""
+        """chunk 0..n-1이 모두 있고 모든 보고의 chunkCount가 같다."""
         return (self.files == chunk_count and self.lo == 0 and self.hi == chunk_count - 1
                 and self.counts == 1)
 
@@ -56,7 +56,7 @@ async def upsert(conn: AsyncConnection, run_id: UUID, partition_id: str, *, chun
 
 
 async def aggregate(conn: AsyncConnection, run_id: UUID, partition_id: str) -> FileAggregate:
-    """파티션의 WRITTEN chunk를 집계한다(API 설계 3.3의 4단계)."""
+    """파티션의 WRITTEN chunk를 집계한다."""
     m = (await conn.execute(text("""
         SELECT COUNT(*)                       AS files,
                MIN(chunk_index)               AS lo,

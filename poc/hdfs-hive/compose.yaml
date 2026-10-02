@@ -1,4 +1,4 @@
-# Sqoop 대체 PoC용 HDFS + HiveServer2 (CFM NiFi 클러스터에서 192.168.122.1로 접근)
+# 시험용 HDFS + HiveServer2 (CFM NiFi 클러스터에서 192.168.122.1로 접근)
 # 실행: docker compose -f poc/hdfs-hive/compose.yaml up -d
 name: nifi-poc-hdfs-hive
 x-hadoop: &hadoop

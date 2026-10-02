@@ -1,4 +1,4 @@
-"""sweeper 규칙의 SQL(API 설계 7장, 가이드 13.1).
+"""sweeper 규칙의 SQL.
 
 대상 run은 SKIP LOCKED로 가져와 처리 중인 요청과 겹치지 않게 한다.
 """
@@ -81,7 +81,7 @@ async def runs_past_deadline(conn: AsyncConnection, run_timeout: timedelta) -> l
 
 
 async def requeue_unacked_dispatches(conn: AsyncConnection, ack_timeout: timedelta) -> list[UUID]:
-    """SENT 후 ACK가 없고 아직 기다리는 상태면 다시 보낸다(API 설계 4.2)."""
+    """SENT 후 ACK가 없고 아직 기다리는 상태면 다시 보낸다."""
     rows = (await conn.execute(text("""
         UPDATE nifi_ops.load_dispatch d
            SET status = 'PENDING', next_attempt_at = clock_timestamp(),

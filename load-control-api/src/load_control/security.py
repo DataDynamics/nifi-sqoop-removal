@@ -1,4 +1,4 @@
-"""Bearer 토큰 인증(API 설계 9.7). role: nifi(NiFi 서비스 계정), operator(운영자)."""
+"""Bearer 토큰 인증. role: nifi(NiFi 서비스 계정), operator(운영자)."""
 
 import hashlib
 import hmac
@@ -21,7 +21,7 @@ def token_digest(token: str) -> str:
 
 
 def require_role(*roles: str) -> Callable[..., Awaitable[str]]:
-    """Bearer 토큰의 SHA-256 digest가 설정의 role별 목록에 있는지 확인한다(API 설계 9.7).
+    """Bearer 토큰의 SHA-256 digest가 설정의 role별 목록에 있는지 확인한다.
 
     설정에는 토큰 원문이 아니라 digest만 둔다. 토큰 교체 기간에는 이전·신규 digest를 함께 둔다.
     """

@@ -1,4 +1,4 @@
-"""stale·timeout 정리(API 설계 7장, 가이드 13.1). worker마다 돌아도 advisory lock을 얻은 하나만 실행한다."""
+"""stale·timeout 정리. worker마다 돌아도 advisory lock을 얻은 하나만 실행한다."""
 
 import asyncio
 import contextlib

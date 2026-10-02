@@ -1,4 +1,4 @@
-"""검증 flow 연동: 시작, 지표 기록, staging 통과, 최종 성공(API 설계 4.4, 5장)."""
+"""검증 flow 연동: 시작, 지표 기록, staging 통과, 최종 성공."""
 
 from uuid import UUID
 

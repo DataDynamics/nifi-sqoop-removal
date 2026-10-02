@@ -1,4 +1,4 @@
-"""운영자 작업(API 설계 5.2): dispatch 재전송."""
+"""운영자 작업: dispatch 재전송."""
 
 from uuid import UUID
 

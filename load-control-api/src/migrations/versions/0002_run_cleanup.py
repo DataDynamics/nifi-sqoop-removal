@@ -1,7 +1,7 @@
 """load_run.cleaned_at: staging table·run 경로 정리 기록
 
 NiFi PG-70 Cleanup이 보존 기간이 지난 run의 staging external table과 HDFS run 경로를 지운 뒤
-POST /v1/runs/{id}/cleanup으로 보고하면 API가 이 컬럼을 채운다. 가이드 4.1 DDL과 함께 고친다.
+POST /v1/runs/{id}/cleanup으로 보고하면 API가 이 컬럼을 채운다.
 
 Revision ID: 0002_run_cleanup
 Revises: 0001_nifi_ops_baseline

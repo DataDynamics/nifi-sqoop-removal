@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""build_flow_v1.py, build_flow_v3.py, build_flow_v4.py가 만든 Process Group과 Parameter Context를 지운다.
+"""build_flow_v4.py가 만든 Job을 지운다.
 
-사용법: teardown_flow.py <nifi-api-url> [config.json]
-config.json을 주지 않으면 V1 기본 이름(SQOOP_REPLACEMENT_POC)을 지운다. V3·V4는 빌더에 쓴 config를 준다.
-config.json에 `names`가 있으면 그 이름의 PG와 Parameter Context를 지운다.
+사용법: teardown_flow.py <nifi-api-url> <config.json>   (빌더에 쓴 config)
 
-V4는 PG-05 Control Receiver를 root에 두고 Job끼리 공유한다. 이 Job의 route·Output Port·연결만 지우고,
-남은 Job이 없으면 PG-05와 공통 Parameter Context도 지운다. 다른 Job이 남아 있으면 공통 Context는 남긴다.
+- Job PG(`JOB_<JOB.KEY>`)와 Job Parameter Context(`PC_JOB_<JOB.KEY>`)를 지운다.
+- root PG-05 Control Receiver에서는 이 Job의 route·Output Port·연결만 지운다.
+- 남은 Job이 없으면 PG-05와 공통 Parameter Context도 지운다.
 """
 import json
 import sys
@@ -15,14 +14,15 @@ import urllib.error
 import urllib.request
 
 API = sys.argv[1].rstrip("/")
-CFG = json.load(open(sys.argv[2])) if len(sys.argv) > 2 else {}
+if len(sys.argv) != 3:
+    raise SystemExit(__doc__)
+CFG = json.load(open(sys.argv[2]))
 NAMES = CFG.get("names", {})
 RECEIVER_NAME = NAMES.get("control_receiver", "PG-05 Control Receiver")
-JOB_KEY = CFG.get("job_params", {}).get("JOB.KEY")
-# V4는 이름을 JOB.KEY로 정한다(JOB_<JOB.KEY>, PC_JOB_<JOB.KEY>). config가 없으면 V1 기본 이름이다.
-PG_NAME = NAMES.get("process_group", f"JOB_{JOB_KEY}" if JOB_KEY else "SQOOP_REPLACEMENT_POC")
+JOB_KEY = CFG["job_params"]["JOB.KEY"]
+PG_NAME = NAMES.get("process_group", f"JOB_{JOB_KEY}")
 PC_COMMON = NAMES.get("common_context", "PC_SQOOP_REPLACEMENT_COMMON")
-PC_JOB = NAMES.get("job_context", f"PC_JOB_{JOB_KEY}" if JOB_KEY else "PC_JOB_PG_INSP_DTL_DAILY")
+PC_JOB = NAMES.get("job_context", f"PC_JOB_{JOB_KEY}")
 CID = "poc-builder"
 
 
@@ -126,7 +126,7 @@ root = call("GET", "/flow/process-groups/root")["processGroupFlow"]["id"]
 children = {pg["component"]["name"]: pg["id"]
             for pg in call("GET", f"/flow/process-groups/{root}")["processGroupFlow"]["flow"]["processGroups"]}
 receiver_left = False
-if PG_NAME in children and RECEIVER_NAME in children and JOB_KEY:
+if PG_NAME in children and RECEIVER_NAME in children:
     if unregister_job(children[RECEIVER_NAME], children[PG_NAME]):
         receiver_left = True
     else:

@@ -1,4 +1,4 @@
-"""DB 엔진, 트랜잭션 헬퍼, SQLSTATE 헬퍼(API 설계 9.5)."""
+"""DB 엔진, 트랜잭션 헬퍼, SQLSTATE 헬퍼."""
 
 import asyncio
 from collections.abc import Awaitable, Callable
@@ -55,7 +55,7 @@ async def in_tx[T](
 ) -> T:
     """fn을 한 트랜잭션으로 실행한다. deadlock·serialization 실패는 트랜잭션 전체를 재실행한다.
 
-    모든 상태 변경 엔드포인트는 멱등이므로 재실행해도 결과가 같다(API 설계 9.5).
+    모든 상태 변경 엔드포인트는 멱등이므로 재실행해도 결과가 같다.
     잠금 순서: load_run → load_partition → load_file → load_dispatch.
     """
     for i in range(attempts):

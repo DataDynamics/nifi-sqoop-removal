@@ -1,4 +1,4 @@
-"""로그 설정과 요청 컨텍스트(API 설계 9.11).
+"""로그 설정과 요청 컨텍스트.
 
 - structlog 이벤트와 stdlib 로그(uvicorn, SQLAlchemy, alembic, asyncpg)를 같은 handler와 형식으로 낸다.
 - 시각은 서버 현지 시각 `YYYY-MM-DD HH:MM:SS.SSS`.

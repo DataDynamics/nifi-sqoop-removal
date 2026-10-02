@@ -1,10 +1,10 @@
 # Load Control API
 
-Sqoop 대체 적재(NiFi)의 상태 원장 기록과 완료 판정을 담당하는 FastAPI 서비스다. 설계는 [Load Control API 설계](../load-control-api-design.md), NiFi 연동은 [가이드](../nifi-sqoop-removal-guide.md) 9장을 따른다.
+Sqoop 대체 적재(NiFi)의 상태 원장 기록과 완료 판정을 담당하는 FastAPI 서비스다. 설계는 [Load Control API 설계](../load-control-api-design.md), NiFi 쪽은 [NiFi Flow 설계](../nifi-sqoop-removal-guide.md)에 있다.
 
-## 구현 범위
+처음 설치한다면 "설치" → "설정" → "운영 스크립트" 순서로 보면 된다.
 
-API 설계 12장 전환 순서 중 API 쪽 작업을 모두 구현했다. NiFi Flow 전환(3단계)과 권한 회수(7단계)는 NiFi·DBA 작업이다.
+## 기능
 
 | 구분 | 엔드포인트·기능 |
 |---|---|
@@ -25,7 +25,7 @@ load-control-api/
 ├── packages/     airgap 설치용 wheel(git 제외)과 requirements.txt(고정 버전 목록)
 ├── src/
 │   ├── load_control/   소스 코드
-│   ├── migrations/     Alembic migration(가이드 4.1 DDL)
+│   ├── migrations/     Alembic migration(nifi_ops 테이블 정의의 원본)
 │   └── tests/          실제 PostgreSQL 대상 통합·동시성 테스트
 ├── pyproject.toml, Dockerfile, README.md
 └── .venv/        실행 환경(bin/install.sh가 만든다, git 제외)
@@ -47,7 +47,7 @@ src/load_control/
 ├── services/         # 트랜잭션 단위 업무 규칙 (manifest 불변식, claim, chunk 판정, 검증, 게시, 정리)
 ├── routers/          # 인증, 입력 검증, 트랜잭션 시작
 └── worker/           # python -m load_control.worker: dispatcher + sweeper
-src/migrations/versions/0001_nifi_ops_baseline.py   # 가이드 4.1 DDL
+src/migrations/versions/0001_nifi_ops_baseline.py   # nifi_ops 테이블·인덱스·권한
 src/migrations/versions/0002_run_cleanup.py         # load_run.cleaned_at(정리 기록)
 ```
 
@@ -165,7 +165,7 @@ bin/migrate.sh            # config의 database.migration_url(없으면 database.
 
 - 설정 파일은 `config/alembic.ini`, migration 스크립트는 `src/migrations/`다.
 - 버전 테이블은 `nifi_ops.alembic_version`이다.
-- 가이드 4.1 DDL로 이미 수동 생성한 DB는 `bin/migrate.sh stamp 0001_nifi_ops_baseline`으로 기준점만 맞춘다.
+- 테이블을 이미 수동으로 만든 DB는 `bin/migrate.sh stamp 0001_nifi_ops_baseline`으로 기준점만 맞춘다.
 - `load_control_api`, `nifi_runtime` 역할이 있으면 권한도 함께 부여한다. 역할 생성은 DBA가 한다.
 
 ## 실행 상세

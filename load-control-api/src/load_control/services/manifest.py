@@ -1,4 +1,4 @@
-"""manifest 등록과 불변식 검증(가이드 7.4, API 설계 3.4)."""
+"""manifest 등록과 불변식 검증."""
 
 from dataclasses import dataclass, field
 from decimal import Decimal
@@ -28,7 +28,7 @@ def _dec(v: str | None) -> Decimal | None:
 
 
 def check_invariants(req: ManifestRequest, allow_empty_source: bool) -> list[str]:
-    """manifest 불변식(가이드 7.4, API 설계 3.4). 위반 사유 목록을 돌려준다."""
+    """manifest 불변식. 위반 사유 목록을 돌려준다."""
     v: list[str] = []
     parts = req.partitions
     ids = [p.partition_id for p in parts]

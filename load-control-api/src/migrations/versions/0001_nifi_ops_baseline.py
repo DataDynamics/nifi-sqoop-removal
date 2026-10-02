@@ -1,6 +1,6 @@
-"""nifi_ops baseline: 가이드 4.1 DDL
+"""nifi_ops baseline: 상태 원장 테이블, 인덱스, 권한
 
-가이드(nifi-sqoop-removal-guide.md) 4.1의 DDL이 원본이다. DDL을 바꿀 때는 가이드와 새 revision을 함께 고친다.
+테이블 정의의 원본은 migration이다. 바꿀 때는 새 revision을 추가한다.
 asyncpg는 prepared statement 하나에 여러 문장을 허용하지 않으므로 문장을 하나씩 실행한다.
 
 Revision ID: 0001_nifi_ops_baseline
@@ -286,7 +286,7 @@ CREATE INDEX ix_load_event_time_brin
 """,
 ]
 
-# 역할은 DBA가 사전에 만든다(가이드 4.1 "권한 예시"). 역할이 없는 환경(테스트 등)에서는 건너뛴다.
+# 역할은 DBA가 사전에 만든다. 역할이 없는 환경(테스트 등)에서는 건너뛴다.
 GRANTS = """
 DO $$
 BEGIN

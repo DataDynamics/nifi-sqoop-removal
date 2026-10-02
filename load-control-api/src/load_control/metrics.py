@@ -1,4 +1,4 @@
-"""Prometheus 메트릭(API 설계 9.11).
+"""Prometheus 메트릭.
 
 server.workers가 1보다 크면 PROMETHEUS_MULTIPROC_DIR를 설정해야 프로세스 합계가 맞는다.
 """

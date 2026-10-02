@@ -35,7 +35,7 @@ _COLUMNS = """run_id, partition_id, lower_bound, upper_bound, upper_inclusive, i
 
 
 async def insert_many(conn: AsyncConnection, rows: list[dict[str, Any]]) -> None:
-    """manifest 일괄 등록. 0건 파티션은 바로 SUCCESS(actual=0)로 넣는다(API 설계 3.4)."""
+    """manifest 일괄 등록. 0건 파티션은 바로 SUCCESS(actual=0)로 넣는다."""
     await conn.execute(text("""
         INSERT INTO nifi_ops.load_partition (
             run_id, partition_id, lower_bound, upper_bound, upper_inclusive, is_null_partition,

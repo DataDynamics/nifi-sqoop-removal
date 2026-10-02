@@ -1,103 +1,63 @@
 # 운영 적용 TODO
 
-PoC(V3 PostgreSQL 원천, V4 Oracle 원천)에서 검증한 구조를 CFM 4.12.0 운영 환경에 적용하기 위해 남은 일이다. 근거는 `nifi-sqoop-removal-guide.md`(가이드), `load-control-api-design.md`(API 설계), `poc/REVIEW.md`(PoC 결과)의 해당 절이다.
+시험 환경에서 확인한 구성([검증 결과](./poc/VERIFICATION.md))을 운영에 적용하기 전에 남은 일이다.
 
-## 0. 현재 상태
+## 1. 플랫폼
 
-| 영역 | 상태 |
-|---|---|
-| PG-00 Trigger, PG-10 Coordinator, PG-20 Worker, PG-05 Receiver, PG-90 Error | NiFi 2.4.0 단일 노드(V3, V4)와 CFM 4.12 2노드 클러스터(V4)에서 검증 |
-| PG-40 Staging Validation, PG-50 Publish, PG-60 Target Validation, PG-70 Cleanup | V4에 구현. CFM 4.12 + Apache Hive 4.0.1(시험용 컨테이너)에서 검증(REVIEW 7.9, 7.10) |
-| Load Control API | 구현·단위 테스트 완료. 단일 인스턴스, HTTP로 연동 시험 |
-| 시나리오 | 정상, 0건 파티션, 중복 실행, HDFS 실패, API 중단, 재발행, `NUMBER` 정밀도, `ORA-01555`(REVIEW 6.2, 7.4~7.7), staging DQ 실패, 게시 실패(`PUBLISH_UNKNOWN`과 운영자 확정), target 검증 실패, HiveServer2 중단(REVIEW 7.9) 통과 |
+- [ ] CDP HiveServer2(Hive 3)로 다시 시험한다. 시험은 Apache Hive 4.0.1이었다. target이 ACID managed table이면 external staging에서 `INSERT OVERWRITE`가 되는지 확인한다
+- [ ] 운영 Oracle 버전에 맞는 ojdbc와 관리 DB용 PostgreSQL JDBC를 모든 NiFi 노드의 같은 경로에 둔다
+- [ ] `HADOOP.CONF.FILES`(core-site, hdfs-site)를 모든 노드의 같은 경로에 두고 `HDFS.STAGE.ROOT`를 정한다
+- [ ] NiFi JVM 시간대와 Hive `hive.local.time.zone`을 같은 값으로 정한다
 
-PoC와 운영 환경의 차이:
+## 2. 운영 Oracle
 
-| 항목 | PoC | 운영 |
-|---|---|---|
-| NiFi | Apache NiFi 2.4.0 단일 노드, CFM 4.12.0 2노드(비보안) | CFM 4.12.0(NiFi 2.6.0) cluster |
-| Oracle | 23ai Free 컨테이너 | 운영 Oracle(버전 확인 필요) |
-| HDFS | `file:///`, 이후 단일 노드 Apache Hadoop 3.4.1 컨테이너(권한 검사 끔) | 실제 HDFS(권한 검사 하지 않음) |
-| Hive | Apache Hive 4.0.1 HiveServer2 컨테이너(인증 없음, Derby metastore) | CDP HiveServer2(인증 없음, ACID 정책 확인 필요) |
-| NiFi ↔ API | HTTP, Bearer 토큰 | 같음(HTTP만 사용) |
-| 배포 | `poc/build_flow_v4.py`가 REST API로 생성 | 같음(환경별 config 파일) |
+- [ ] 조회 계정 권한: 대상 테이블 `SELECT`·`FLASHBACK`, `SYS.V_$DATABASE` `SELECT`
+- [ ] `UNDO_RETENTION`과 undo 크기가 run 최대 소요시간보다 넉넉한지 DBA와 확인
+- [ ] 대상 테이블마다 `(업무 조건 컬럼, split 컬럼)` 인덱스와 16 SQL 실행 계획 확인
+- [ ] 승인된 동시 세션 수에 맞춰 `ORACLE.POOL.MAX`와 34 Concurrent Tasks를 정한다
+- [ ] split 컬럼에 NULL이 있는 테이블을 찾는다(NULL이 있으면 manifest가 거부된다)
 
-## 1. 플랫폼과 버전 확정
+## 3. Job 정의
 
-- [x] CFM 4.12.0(NiFi 2.6.0)에서 V4 빌더로 Flow를 생성하고 Processor가 모두 VALID인지 확인한다(REVIEW 7.8, 7.9). 2.4.0과 다른 속성 이름은 없었다
-- [x] CFM 4.12.0 배포본에 `nifi-parquet-nar`, `nifi-hadoop-nar`, `nifi-hadoop-libraries-nar`가 포함돼 있는지 확인한다(포함, REVIEW 7.8)
-- [x] CFM 4.12.0 Hive Processor·Connection Pool의 실제 이름을 확정하고 `CS_HIVE3_DBCP`에 반영한다: `ClouderaHiveConnectionPool`, `PutClouderaHiveQL`(가이드 4장·10장)
-- [ ] CDP HiveServer2(Hive 3, 인증 없음)로 V4를 다시 시험한다. PoC는 Apache Hive 4.0.1이었다. 특히 target 테이블이 ACID managed table이면 `INSERT OVERWRITE`와 external staging 조합을 확인한다
-- [ ] 운영 Oracle 버전에 맞는 ojdbc 버전을 정하고 모든 노드의 같은 경로에 배포한다(`ORACLE.JDBC.DRIVER.PATH`)
-- [ ] 관리 DB PostgreSQL 버전과 JDBC 드라이버 경로를 정한다(`META.JDBC.DRIVER.PATH`)
+- [ ] Job마다 `job_params`를 확정한다: 원천 테이블·컬럼(정밀도 없는 `NUMBER`는 CAST), split 컬럼, 업무 조건, DQ 컬럼, 파티션 수, staging·target 정의
+- [ ] Hive staging·target DDL 타입을 Parquet 결과와 맞춘다
+- [ ] CLOB·BLOB·`RAW`·`INTERVAL` 등 시험하지 않은 타입이 있는 테이블은 따로 시험한다
+- [ ] 마이크로초 이하 정밀도가 필요한 컬럼은 문자열로 추출한다(Parquet은 밀리초)
 
-## 2. 미구현 Flow
+## 4. Load Control API 배포
 
-- [x] PG-40 Staging Validation 나머지: Hive external staging 테이블 DDL(run root 경로), staging count·`AMOUNT_SUM`·`MIN_TS`/`MAX_TS` DQ, API 보고(가이드 10장)
-- [x] PG-50 Publish: publish claim CAS, `INSERT OVERWRITE`, `PUBLISH_UNKNOWN` 처리. 55는 재시도하지 않는다(가이드 11장)
-- [x] PG-60 Target Validation: target 지표를 source·staging과 비교하고 최종 상태를 보고한다(가이드 12장)
-- [x] 비운영 target에서 `INSERT OVERWRITE`와 `PUBLISH_UNKNOWN` 경로를 시험한다(가이드 19장 7, REVIEW 7.9)
-- [x] staging external table과 run 경로 정리: PG-70 Cleanup과 API `cleanup` 설정(가이드 13.3, REVIEW 7.10). 운영 보존 기간(기본 SUCCESS 3일, 실패 14일)은 확정 필요
-- [x] PG-05 Control Receiver를 root로 옮기고 Job별 Output Port로 나눈다(가이드 2장, 9.5). V4 빌더가 Job 등록·해제를 자동으로 한다(REVIEW 7.11)
-- [ ] 선택: PG-20 `ValidateRecord` + `CS_SCHEMA_REGISTRY`(승인된 target schema), PG-90 DLQ·알림(가이드 8장, 14장)
-- [ ] 선택: PutHDFS 실패가 PG-90에서 `NON_RETRYABLE`로 분류된다. 운영 분류가 필요하면 PG-20의 `load.stage`를 세분한다(REVIEW 6.3 #14)
+- [ ] 관리 DB(`nifi_ops`)를 만들고 migration 계정으로 `bin/migrate.sh` 실행
+- [ ] 런타임 계정 분리: API는 원장 쓰기, NiFi는 `load_event` INSERT만(둘 다 DELETE·DDL 없음)
+- [ ] API 2개 이상(LB 뒤)과 worker 2개를 systemd로 띄운다(`bin/systemd/install.sh`)
+- [ ] 토큰(nifi, operator)을 발급해 digest를 `config.yaml`에 넣는다
+- [ ] 운영값 확정: `recovery`(`mode`, `run_timeout`, `stale`), `cleanup` 보존 기간, `dispatch`. 재발행(`REISSUE`) 사용 여부
+- [ ] 메트릭 수집과 알림: `DEAD` dispatch, `PUBLISH_UNKNOWN`, `TIMED_OUT`, `FAILED_*`, 5xx 증가
+- [ ] `load_event` 보존 삭제 Job, `logs/*.out` logrotate
+- [ ] 방화벽: API 포트는 NiFi 노드·운영자 대역, NiFi PG-05 포트는 API worker 호스트만
 
-## 3. 운영 Oracle
+## 5. NiFi 설정
 
-- [ ] 조회 계정: 대상 테이블 `SELECT`·`FLASHBACK`, `SYS.V_$DATABASE` `SELECT`만 부여한다. `V$DATABASE` 권한을 받을 수 없으면 14를 `DBMS_FLASHBACK.GET_SYSTEM_CHANGE_NUMBER`로 바꾼다(REVIEW 7.4)
-- [ ] `UNDO_RETENTION`과 undo tablespace 크기가 run 최대 소요시간보다 넉넉한지 DBA와 확인한다. 부족하면 run이 `FAILED_SNAPSHOT_EXPIRED`로 끝난다(REVIEW 7.7)
-- [ ] 대상 테이블마다 `(업무 조건 컬럼, split 컬럼)` 인덱스를 확인하고 16 manifest SQL의 실행 계획을 본다. 인덱스가 없으면 `GROUP BY`/`WIDTH_BUCKET` 방식으로 바꾼다(가이드 7.3)
-- [ ] 동시 세션 수: `노드 수 × Worker Concurrent Tasks + 여유`가 승인된 세션 수 이하가 되게 `ORACLE.POOL.MAX`를 정한다(가이드 18장)
-- [ ] split 컬럼에 NULL이 있는 테이블을 찾는다. V4는 NULL 파티션(`SPLIT.NULL.POLICY=SEPARATE`)을 만들지 않아 API가 manifest를 거부한다
-- [ ] 운영 시간대의 원천 변경량을 확인한다. 변경이 많으면 `AS OF SCN` 조회가 느려지고 undo 사용량이 커진다
+- [ ] 환경별 Concurrent Tasks·재시도 횟수를 정해 빌더 값에 반영한다(이 값들은 Parameter로 바꿀 수 없다)
+- [ ] Back Pressure, Provenance 보존 기간, Bulletin 수집 연계
+- [ ] NiFi Policy: 운영자와 개발자 분리, Parameter Context 변경 권한 제한
+- [ ] Trigger 스케줄과 업무일자 계산식을 운영 일정에 맞춘다
 
-## 4. Job별 정의와 타입
+## 6. 운영 환경 재시험
 
-- [ ] Job마다 `PC_JOB_<JOB_NAME>`을 확정한다: `SRC.OWNER`, `SRC.TABLE`, `SRC.COLUMNS`(순서 고정), `SRC.SPLIT.COLUMN`, `SRC.BASE.WHERE`, `DQ.AMOUNT.COLUMN`, `DQ.TIMESTAMP.COLUMN`, `PARTITION.COUNT`(가이드 3.2)
-- [ ] 정밀도 없는 `NUMBER` 컬럼은 모두 `SRC.COLUMNS`에서 `CAST(... AS NUMBER(p,s))`로 정밀도를 명시한다. scale이 작으면 오류 없이 반올림된다(가이드 4장, REVIEW 7.6)
-- [ ] Hive DDL 타입을 Parquet 결과와 맞춘다: `NUMBER(19)` → `DECIMAL(19,0)` 또는 `CAST`로 `BIGINT`, Oracle `DATE` → timestamp(REVIEW 7.4)
-- [ ] CLOB·BLOB·`RAW`·`INTERVAL` 등 PoC에서 시험하지 않은 타입이 있는 테이블은 별도로 시험한다
-- [ ] 시간대 표준: NiFi JVM `-Duser.timezone`과 Hive parquet timestamp 해석 설정을 정하고, 원천과 Hive에서 읽은 `MIN_TS`/`MAX_TS`가 같은지 확인한다(가이드 4장, REVIEW 2장 #6)
-- [ ] 마이크로초 이하 정밀도가 필요한 컬럼은 문자열로 추출하거나 명시적 schema를 둔다(Parquet은 millis로 기록됨)
+- [ ] 운영과 같은 구성(실제 HDFS·Hive, 운영 Oracle)에서 [검증 결과](./poc/VERIFICATION.md) 2장 시나리오를 다시 수행
+- [ ] 시험하지 못한 장애: 파티션 처리 중 NiFi 노드 종료·재기동, API 인스턴스 1개 종료, worker 종료, 관리 DB 연결 차단
+- [ ] 운영 규모 데이터로 2/4/8 파티션 처리 시간과 Oracle·API·관리 DB 부하를 재고 `PARTITION.COUNT`, `EXTRACT.ROWS.PER.FILE`, Concurrent Tasks를 정한다
 
-## 5. HDFS와 Hive
+## 7. 전환
 
-- [ ] `HADOOP.CONF.FILES`(core-site, hdfs-site)를 모든 노드의 같은 경로에 배포한다
-- [ ] `HDFS.STAGE.ROOT` 경로를 정한다. HDFS 권한 검사는 하지 않는다(`dfs.permissions.enabled=false`)
-- [ ] 운영 보존 기간을 정해 API `cleanup.success_retention`·`failed_retention`에 넣는다(정리 자체는 PG-70이 한다)
+- [ ] 대상 Job 목록과 전환 순서(작은 테이블부터)
+- [ ] AS-IS Sqoop과 병행 실행해 건수·합계·최소·최대·샘플 행 비교. 병행 중에는 별도 target에 게시
+- [ ] 되돌림 절차: Kylo `ImportSqoop` Flow 재활성화 기준
+- [ ] 운영 Runbook 확정([매뉴얼](./poc/V4-MANUAL.md) 6~7장 기반)
+- [ ] 전환 후 Kylo Sqoop Flow 제거
 
-## 6. Load Control API 운영 배포
+## 선택 기능
 
-- [ ] API 2개 이상을 LB 뒤에 두고, worker(dispatcher + sweeper) 2개를 띄운다(API 설계 10.1)
-- [ ] 관리 DB(`nifi_ops`)를 운영 PostgreSQL에 만들고 migration 전용 계정으로 `bin/migrate.sh`(alembic upgrade head)를 실행한다
-- [ ] 런타임 계정을 나눈다: API는 원장 쓰기, NiFi는 `load_event` INSERT만. 두 계정 모두 `DELETE`·`TRUNCATE`·`DROP` 없음(가이드 4.1 권한 예시)
-- [ ] 토큰을 발급하고 digest를 API 설정에 넣는다. NiFi에는 Sensitive Parameter `CONTROL.API.AUTHORIZATION`으로만 둔다
-- [ ] `recovery` 설정을 운영값으로 정한다: `mode=FAIL`, `run_timeout`, `extract_query_timeout`, `stale`. 재발행(`REISSUE`)을 쓸지 결정한다(가이드 13장)
-- [ ] `CONTROL.API.RETRY.MAX`와 backoff 합계가 API 재기동 시간보다 길게 정한다(API 설계 10.1)
-- [ ] 메트릭 수집과 알림: `DEAD` dispatch, `PUBLISH_UNKNOWN`, `TIMED_OUT`, `FAILED_*`, 5xx 증가, `PENDING` backlog 증가(API 설계 10.3)
-- [ ] `load_event` 등 로그 보존 Job을 PostgreSQL scheduler나 외부 Job으로 등록한다(가이드 4.1)
-- [ ] 운영자 엔드포인트(`/dispatches/{id}/resend`, `/publish-unknown/resolve`)에 operator 권한과 감사 로그를 둔다
-
-## 7. NiFi cluster 설정과 배포
-
-- [ ] 실행 정책: PG-00·10은 Primary Node, PG-20·05·40·50·60은 All Nodes, `partitions`·`reissue` 연결은 Round Robin(가이드 2.3, 18장)
-- [ ] Concurrent Tasks와 Retry Count는 Parameter를 참조할 수 없으므로 배포 스크립트가 환경별 정수로 넣는다(가이드 2.3)
-- [ ] Yield Duration, Back Pressure, Provenance 보존 기간, Bulletin 수집 연계를 정한다(가이드 15장, 18장)
-- [ ] NiFi Policy를 운영자와 개발자로 나누고, Parameter Context 변경 권한을 제한한다
-- [ ] 배포는 빌더(`poc/build_flow_v4.py`)를 환경별 config 파일로 실행한다. 비밀번호·토큰이 든 config 파일은 권한 `600`으로 두고 저장소에 넣지 않는다
-- [ ] Trigger는 DISABLED로 배포하고 운영 전환 시점에 enable한다. 스케줄(PoC는 1일 Timer)을 운영 일정에 맞춘다
-
-## 8. cluster 환경 재시험
-
-- [ ] 운영과 같은 구성(cluster, 실제 HDFS·Hive)의 검증 환경에서 V3·V4 시나리오를 다시 수행한다(REVIEW 6.2, 7.4)
-- [ ] PoC에서 못 한 장애를 주입한다: NiFi 노드 종료·재기동(파티션 처리 중), API 인스턴스 1개 종료, worker 종료, 관리 DB 연결 차단, 검증 호출 수신 실패(가이드 19장 9)
-- [ ] 2/4/8 파티션과 운영 규모 데이터로 처리 시간, API 응답 시간, run 잠금 대기, Oracle·관리 DB 부하를 측정하고 `PARTITION.COUNT`, `EXTRACT.ROWS.PER.FILE`, Concurrent Tasks를 정한다(가이드 19장 4)
-- [ ] 운영 승인 조건(가이드 19장)을 항목별로 확인한다. 특히 NiFi 계정으로 원장 테이블을 변경할 수 없는지, `source = partition sum = staging = target`일 때만 SUCCESS인지
-
-## 9. 운영 전환
-
-- [ ] 대상 Job 목록과 전환 순서를 정한다(작은 테이블부터)
-- [ ] AS-IS Sqoop과 일정 기간 병행 실행해 건수·합계·min/max·샘플 행을 비교한다. 병행 중에는 TO-BE가 운영 target을 덮어쓰지 않게 별도 target에 게시한다
-- [ ] 되돌림 절차: Kylo `ImportSqoop` Flow 재활성화 방법과 판단 기준을 정한다
-- [ ] 운영 Runbook 작성: 실패 run 재실행(새 `run_id`), `FAILED_SNAPSHOT_EXPIRED` 대응, `PUBLISH_UNKNOWN` 확인·확정, `DEAD` dispatch 재전송, 중복 실행 경고 확인
-- [ ] 전환 후 Kylo Sqoop Flow와 관련 설정을 제거한다
+- [ ] PG-20 `ValidateRecord`(승인된 schema로 Parquet 검증)
+- [ ] PG-90 이벤트 DB 장애 대비 DLQ, ERROR 알림
+- [ ] `PutHDFS` 실패 원인 세분화(지금은 `CHUNK_WRITE_FAILED` 하나)

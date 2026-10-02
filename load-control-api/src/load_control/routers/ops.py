@@ -13,7 +13,7 @@ from load_control.schemas.publish import (
 from load_control.security import require_role
 from load_control.services import ops, publish
 
-# 운영자 전용. NiFi 서비스 계정 토큰으로는 호출할 수 없다(API 설계 5.2).
+# 운영자 전용. NiFi 서비스 계정 토큰으로는 호출할 수 없다.
 router = APIRouter(prefix="/v1/runs/{run_id}", tags=["operator"],
                    dependencies=[Depends(require_role("operator"))])
 

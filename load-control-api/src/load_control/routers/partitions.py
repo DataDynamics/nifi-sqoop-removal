@@ -1,4 +1,4 @@
-"""파티션 엔드포인트(NiFi PG-20 Worker가 호출, 가이드 8장)."""
+"""파티션 엔드포인트(NiFi PG-20 Worker가 호출)."""
 
 from uuid import UUID
 

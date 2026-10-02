@@ -16,7 +16,7 @@ async def record(conn: AsyncConnection, name: str, run: RunRow | None = None, *,
                  chunk_index: int | None = None, row_count: int | None = None,
                  error_class: str | None = None, error_code: str | None = None,
                  message: str | None = None, details: dict[str, Any] | None = None) -> None:
-    """상태 전이 이벤트를 같은 트랜잭션에서 load_event에 기록한다(가이드 14.4)."""
+    """상태 전이 이벤트를 같은 트랜잭션에서 load_event에 기록한다."""
     await conn.execute(text("""
         INSERT INTO nifi_ops.load_event (
             event_id, event_level, event_name, run_id, job_key, business_key, partition_id,

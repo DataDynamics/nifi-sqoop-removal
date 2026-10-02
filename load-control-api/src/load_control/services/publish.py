@@ -1,4 +1,4 @@
-"""게시 소유권과 결과(가이드 11장, API 설계 5.2). INSERT OVERWRITE는 token 소유자 1명만 실행한다."""
+"""게시 소유권과 결과. INSERT OVERWRITE는 token 소유자 1명만 실행한다."""
 
 import logging
 from uuid import UUID
@@ -91,7 +91,7 @@ async def result(conn: AsyncConnection, run_id: UUID, req: PublishResultRequest)
 
 async def resolve_unknown(conn: AsyncConnection, run_id: UUID, req: PublishUnknownResolveRequest,
                           operator: str) -> PublishResultResponse:
-    """운영자가 Hive 이력과 target 지표를 확인한 뒤 PUBLISH_UNKNOWN을 확정한다(가이드 11장)."""
+    """운영자가 Hive 이력과 target 지표를 확인한 뒤 PUBLISH_UNKNOWN을 확정한다."""
     run = await _lock(conn, run_id)
     to = RunStatus(req.resolution)
     if run.status == to:

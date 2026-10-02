@@ -1,4 +1,4 @@
-"""load_run SQL. 모든 상태 전이는 WHERE status = 기대 상태 조건(CAS)으로 실행한다(가이드 17장)."""
+"""load_run SQL. 모든 상태 전이는 WHERE status = 기대 상태 조건(CAS)으로 실행한다."""
 
 import json
 from dataclasses import dataclass
@@ -71,7 +71,7 @@ async def get(conn: AsyncConnection, run_id: UUID) -> RunRow | None:
 
 
 async def lock(conn: AsyncConnection, run_id: UUID) -> RunRow | None:
-    """run 행을 잠근다. 같은 run의 판정을 직렬화하는 핵심 잠금(API 설계 3.2)."""
+    """run 행을 잠근다. 같은 run의 판정을 직렬화하는 핵심 잠금."""
     m = (await conn.execute(
         text(f"SELECT {_COLUMNS} FROM nifi_ops.load_run WHERE run_id = :run_id FOR UPDATE"),
         {"run_id": run_id})).mappings().first()
@@ -113,7 +113,7 @@ async def start_extracting(conn: AsyncConnection, run_id: UUID, *, snapshot_scn:
 
 
 async def try_complete_extract(conn: AsyncConnection, run_id: UUID) -> bool:
-    """모든 파티션 SUCCESS이고 합계가 source count와 같으면 EXTRACTED_VALIDATED로 CAS(API 설계 3.3)."""
+    """모든 파티션 SUCCESS이고 합계가 source count와 같으면 EXTRACTED_VALIDATED로 CAS."""
     result = await conn.execute(text("""
         UPDATE nifi_ops.load_run r
            SET status = 'EXTRACTED_VALIDATED',
@@ -183,7 +183,7 @@ NOW = object()
 
 async def cas_status(conn: AsyncConnection, run_id: UUID, *, expected: str, to: str,
                      **sets: Any) -> bool:
-    """WHERE status = expected 조건의 상태 전이(가이드 17장). 갱신됐으면 True."""
+    """WHERE status = expected 조건의 상태 전이. 갱신됐으면 True."""
     unknown = set(sets) - _CAS_COLUMNS
     if unknown:
         raise ValueError(f"cas_status: unsupported columns {unknown}")

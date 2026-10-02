@@ -209,10 +209,22 @@ NULL split 파티션(`SPLIT.NULL.POLICY=SEPARATE`)은 만들지 않는다. split
 |---|---|
 | 1 | 위 권한으로 14(`V$DATABASE`)와 `AS OF SCN` 조회 모두 동작. `DBMS_FLASHBACK` 대체는 필요 없었다 |
 | 2 | 16 SQL 실행 계획: 지표 CTE와 파티션별 상관 서브쿼리가 모두 `(BASE_DT, INSP_DTL_SEQ)` 인덱스 범위 스캔. 105,000건에서 0.06초. 이 인덱스가 없는 운영 테이블은 다시 확인한다 |
-| 3 | Parquet 타입: `NUMBER(19)` → `decimal(19,0)`(Hive DDL도 `DECIMAL(19,0)` 또는 `CAST`로 `BIGINT`), `CAST(AMOUNT AS NUMBER(18,2))` → `decimal(18,2)`, `DATE`·`TIMESTAMP` → `timestamp[ms, UTC]`. V3와 같이 JVM 시간대(KST) 기준으로 UTC로 바뀐다(`2026-09-28 00:00:01` → `2026-09-27T15:00:01Z`, 2장 #6). Oracle `DATE`는 날짜 컬럼이어도 timestamp가 된다. **정밀도 없는 `NUMBER`를 CAST 없이 읽는 경우(Default Decimal Precision/Scale)는 시험하지 않았다** |
+| 3 | Parquet 타입: `NUMBER(19)` → `decimal(19,0)`(Hive DDL도 `DECIMAL(19,0)` 또는 `CAST`로 `BIGINT`), `CAST(AMOUNT AS NUMBER(18,2))` → `decimal(18,2)`, `DATE`·`TIMESTAMP` → `timestamp[ms, UTC]`. V3와 같이 JVM 시간대(KST) 기준으로 UTC로 바뀐다(`2026-09-28 00:00:01` → `2026-09-27T15:00:01Z`, 2장 #6). Oracle `DATE`는 날짜 컬럼이어도 timestamp가 된다. 정밀도 없는 `NUMBER`를 CAST 없이 읽는 경우는 7.6 |
 | 4 | JSON writer가 대문자 컬럼명과 `TO_CHAR` 문자열을 그대로 내보냈고, 17 Jolt와 API manifest 등록이 통과 |
 | 5 | **시험하지 않음.** 컨테이너 `UNDO_RETENTION`은 900초. `ORA-01555` → `FAILED_SNAPSHOT_EXPIRED` 경로는 운영 Oracle에서 확인한다 |
 | 6 | 위 표와 같이 V3 시나리오 모두 V3와 같은 결과 |
+
+### 7.6 정밀도 없는 `NUMBER` (2026-10-02)
+
+원천에 정밀도 없는 `NUMBER` 컬럼 `RATE`(= seq / 3, 소수 무한)와 `BIG_NUM`(= seq × 10^17 + 7, 최대 23자리)을 추가하고 `SRC.COLUMNS`를 `..., AMOUNT, ..., RATE, BIG_NUM`(CAST 없음)으로 바꿔 34의 Default Decimal Precision/Scale 동작을 확인했다.
+
+| 설정·데이터 | 결과 |
+|---|---|
+| 기본값(`ORACLE.NUMBER.DEFAULT.PRECISION=38`, `SCALE=10`) | run 성공. `AMOUNT`·`RATE`·`BIG_NUM` 모두 `decimal(38,10)`. `RATE`는 소수 10자리로 HALF_UP 반올림(`0.6666666667`)되어 합계가 Oracle `SUM(ROUND(RATE,10))`과 같고, `AMOUNT` 합계·`BIG_NUM` 값은 그대로 |
+| 기본값 + 한 행의 `BIG_NUM`을 10^30 + 7로 변경 | 0004 파티션이 `AvroTypeException: Cannot encode decimal with precision 41 as max precision 38`로 실패 → PG-90 `SQL_ERROR`(NON_RETRYABLE) → run `FAILED_EXTRACT`. 정수부가 precision − scale(28)자리를 넘으면 값이 깨지지 않고 실패한다 |
+| `SCALE=0` | **오류 없이 run 성공.** 모든 컬럼이 `decimal(38,0)`, `AMOUNT` 1.37 → 1, 2.74 → 3, 1368.63 → 1369(반올림). `AMOUNT` 합계 71,853,600(원천 71,853,075). 추출 단계 검증(건수)은 통과하므로 stage·target의 `AMOUNT_SUM` 비교(가이드 10.3)에서만 드러난다 |
+
+정리: 원천 컬럼은 `CAST(... AS NUMBER(p,s))`로 정밀도를 명시하고(가이드 3.2), Default Decimal Precision/Scale은 그 밖의 컬럼을 위한 안전망으로만 둔다. scale을 작게 잡으면 소리 없이 값이 바뀐다. 가이드 3.1·4장에 반영했다.
 
 ### 7.5 재현 방법 (V4)
 

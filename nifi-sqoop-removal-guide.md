@@ -321,7 +321,7 @@ Concurrent Tasks와 Retry Count는 정수 스케줄링 설정이라 Parameter(`#
 | `WORKER.CONCURRENT.TASKS` | `2` | N | 노드당 추출 병렬도 기준값. Concurrent Tasks에는 참조할 수 없으므로 배포 시 정수로 입력 |
 | `ORACLE.POOL.MAX` | `8` | N | `CS_DBCP_ORACLE` 최대 연결 수. 전체 노드 정책과 맞춤 |
 | `ORACLE.NUMBER.DEFAULT.PRECISION` | `38` | N | 정밀도 없는 `NUMBER` 컬럼을 Parquet decimal로 쓸 때의 precision(PG-20 34, 4장) |
-| `ORACLE.NUMBER.DEFAULT.SCALE` | `10` | N | 같은 경우의 scale. `0`이면 소수점 이하가 잘린다 |
+| `ORACLE.NUMBER.DEFAULT.SCALE` | `10` | N | 같은 경우의 scale. 더 긴 소수는 오류 없이 반올림된다(`0`이면 1.37 → 1). 정수부가 precision − scale 자리를 넘으면 파티션이 실패한다 |
 | `EXTRACT.FETCH.SIZE` | `5000` | N | JDBC fetch size |
 | `EXTRACT.ROWS.PER.FILE` | `500000` | N | chunk 행 수, 부하 시험으로 조정 |
 | `EXTRACT.QUERY.TIMEOUT` | `60 min` | N | 파티션 query timeout |
@@ -383,7 +383,15 @@ run timeout, stale 판정, dispatch 재시도 같은 제어 설정은 NiFi Param
 
 추출 `ExecuteSQLRecord`에는 `Use Avro Logical Types=true`를 명시한다. 기본값 `false`이면 DATE, TIMESTAMP, DECIMAL이 문자열로 기록되어 Hive DDL과 어긋난다.
 
-Oracle의 정밀도 없는 `NUMBER` 컬럼은 JDBC가 precision 0으로 알려 주므로, `ExecuteSQLRecord`의 Default Decimal Precision/Scale(기본 10, 0)로 기록된다. 기본값 그대로면 소수점 이하가 잘리거나 큰 값이 깨질 수 있다. 원천 컬럼은 `SRC.COLUMNS`에서 `CAST(col AS NUMBER(p,s))`로 정밀도를 명시하고, 남는 경우를 위해 34의 Default Decimal Precision/Scale을 `#{ORACLE.NUMBER.DEFAULT.PRECISION}`/`#{ORACLE.NUMBER.DEFAULT.SCALE}`로 지정한다. Oracle `DATE`는 시각까지 담고 있어 Parquet에 timestamp로 기록되므로 아래 시간대 규칙을 똑같이 적용한다.
+Oracle의 정밀도 없는 `NUMBER` 컬럼은 JDBC가 precision 0으로 알려 주므로, `ExecuteSQLRecord`의 Default Decimal Precision/Scale(기본 10, 0)로 기록된다. 기본값 그대로면 소수가 정수로 반올림되거나 큰 값에서 파티션이 실패한다. PoC(V4, Oracle 23ai Free)에서 확인한 동작은 다음과 같다.
+
+| 경우 | 결과 |
+|---|---|
+| 소수 자릿수가 scale보다 많음 | 오류 없이 HALF_UP 반올림. scale `0`이면 `AMOUNT` 1.37 → 1, 2.74 → 3이 되고 run은 성공한다. 건수 검증으로는 잡히지 않고 `AMOUNT_SUM` 비교(10.3)에서만 드러난다 |
+| 정수부가 precision − scale 자리를 넘음 | `AvroTypeException: Cannot encode decimal with precision 41 as max precision 38`로 해당 파티션이 `SQL_ERROR` 실패, run `FAILED_EXTRACT`. 값이 깨진 채 적재되지는 않는다 |
+| 기본값(38, 10) | 모든 값이 `decimal(38,10)`. `1/3` → `0.3333333333`, 23자리 정수 그대로 |
+
+그래서 원천 컬럼은 `SRC.COLUMNS`에서 `CAST(col AS NUMBER(p,s))`로 정밀도를 명시하고, 남는 경우를 위해 34의 Default Decimal Precision/Scale을 `#{ORACLE.NUMBER.DEFAULT.PRECISION}`/`#{ORACLE.NUMBER.DEFAULT.SCALE}`로 지정한다. Oracle `DATE`는 시각까지 담고 있어 Parquet에 timestamp로 기록되므로 아래 시간대 규칙을 똑같이 적용한다.
 
 시간대가 없는 원천 `DATE`/`TIMESTAMP`는 JDBC가 NiFi JVM 기본 시간대로 해석한다. 그 결과 Parquet에는 UTC로 변환된 `TIMESTAMP_MILLIS (isAdjustedToUTC=true)`로 기록된다. NiFi 2.4.0 PoC에서 JVM 시간대가 KST일 때 원천 `2026-09-28 00:00:01`이 `2026-09-27T15:00:01Z`로 저장됐고, 마이크로초 이하 정밀도는 버려졌다. Hive가 이 값을 읽는 방식은 Hive 버전과 parquet timestamp 설정에 따라 다르며, 건수 검증으로는 이 차이를 잡을 수 없다. 따라서 다음을 지킨다.
 

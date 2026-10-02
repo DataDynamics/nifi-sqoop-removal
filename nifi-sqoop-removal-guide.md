@@ -249,7 +249,7 @@ flowchart LR
 
 가이드 초안의 PG-30 Partition and Run Gate(Wait/Notify)와 PG-70 Recovery Monitor는 없다. 완료 판정은 API가 하고, 검증 flow는 API의 호출을 PG-05가 받아 시작한다(9장). 복구는 API sweeper가 담당한다(13장).
 
-참조 구현은 `poc/build_flow_v3.py`(PostgreSQL 원천, NiFi 2.4.0에서 검증)와 `poc/build_flow_v4.py`(같은 구조의 Oracle 원천, 미검증)다. 두 빌더는 Job이 하나뿐이라 PG-05를 Job PG 안에 두었다. 운영에서는 위 구조처럼 root로 옮긴다.
+참조 구현은 `poc/build_flow_v3.py`(PostgreSQL 원천, NiFi 2.4.0에서 검증)와 `poc/build_flow_v4.py`(같은 구조의 Oracle 원천, Oracle 23ai Free에서 검증)다. 두 빌더는 Job이 하나뿐이라 PG-05를 Job PG 안에 두었다. 운영에서는 위 구조처럼 root로 옮긴다.
 
 ### 2.1 구현 규칙
 
@@ -269,7 +269,7 @@ flowchart LR
 | PG | Processor | PoC 검증 |
 |---|---:|---|
 | PG-00 Trigger | 3 | 검증 |
-| PG-10 Run Coordinator | 10 | PostgreSQL 원천 V3로 검증(SCN 조회 2개를 뺀 8개). Oracle V4는 구성만 확인(dry-run) |
+| PG-10 Run Coordinator | 10 | PostgreSQL 원천 V3(SCN 조회 2개를 뺀 8개)와 Oracle 원천 V4(10개)로 검증 |
 | PG-20 Extract Worker | 9 (+ 선택 `ValidateRecord` 1) | 검증(`ValidateRecord` 제외) |
 | PG-05 Control Receiver | 6 | 검증(Job PG 안에 둔 형태) |
 | PG-40 Staging Validation | 15 | 입구 7개만 검증(Hive 없음) |
@@ -956,7 +956,7 @@ SELECT LPAD(c.pid, 4, '0') AS PARTITION_ID,
 - 원천이 0건이면 경계를 0으로 두고 모든 파티션의 예상 건수가 0이 된다. 허용 여부는 API가 `allowEmptySource`로 판정한다.
 - NULL 파티션(`SPLIT.NULL.POLICY=SEPARATE`)은 위 SQL에 없다. 필요하면 `IS NULL` 행을 `UNION ALL`로 추가한다(7.4).
 
-이 구조는 PostgreSQL 원천 V3(`poc/build_flow_v3.py` 14)로 NiFi 2.4.0에서 검증했다. 위 Oracle SQL은 V4(`poc/build_flow_v4.py` 16)에 그대로 들어 있으나 Oracle 환경에서 실행하지 않았다. 대상 DB에서 실행 계획과 함께 확인한다. 파티션마다 상관 서브쿼리가 원천을 다시 읽으므로, split 컬럼과 업무 조건에 맞는 인덱스가 없으면 `GROUP BY` 방식(`WIDTH_BUCKET` 등으로 버킷을 계산해 한 번에 집계)으로 바꾼다.
+이 구조는 PostgreSQL 원천 V3(`poc/build_flow_v3.py` 14)로 NiFi 2.4.0에서 검증했다. 위 Oracle SQL은 V4(`poc/build_flow_v4.py` 16)로 Oracle 23ai Free에서 실행했다(`poc/REVIEW.md` 7.4). `(업무 조건, split 컬럼)` 인덱스가 있으면 상관 서브쿼리가 인덱스 범위 스캔으로 처리된다. 운영 테이블에서는 실행 계획을 다시 확인한다. 파티션마다 상관 서브쿼리가 원천을 다시 읽으므로, split 컬럼과 업무 조건에 맞는 인덱스가 없으면 `GROUP BY` 방식(`WIDTH_BUCKET` 등으로 버킷을 계산해 한 번에 집계)으로 바꾼다.
 
 ### 7.4 Manifest SQL 원칙
 

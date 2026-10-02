@@ -6,7 +6,7 @@
 > |---|---|---|---|
 > | V1 | Load Control API 없음. NiFi가 `PutSQL`로 원장을 직접 기록하고 PG-30 Wait/Notify로 완료 판정. 하나의 PG에 평면 배치 | `poc/build_flow_v1.py` | 1~5장 |
 > | V3 | Load Control API 연동. 원장 기록과 완료 판정은 API, NiFi는 데이터 처리. Job PG 아래 자식 PG와 Port로 구성 | `poc/build_flow_v3.py` | 6장 |
-> | V4 | V3와 같은 구조에서 원천만 Oracle로 바꾼 버전(SCN 고정, `AS OF SCN`). **Oracle 실행 시험은 하지 않았다** | `poc/build_flow_v4.py` | 7장 |
+> | V4 | V3와 같은 구조에서 원천만 Oracle로 바꾼 버전(SCN 고정, `AS OF SCN`). Oracle 23ai Free 컨테이너에서 V3 시나리오를 재수행했다 | `poc/build_flow_v4.py` | 7장 |
 >
 > 현재 가이드는 V3 구조를 따른다.
 
@@ -150,9 +150,9 @@ python3 poc/build_flow_v3.py http://<nifi-host>:<port>/nifi-api my-config.json
 python3 poc/teardown_flow.py http://<nifi-host>:<port>/nifi-api my-config.json
 ```
 
-## 7. V4: Oracle 원천 빌더 (2026-10-01, 미검증)
+## 7. V4: Oracle 원천 빌더 (2026-10-01 작성, 2026-10-02 시험)
 
-`poc/build_flow_v4.py`는 V3(PostgreSQL 원천)와 같은 구조·API 계약에서 원천만 Oracle로 바꾼 빌더다. 설정 예시는 `poc/config.v4.example.json`. Oracle 환경이 없어 **실행 시험은 하지 않았다.**
+`poc/build_flow_v4.py`는 V3(PostgreSQL 원천)와 같은 구조·API 계약에서 원천만 Oracle로 바꾼 빌더다. 설정 예시는 `poc/config.v4.example.json`. 작성 시점에는 dry-run만 했고(7.2), 이후 Oracle 컨테이너에서 실행 시험을 했다(7.4). 빌더는 수정 없이 동작했다.
 
 ### 7.1 V3 대비 변경점
 
@@ -167,7 +167,7 @@ python3 poc/teardown_flow.py http://<nifi-host>:<port>/nifi-api my-config.json
 
 NULL split 파티션(`SPLIT.NULL.POLICY=SEPARATE`)은 만들지 않는다. split 컬럼에 NULL이 있으면 API가 manifest를 거부한다.
 
-### 7.2 수행한 점검 (NiFi에 생성하지 않음)
+### 7.2 작성 시 점검 (dry-run, NiFi에 생성하지 않음)
 
 빌더의 쓰기 요청을 가로채고 읽기 요청(Processor 타입·정의)만 실제 NiFi 2.4.0에서 받는 dry-run으로 확인했다.
 
@@ -179,7 +179,7 @@ NULL split 파티션(`SPLIT.NULL.POLICY=SEPARATE`)은 만들지 않는다. split
 | EL | 모든 속성의 `${`·`}` 짝이 맞음 |
 | Parameter | 빌더가 참조하는 Parameter가 `config.v4.example.json`에 모두 있음 |
 
-### 7.3 Oracle 환경에서 확인할 것
+### 7.3 Oracle 환경에서 확인할 것 (결과는 7.4)
 
 1. 조회 계정 권한: 대상 테이블 `SELECT`·`FLASHBACK`, `V$DATABASE` 조회(없으면 14를 `DBMS_FLASHBACK.GET_SYSTEM_CHANGE_NUMBER`로 변경)
 2. 16 SQL의 실행 계획: 파티션마다 상관 서브쿼리가 원천을 다시 읽으므로 split 컬럼·업무 조건 인덱스 확인. 느리면 `GROUP BY`/`WIDTH_BUCKET` 방식으로 변경(가이드 7.3)
@@ -188,3 +188,38 @@ NULL split 파티션(`SPLIT.NULL.POLICY=SEPARATE`)은 만들지 않는다. split
 5. `UNDO_RETENTION`이 run 최대 소요시간보다 긴지(`ORA-01555` → `FAILED_SNAPSHOT_EXPIRED`)
 6. V3에서 수행한 시나리오(정상, 중복 실행, HDFS 실패, API 중단, 재발행) 재수행
 
+### 7.4 Oracle 시험 결과 (2026-10-02)
+
+- 실행 환경: NiFi 2.4.0(V3와 같음), Oracle Database 23ai Free(`gvenzl/oracle-free:23-slim` 컨테이너 `nifi-poc-oracle`, `localhost:1521/FREEPDB1`), ojdbc11 21.15, Load Control API(관리 DB `nifiops_v4`, api 18582, Control Receiver 19545)
+- 데이터: `APP.INSP_DTL`에 V3 원천과 같은 데이터(업무일자 `2026-09-28` 105,000건, seq 30001~45000 공백, 다른 일자 5,000건과 NULL split 5건). 컬럼 타입은 `INSP_DTL_SEQ NUMBER(19)`, `BASE_DT DATE`, `AMOUNT NUMBER`(정밀도 없음, `SRC.COLUMNS`에서 `CAST(... AS NUMBER(18,2))`), `REG_TS TIMESTAMP`, `NOTE VARCHAR2`
+- 조회 계정 `NIFI_READER`: `CREATE SESSION`, 대상 테이블 `SELECT`·`FLASHBACK`, `SYS.V_$DATABASE` `SELECT`만 부여
+
+| 시나리오 | 결과 |
+|---|---|
+| 정상 실행 | 43개 Processor 모두 VALID. run `STAGE_VALIDATING`, SCN 고정(`snapshot_scn` 기록), 8/8 SUCCESS, 105,000건, 검증 dispatch `ACKED`(202). Parquet 21개, `_SUCCESS` 생성. Oracle과 count·distinct·min/max·`SUM(AMOUNT)`(71,853,075)·NOTE 비NULL 수(94,500) 일치. 원천 지표 `SOURCE_COUNT`·`AMOUNT_SUM`·`MIN_TS`·`MAX_TS`가 Oracle 값과 같음 |
+| 0건 파티션 | 0002(seq 30001~45001)가 manifest 등록 시 SUCCESS, Worker로 가지 않음 |
+| 동일 업무일자 중복 실행 | 409 → PG-90이 `DUPLICATE_ACTIVE_RUN`(WARN) 기록, 기존 run 변화 없음 |
+| 파티션 0004 HDFS 쓰기 실패 주입(36 Directory를 0004만 `/proc/...`로) | 0004 FAILED, run `FAILED_EXTRACT`(`CHUNK_WRITE_FAILED`), 검증 dispatch 없음, `_SUCCESS` 없음 |
+| API 중단 중 실행 | API 중단 후 Trigger(14:09:07), 14:09:45 재기동. `12_Create_Run`이 relationship 재시도로 대기하다 14:10:23 run 생성, `STAGE_VALIDATING`까지 진행. NiFi 오류 이벤트 없음 |
+| 파티션 재발행(sweeper `REISSUE`, 6.2와 같은 설정) | 0004의 chunk 보고를 닫힌 포트로 보냄 → 약 20초 뒤 `RECOVERY_REISSUED`, `REISSUE_PARTITION` dispatch 202 → PG-05가 재발행 본문의 `snapshotScn`으로 재추출(attempt 2) → 0004 SUCCESS → `STAGE_VALIDATING`. 이전 시도의 보고 3건은 409 `CLAIM_MISMATCH`(WARN). 데이터 일치(21파일, 105,000건) |
+
+7.3 항목별 확인 결과:
+
+| # | 결과 |
+|---|---|
+| 1 | 위 권한으로 14(`V$DATABASE`)와 `AS OF SCN` 조회 모두 동작. `DBMS_FLASHBACK` 대체는 필요 없었다 |
+| 2 | 16 SQL 실행 계획: 지표 CTE와 파티션별 상관 서브쿼리가 모두 `(BASE_DT, INSP_DTL_SEQ)` 인덱스 범위 스캔. 105,000건에서 0.06초. 이 인덱스가 없는 운영 테이블은 다시 확인한다 |
+| 3 | Parquet 타입: `NUMBER(19)` → `decimal(19,0)`(Hive DDL도 `DECIMAL(19,0)` 또는 `CAST`로 `BIGINT`), `CAST(AMOUNT AS NUMBER(18,2))` → `decimal(18,2)`, `DATE`·`TIMESTAMP` → `timestamp[ms, UTC]`. V3와 같이 JVM 시간대(KST) 기준으로 UTC로 바뀐다(`2026-09-28 00:00:01` → `2026-09-27T15:00:01Z`, 2장 #6). Oracle `DATE`는 날짜 컬럼이어도 timestamp가 된다. **정밀도 없는 `NUMBER`를 CAST 없이 읽는 경우(Default Decimal Precision/Scale)는 시험하지 않았다** |
+| 4 | JSON writer가 대문자 컬럼명과 `TO_CHAR` 문자열을 그대로 내보냈고, 17 Jolt와 API manifest 등록이 통과 |
+| 5 | **시험하지 않음.** 컨테이너 `UNDO_RETENTION`은 900초. `ORA-01555` → `FAILED_SNAPSHOT_EXPIRED` 경로는 운영 Oracle에서 확인한다 |
+| 6 | 위 표와 같이 V3 시나리오 모두 V3와 같은 결과 |
+
+### 7.5 재현 방법 (V4)
+
+```bash
+# Oracle 컨테이너(재부팅 후에도 자동 시작)
+docker run -d --name nifi-poc-oracle --restart unless-stopped -p 1521:1521 -e ORACLE_PASSWORD=<pw> gvenzl/oracle-free:23-slim
+# APP.INSP_DTL 생성·적재와 NIFI_READER 권한은 7.4 참고
+# 관리 DB·API·worker는 6.4와 같다(관리 DB와 포트만 V4용으로)
+python3 poc/build_flow_v4.py http://<nifi-host>:<port>/nifi-api my-config.json   # config.v4.example.json 사본
+```

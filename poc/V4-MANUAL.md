@@ -234,12 +234,16 @@ SHOW PARTITIONS dw.insp_dtl;
 SELECT count(*), sum(amount), min(reg_ts), max(reg_ts) FROM dw.insp_dtl WHERE base_dt = '2026-09-28';
 ```
 
-### 6.3 로그
+### 6.3 TUI 모니터
+
+API 서버 호스트에서 `load-control-api/bin/monitor.sh`를 실행하면 진행 중 run, 경보(`PUBLISH_UNKNOWN`, DEAD dispatch, 실패, 멈춘 run), run별 파티션·지표·이벤트, 로그를 한 화면에서 본다. 사용법은 [load-control-api/README.md](../load-control-api/README.md) "모니터".
+
+### 6.4 로그
 
 - API: `load-control-api/logs/server.log`, `worker.log`. `grep <run_id> logs/*.log`로 한 run의 모든 API 호출과 판정을 따라간다
 - NiFi: `nifi-app.log`의 `SQOOP_REPLACEMENT` 줄(PG-90), bulletin, provenance(`run_id`, `partition.id` attribute로 검색)
 
-### 6.4 같은 업무일자 다시 실행
+### 6.5 같은 업무일자 다시 실행
 
 진행 중인 run이 있으면 `DUPLICATE_ACTIVE_RUN`으로 거부된다. 끝난 run(성공·실패)이면 그대로 다시 Trigger한다. 새 `run_id`·새 SCN으로 실행되고 target 파티션이 교체된다. `PUBLISH_UNKNOWN`은 먼저 7.5로 확정한다.
 

@@ -96,6 +96,7 @@ async def get_run_detail(conn: AsyncConnection, run_id: UUID) -> RunDetail:
         source_count=run.source_count, expected_partition_count=run.expected_partition_count,
         success_partition_count=run.success_partition_count,
         failed_partition_count=run.failed_partition_count, extracted_count=run.extracted_count,
+        staging_count=run.staging_count, target_count=run.target_count,
         hdfs_run_path=run.hdfs_run_path, stage_table=run.stage_table_name,
         started_at=run.started_at, heartbeat_at=run.heartbeat_at,
         extract_completed_at=run.extract_completed_at, completed_at=run.completed_at,
@@ -120,5 +121,9 @@ async def list_runs(conn: AsyncConnection, *, job_key: str | None, business_key:
                                 limit=limit)
     return [RunListItem(run_id=str(r.run_id), job_key=r.job_key, business_key=r.business_key,
                         status=RunStatus(r.status), source_count=r.source_count,
-                        extracted_count=r.extracted_count, started_at=r.started_at,
-                        completed_at=r.completed_at, error_code=r.error_code) for r in rows]
+                        extracted_count=r.extracted_count, staging_count=r.staging_count,
+                        target_count=r.target_count, expected_partition_count=r.expected_partition_count,
+                        success_partition_count=r.success_partition_count,
+                        failed_partition_count=r.failed_partition_count, started_at=r.started_at,
+                        heartbeat_at=r.heartbeat_at, completed_at=r.completed_at,
+                        error_code=r.error_code) for r in rows]

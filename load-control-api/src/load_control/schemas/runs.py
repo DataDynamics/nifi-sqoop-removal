@@ -130,6 +130,8 @@ class RunDetail(ApiModel):
     success_partition_count: int
     failed_partition_count: int
     extracted_count: int
+    staging_count: int | None
+    target_count: int | None
     hdfs_run_path: str | None
     stage_table: str | None
     started_at: datetime
@@ -153,6 +155,12 @@ class RunListItem(ApiModel):
     status: RunStatus
     source_count: int | None
     extracted_count: int
+    staging_count: int | None
+    target_count: int | None
+    expected_partition_count: int | None
+    success_partition_count: int
+    failed_partition_count: int
     started_at: datetime
+    heartbeat_at: datetime
     completed_at: datetime | None
     error_code: str | None

@@ -67,6 +67,12 @@ dispatch:                 # outbox 전달
   poll_interval: PT5S
   batch: 20
 
+monitor:                  # TUI 모니터(bin/monitor.sh). 조회 API만 쓴다
+  api_url: null           # null이면 http://127.0.0.1:<server.port>
+  token: null             # nifi 또는 operator 토큰 원문(위 digest의 원래 값)
+  refresh_seconds: 5      # 화면 새로고침 주기(초)
+  log_dir: logs           # server.log, worker.log, *.pid 위치
+
 worker:                   # python -m load_control.worker
   metrics_host: 0.0.0.0   # /metrics bind address
   metrics_port: 9100      # null이면 /metrics를 열지 않는다

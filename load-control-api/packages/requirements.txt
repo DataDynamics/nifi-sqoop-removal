@@ -12,19 +12,27 @@ httpcore==1.0.9           # via httpx
 httptools==0.8.0          # via uvicorn
 httpx==0.28.1             # via load-control-api (pyproject.toml)
 idna==3.20                # via anyio, httpx
+linkify-it-py==2.2.0      # via markdown-it-py
 mako==1.4.3               # via alembic
+markdown-it-py==4.2.0     # via mdit-py-plugins, rich, textual
 markupsafe==3.0.3         # via mako
+mdit-py-plugins==0.6.1    # via textual
+mdurl==0.1.2              # via markdown-it-py
 opentelemetry-api==1.45.0  # via fastapi
+platformdirs==4.12.2      # via textual
 prometheus-client==0.26.0  # via load-control-api (pyproject.toml)
 pydantic==2.13.5          # via fastapi, pydantic-settings, load-control-api (pyproject.toml)
 pydantic-core==2.46.5     # via pydantic
 pydantic-settings==2.15.0  # via load-control-api (pyproject.toml)
+pygments==2.21.0          # via rich, textual
 python-dotenv==1.2.4      # via pydantic-settings, uvicorn
 pyyaml==6.0.3             # via pydantic-settings, uvicorn
+rich==15.0.0              # via textual
 sqlalchemy==2.1.2         # via alembic, load-control-api (pyproject.toml)
 starlette==1.7.0          # via fastapi
 structlog==26.1.0         # via load-control-api (pyproject.toml)
-typing-extensions==4.16.0  # via alembic, anyio, fastapi, opentelemetry-api, pydantic, pydantic-core, sqlalchemy, starlette, typing-inspection
+textual==8.2.8            # via load-control-api (pyproject.toml)
+typing-extensions==4.16.0  # via alembic, anyio, fastapi, opentelemetry-api, pydantic, pydantic-core, sqlalchemy, starlette, textual, typing-inspection
 typing-inspection==0.4.4  # via fastapi, pydantic, pydantic-settings
 uvicorn==0.54.0           # via load-control-api (pyproject.toml)
 uvloop==0.23.0            # via uvicorn

@@ -133,6 +133,15 @@ class CleanupSettings(Section):
     max_batch: int = Field(default=200, ge=1)          # 한 번에 돌려줄 최대 run 수
 
 
+class MonitorSettings(Section):
+    """TUI 모니터(bin/monitor.sh). 조회 API만 쓰고 상태를 바꾸지 않는다."""
+
+    api_url: AnyHttpUrl | None = None  # 기본: http://127.0.0.1:<server.port>
+    token: str | None = None           # nifi 또는 operator role 토큰 원문(digest가 아니다)
+    refresh_seconds: float = Field(default=5.0, ge=1.0)
+    log_dir: Path = Path("logs")       # server.log, worker.log, *.pid 위치(설치 디렉터리 기준)
+
+
 class WorkerSettings(Section):
     """worker 프로세스(dispatcher, sweeper) 설정."""
 
@@ -186,6 +195,7 @@ class Settings(BaseSettings):
     recovery: RecoverySettings = Field(default_factory=RecoverySettings)
     dispatch: DispatchSettings = Field(default_factory=DispatchSettings)
     cleanup: CleanupSettings = Field(default_factory=CleanupSettings)
+    monitor: MonitorSettings = Field(default_factory=MonitorSettings)
     worker: WorkerSettings = Field(default_factory=WorkerSettings)
     logging: LoggingSettings = Field(default_factory=LoggingSettings)
 

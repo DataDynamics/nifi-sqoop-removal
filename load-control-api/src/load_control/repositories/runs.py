@@ -25,6 +25,8 @@ class RunRow:
     success_partition_count: int
     failed_partition_count: int
     extracted_count: int
+    staging_count: int | None
+    target_count: int | None
     hdfs_run_path: str | None
     stage_table_name: str | None
     parameters: dict[str, Any]
@@ -39,8 +41,8 @@ class RunRow:
 
 _COLUMNS = """run_id, job_key, business_key, status, snapshot_scn, source_count,
        expected_partition_count, success_partition_count, failed_partition_count,
-       extracted_count, hdfs_run_path, stage_table_name, parameters, started_at,
-       heartbeat_at, extract_completed_at, completed_at, error_stage, error_code, error_message"""
+       extracted_count, staging_count, target_count, hdfs_run_path, stage_table_name, parameters,
+       started_at, heartbeat_at, extract_completed_at, completed_at, error_stage, error_code, error_message"""
 
 
 def _row(m: Any) -> RunRow:

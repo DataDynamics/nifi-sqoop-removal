@@ -30,7 +30,7 @@
 | 파티션 재발행(`recovery.mode=REISSUE`) | 멈춘 파티션이 22초 뒤 같은 SCN으로 재발행되어 2번째 시도에서 성공, run `SUCCESS`. 늦게 도착한 첫 시도의 보고는 409 `CLAIM_MISMATCH`(WARN). 파일 중복 없음 |
 | Job 2개 공유(root PG-05) | 두 Job을 동시에 실행해 각각 `SUCCESS`. 한 Job을 지우면 그 경로는 404, 다른 Job은 계속 수신 |
 | 정리(PG-70) | 보존 기간이 지난 run의 staging 테이블과 HDFS 경로 삭제. 경로가 현재 `HDFS.STAGE.ROOT`와 다른 run은 거부(삭제 없음). HDFS 경로가 없는 run도 정상 처리 |
-| Load Control API 테스트 | 122개 중 121개 통과(동시 완료, 중복 보고, 동시 claim, dispatcher 경합, deadlock 재시도 포함). 나머지 1개는 서버 전체의 LISTEN 연결 수를 세는 테스트라 같은 DB 서버에 다른 worker가 돌던 시험 환경에서 제외 |
+| Load Control API 테스트 | 128개 중 127개 통과(동시 완료, 중복 보고, 동시 claim, dispatcher 경합, deadlock 재시도, TUI 화면 포함). 나머지 1개는 서버 전체의 LISTEN 연결 수를 세는 테스트라 같은 DB 서버에 다른 worker가 돌던 시험 환경에서 제외 |
 
 ## 3. 설계에 반영한 제품 동작
 

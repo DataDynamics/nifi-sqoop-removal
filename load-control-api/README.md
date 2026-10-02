@@ -13,13 +13,14 @@ Sqoop 대체 적재(NiFi)의 상태 원장 기록과 완료 판정을 담당하�
 | 조회 | `GET /v1/runs`, `GET /v1/runs/{id}` (role `nifi`, `operator`) |
 | 운영자 | `POST /dispatches/{id}/resend`, `/publish-unknown/resolve` (role `operator`만) |
 | 정리 | `GET /v1/cleanup/candidates`, `POST /v1/runs/{id}/cleanup` (NiFi PG-70, 운영자 수동 기록) |
+| 모니터 | `GET /v1/monitor/summary`, `/v1/runs/{id}/validations`, `/v1/runs/{id}/events`(조회 전용), TUI `bin/monitor.sh` |
 | worker | outbox dispatcher(LISTEN/NOTIFY, lease, backoff, DEAD), sweeper(stale 파티션, run timeout, ACK timeout 재전송, 검증 정체 경보, 게시 결과 불명) |
 
 ## 디렉터리 구조
 
 ```text
 load-control-api/
-├── bin/          운영 스크립트(아래 "운영 스크립트"), systemd/(서비스 파일)
+├── bin/          운영 스크립트(아래 "운영 스크립트"), monitor.sh(TUI), systemd/(서비스 파일)
 ├── config/       config.example.yaml, alembic.ini, config.yaml(실제 설정, git 제외)
 ├── logs/         server.log, worker.log(로그), server.out, worker.out(표준출력), *.pid (git 제외)
 ├── packages/     airgap 설치용 wheel(git 제외)과 requirements.txt(고정 버전 목록)
@@ -46,7 +47,8 @@ src/load_control/
 ├── repositories/     # SQL만 (판단 없음)
 ├── services/         # 트랜잭션 단위 업무 규칙 (manifest 불변식, claim, chunk 판정, 검증, 게시, 정리)
 ├── routers/          # 인증, 입력 검증, 트랜잭션 시작
-└── worker/           # python -m load_control.worker: dispatcher + sweeper
+├── worker/           # python -m load_control.worker: dispatcher + sweeper
+└── monitor/          # python -m load_control.monitor: TUI 모니터(textual)
 src/migrations/versions/0001_nifi_ops_baseline.py   # nifi_ops 테이블·인덱스·권한
 src/migrations/versions/0002_run_cleanup.py         # load_run.cleaned_at(정리 기록)
 ```
@@ -83,6 +85,7 @@ bin/start.sh
 | `bin/migrate.sh [alembic 인자]` | 기본 `upgrade head`. 예: `bin/migrate.sh current` |
 | `bin/install.sh [--online]` | `.venv` 생성과 의존 패키지 설치 |
 | `bin/download-packages.sh [--lock]` | airgap용 wheel 받기 |
+| `bin/monitor.sh [--url URL] [--token TOKEN]` | TUI 모니터(아래 "모니터") |
 
 - PID 파일이 남아 있어도 그 PID가 이 서비스의 python 프로세스가 아니면 중지된 것으로 본다
 - bin 스크립트와 systemd 중 하나만 쓴다
@@ -106,6 +109,35 @@ sudo bin/systemd/install.sh --uninstall       # 제거
 ```
 
 서비스는 bin 스크립트와 같은 명령(`PYTHONPATH=src .venv/bin/python -m load_control.server|worker --config config/config.yaml`)을 설치 디렉터리에서 실행한다. 표준출력은 journal(`journalctl -u load-control-api`)로 가고, 로그 파일은 아래와 같다.
+
+## 모니터
+
+`bin/monitor.sh`는 터미널 화면에서 상태를 보는 조회 전용 도구다. 조회 API만 부르고 상태를 바꾸지 않는다.
+
+```bash
+bin/monitor.sh                         # config/config.yaml의 monitor 섹션 사용
+bin/monitor.sh --url http://api-host:8080 --token <token>
+```
+
+| 화면 | 내용 | 키 |
+|---|---|---|
+| 대시보드 | API 준비 여부, server·worker PID, 진행 중·최근 24시간 run 수, dispatch(PENDING·SENT·DEAD), 정리 대상 수, 경보, run 목록(진행률·단계별 건수·소요) | `Enter` 상세, `l` 로그, `a` 진행 중만, `r` 새로고침, `q` 종료 |
+| run 상세 | run 정보, 탭: 파티션(상태·건수·시도·노드), 검증 지표(SOURCE·STAGING·TARGET, PASS/FAIL), dispatch, 이벤트 타임라인 | `l` 이 run의 로그, `Esc` 뒤로 |
+| 로그 | `logs/server.log`, `worker.log` 실시간. 입력란 글자(run ID, requestId 등)가 들어간 줄만 표시 | `F2` WARN·ERROR만, `F3` server/worker 전환, `Esc` 뒤로 |
+
+경보 종류:
+
+| 종류 | 뜻 |
+|---|---|
+| `PUBLISH_UNKNOWN` | 게시 결과 불명. 운영자 확정 필요 |
+| `DISPATCH_DEAD` | NiFi 호출을 포기함. PG-05 수신 확인 후 재전송 |
+| `RUN_FAILED` | 최근 24시간 안에 실패·`TIMED_OUT`으로 끝난 run |
+| `RUN_STALE` | 오래 멈춘 run(`recovery.stale`, `recovery.validation_stale` 기준) |
+| `CLEANUP_FAILED` | 정리 실패가 남아 있는 run |
+
+- 설정: `monitor.api_url`(기본 `http://127.0.0.1:<server.port>`), `monitor.token`(nifi 또는 operator 토큰 원문), `monitor.refresh_seconds`(기본 5초), `monitor.log_dir`
+- 서비스 PID와 로그는 이 디렉터리의 `logs/`에서 읽으므로 API 서버 호스트에서 실행한다. 다른 호스트에서 `--url`로 붙으면 API 정보만 보인다. systemd로 띄웠으면 PID는 "PID 파일 없음"으로 나오고 API 준비 여부로 판단한다
+- 터미널이 UTF-8이어야 한글이 깨지지 않는다
 
 ## 로그
 

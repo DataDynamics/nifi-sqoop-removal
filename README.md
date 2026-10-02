@@ -70,7 +70,8 @@ flowchart LR
 
 1. Load Control API 설치·실행: [load-control-api/README.md](./load-control-api/README.md)
 2. NiFi Flow 생성·실행: [poc/V4-MANUAL.md](./poc/V4-MANUAL.md)
-3. 설계를 이해하려면: [NiFi Flow 설계](./nifi-sqoop-removal-guide.md) → [API 설계](./load-control-api-design.md)
+3. 상태 보기: API 서버에서 `load-control-api/bin/monitor.sh`(터미널 대시보드)
+4. 설계를 이해하려면: [NiFi Flow 설계](./nifi-sqoop-removal-guide.md) → [API 설계](./load-control-api-design.md)
 
 ## 현재 상태
 

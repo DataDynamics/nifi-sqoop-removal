@@ -158,6 +158,8 @@ outbox는 "최소 1회" 전달이라 같은 요청이 두 번 올 수 있다. �
 | GET | `/v1/runs`, `/v1/runs/{id}` | 운영 | 목록·상세(파티션, dispatch 포함) |
 | POST | `/v1/runs/{id}/dispatches/{did}/resend` | 운영자 | `DEAD`/`SENT` dispatch 재전송 |
 | POST | `/v1/runs/{id}/publish-unknown/resolve` | 운영자 | `PUBLISH_UNKNOWN`을 확정. 사유 필수 |
+| GET | `/v1/monitor/summary` | TUI 모니터 | 진행 중·최근 24시간 run 수, dispatch 현황, 정리 대상 수, 경보 목록 |
+| GET | `/v1/runs/{id}/validations`, `/v1/runs/{id}/events` | TUI 모니터, 운영 | run의 검증 지표, 이벤트 타임라인 |
 | GET | `/healthz`, `/readyz`, `/metrics` | 모니터링 | 생존, DB 연결, Prometheus |
 
 API는 NiFi의 PASS/FAIL 판정을 그대로 믿지 않는다. 저장된 지표에 FAIL이 하나라도 있으면 `stage-validated`, `success`가 거절한다(`reasons`에 이유).
@@ -278,6 +280,7 @@ PG-70이 끝난 run의 staging 테이블과 HDFS run 경로를 지울 때 대상
 - **로그**: `logs/server.log`, `logs/worker.log`. 한 줄 형식, 한글 메시지, `YYYY-MM-DD HH:MM:SS.SSS`. API 호출마다 수신·응답 두 줄(본문 포함), 같은 요청의 모든 로그에 `requestId`·`runId`가 붙는다.
 - **메트릭(`/metrics`)**: 엔드포인트별 요청 수·지연, dispatch 상태별 수, 활성 run 수, sweeper 처리 건수.
 - **알림 대상**: `DEAD` dispatch, `PUBLISH_UNKNOWN`, `TIMED_OUT`, `FAILED_*`, 5xx 급증, `PENDING` dispatch 증가.
+- **TUI 모니터**: `bin/monitor.sh`. 조회 API로 대시보드·경보·run 상세·로그를 본다([load-control-api/README.md](./load-control-api/README.md) "모니터").
 - **설정**: `config/config.yaml` 하나. 항목은 `config/config.example.yaml`에 설명이 있다.
 
 ## 11. 구현 구조와 테스트

@@ -244,6 +244,21 @@ NULL split 파티션(`SPLIT.NULL.POLICY=SEPARATE`)은 만들지 않는다. split
 
 Oracle 메시지는 NLS 설정에 따라 한글로 나왔지만(`ORA-01555: 너무 이전 스냅샷: ...`) 코드 추출(`ORA-[0-9]{5}`)에는 영향이 없다.
 
+### 7.8 Cloudera CFM NiFi 클러스터 (2026-10-03)
+
+V4를 Cloudera CFM 4.12(NiFi 2.6.0.4.12.0.1-9) 2노드 비보안 클러스터(`rhel96-vm2`/`vm3`, UI `http://10.0.1.50:18081/nifi`는 haproxy, 노드 API `http://192.168.122.122:8080/nifi-api`)에 설치해 정상 실행을 확인했다.
+
+- 빌더 변경: 00_Generate_Trigger를 Primary Node에서만 실행(`executionNode=PRIMARY`). 클러스터에서 Run Once는 모든 노드에서 실행되므로 그대로 두면 노드 수만큼 trigger가 생기고 두 번째부터 `DUPLICATE_ACTIVE_RUN`이 된다. 단일 노드에서는 영향 없다
+- CFM 기본 배포본에 V4가 쓰는 Processor·Controller Service(Parquet, PutHDFS, HikariCP 포함)가 모두 있어 NAR 추가는 필요 없었다
+- 노드 준비(두 노드 같은 경로): `/opt/nifi-poc/jdbc/`에 ojdbc11 21.15, PostgreSQL JDBC 42.7.3, `/opt/nifi-poc/conf/core-site.xml`(`fs.defaultFS=file:///`, 이 VM들에는 HDFS가 없음), `/var/lib/nifi-poc/stage`(`nifi` 소유)
+- 원천 Oracle은 7.4와 같은 컨테이너(`192.168.122.1:1521/FREEPDB1`). Load Control API는 관리 DB `nifiops_cfm`, api 18583, worker metrics 9103, `nifi.receiver_url=http://192.168.122.122:19546`. PostgreSQL `pg_hba.conf`에 `192.168.122.0/24` → `nifiops_cfm` 허용 추가
+
+| 항목 | 결과 |
+|---|---|
+| 생성 | 43개 Processor 모두 VALID, Controller Service 5개 ENABLED |
+| 정상 실행(업무일자 `2026-09-28`) | run 1개만 생성, `STAGE_VALIDATING`. 8/8 SUCCESS(0002는 0건), 105,000건. 7개 파티션이 Round Robin으로 vm2 4개·vm3 3개에 나뉘어 추출됨(`worker_node`) |
+| 결과 파일 | `file:///`라 Parquet가 처리한 노드의 로컬 디스크에 나뉘어 생기고 `_SUCCESS`는 검증 요청을 받은 vm2에만 생긴다. 운영처럼 HDFS를 쓰면 한 경로에 모인다 |
+
 ### 7.5 재현 방법 (V4)
 
 ```bash

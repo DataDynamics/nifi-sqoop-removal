@@ -23,7 +23,7 @@ flowchart LR
 |---|---|
 | 구현 범위 | 추출 단계(PG-00, 10, 20), API 호출 수신(PG-05), 검증 시작과 `_SUCCESS` 기록(PG-40 입구), 오류 처리(PG-90) |
 | 미구현 | Hive staging 검증, `INSERT OVERWRITE`, Target 검증(PG-40 나머지, PG-50, PG-60). run은 `STAGE_VALIDATING`에서 멈춘다 |
-| 검증 환경 | Apache NiFi 2.4.0 단일 노드, Oracle Database 23ai Free, ojdbc11 21.15, PostgreSQL 16, HDFS 대신 `file:///` |
+| 검증 환경 | Apache NiFi 2.4.0 단일 노드와 Cloudera CFM 4.12(NiFi 2.6.0) 2노드 클러스터, Oracle Database 23ai Free, ojdbc11 21.15, PostgreSQL 16, HDFS 대신 `file:///` (REVIEW.md 7.4, 7.8) |
 | 구성 | PG 7개(상위 1 + 자식 6), Processor 43개, Connection 75개, Port 13개 |
 
 운영 적용에 남은 일은 `TODO.md`에 있다.
@@ -82,6 +82,8 @@ HDFS 결과 경로:
 - ojdbc(`ORACLE.JDBC.DRIVER.PATH`)와 PostgreSQL JDBC(`META.JDBC.DRIVER.PATH`) 파일을 모든 노드의 같은 경로에 둔다
 - `HADOOP.CONF.FILES`에 지정할 `core-site.xml`, `hdfs-site.xml`을 둔다
 - `CONTROL.LISTEN.PORT`(PG-05 수신 포트)가 비어 있어야 한다
+- Cloudera CFM 4.12(NiFi 2.6.0)는 기본 배포본에 필요한 NAR가 모두 있다
+- 클러스터에서는 PG-05가 모든 노드에서 `CONTROL.LISTEN.PORT`를 연다. API `nifi.receiver_url`은 노드 하나 또는 그 앞의 LB로 둔다
 
 ### 3.2 Oracle
 
@@ -205,6 +207,8 @@ Trigger(00)는 DISABLED라 PG를 시작해도 실행되지 않는다.
 1. Job Parameter Context의 `BUSINESS.KEY`를 실행할 업무일자로 바꾼다
 2. 00_Generate_Trigger를 Enable한다(상태가 STOPPED가 됨)
 3. 00_Generate_Trigger에서 **Run Once**를 실행한다
+
+00은 Primary Node에서만 실행되도록 만들어지므로 클러스터에서도 Run Once 한 번에 run 하나만 생긴다.
 
 > **주의**: 00을 enable한 상태로 상위 PG를 다시 Start하면 00도 RUNNING이 되어 바로 한 번 실행된다(스케줄 1일). 같은 업무일자의 run이 진행 중이면 `DUPLICATE_ACTIVE_RUN`으로 거부되어 데이터에는 영향이 없지만, PG를 다시 시작하기 전에 00을 STOPPED 또는 DISABLED로 둔다.
 

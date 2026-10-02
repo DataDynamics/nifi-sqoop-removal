@@ -20,6 +20,8 @@ V3 대비 변경점
 - NULL split 파티션(SPLIT.NULL.POLICY=SEPARATE)은 만들지 않는다. NULL이 있으면 API가 manifest를 거부한다.
 
 Oracle Database 23ai Free에서 V3 시나리오와 NUMBER 정밀도, ORA-01555를 시험했다(REVIEW.md 7.4~7.7).
+Cloudera CFM 4.12(NiFi 2.6.0) 2노드 클러스터에서도 정상 실행을 확인했다(REVIEW.md 7.8). 클러스터에서 trigger가
+노드마다 생기지 않도록 00은 Primary Node에서만 실행한다.
 사용 방법은 V4-MANUAL.md.
 
 사용법: build_flow_v4.py <nifi-api-url> <config.json>
@@ -190,14 +192,18 @@ conns = []   # (group, src, rels, dst, extra)
 COLW, ROWH = 420, 190
 
 
-def p(g, key, name, short, props=None, col=0, row=0, tasks=1, sched="0 sec", sensitive=(), retry=None):
-    """retry=(relationships, count): Processor 내장 재시도. 소진되면 해당 relationship 연결로 간다."""
+def p(g, key, name, short, props=None, col=0, row=0, tasks=1, sched="0 sec", sensitive=(), retry=None,
+      primary=False):
+    """retry=(relationships, count): Processor 내장 재시도. 소진되면 해당 relationship 연결로 간다.
+    primary=True: 클러스터에서 Primary Node에서만 실행(단일 노드에서는 영향 없음)."""
     b, t = bundle(short)
     config = {"properties": props or {}, "concurrentlySchedulableTaskCount": tasks,
               "schedulingPeriod": sched, "penaltyDuration": "5 sec", "yieldDuration": "5 sec",
               "comments": COMMENTS[key]}  # 설명이 없는 Processor는 KeyError로 빌드를 멈춘다
     if sensitive:
         config["sensitiveDynamicPropertyNames"] = list(sensitive)
+    if primary:
+        config["executionNode"] = "PRIMARY"
     if retry:
         config.update({"retriedRelationships": retry[0], "retryCount": retry[1],
                        "backoffMechanism": "PENALIZE_FLOWFILE", "maxBackoffPeriod": "1 min"})
@@ -338,7 +344,8 @@ PG-05 →(validate)→ PG-40,  PG-05 →(reissue, Round Robin)→ PG-20,  모든
 port(G00, "start-run", "out", 3, 0)
 port(G00, "errors", "out", 3, 1)
 p(G00, "P00", "00_Generate_Trigger", "GenerateFlowFile",
-  {"generate-ff-custom-text": "{}", "Unique FlowFiles": "false"}, 0, 0, sched="1 day")
+  {"generate-ff-custom-text": "{}", "Unique FlowFiles": "false"}, 0, 0, sched="1 day",
+  primary=True)  # 클러스터에서 노드마다 trigger가 생기지 않게 한다
 ua(G00, "P01", "01_Set_Trigger_Attributes", {
     "load.job.key": "#{JOB.KEY}", "load.business.key": "#{BUSINESS.KEY}",
     "load.trigger.type": "SCHEDULE", "load.stage": "RUN_CREATE"}, 1, 0)

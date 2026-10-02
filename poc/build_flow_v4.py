@@ -19,7 +19,8 @@ V3 대비 변경점
 - PG-05: 재발행 본문의 snapshotScn을 load.snapshot.scn으로 꺼낸다.
 - NULL split 파티션(SPLIT.NULL.POLICY=SEPARATE)은 만들지 않는다. NULL이 있으면 API가 manifest를 거부한다.
 
-이 빌더는 Oracle 환경에서 실행 시험을 하지 않았다(PostgreSQL 원천 V3로 구조만 검증).
+Oracle Database 23ai Free에서 V3 시나리오와 NUMBER 정밀도, ORA-01555를 시험했다(REVIEW.md 7.4~7.7).
+사용 방법은 V4-MANUAL.md.
 
 사용법: build_flow_v4.py <nifi-api-url> <config.json>
 config.json 형식은 config.v4.example.json. `names.process_group` 기본값은 SQOOP_REPLACEMENT_POC_V4.

@@ -455,7 +455,7 @@ docker exec nifi-poc-hiveserver2 beeline -u jdbc:hive2://192.168.122.1:10000/ -n
 # 모든 NiFi 노드에 conf/core-site.xml, conf/hdfs-site.xml을 복사하고 HADOOP.CONF.FILES로 지정한다
 ```
 
-- HDFS 권한 검사는 끈다(`dfs.permissions.enabled=false`). NiFi(`nifi`)가 쓴 파일을 Hive(`hive`)가 읽기 위해서다. 운영 권한 설계는 `TODO.md` 5장
+- HDFS 권한 검사는 끈다(`dfs.permissions.enabled=false`). NiFi(`nifi`)가 쓴 파일을 Hive(`hive`)가 읽기 위해서다. 운영도 권한 검사를 하지 않는다
 - Hive 시간대는 NiFi 노드와 같은 `America/New_York`(`hive.local.time.zone`)
 - Hive 4는 DB 디렉터리가 이미 있으면 `CREATE DATABASE`가 실패한다. metastore를 새로 만들었다면 빈 `/warehouse/tablespace/managed/hive/<db>.db`를 지우고 만든다
 

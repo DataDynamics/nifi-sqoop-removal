@@ -8,7 +8,7 @@ PoC(V3 PostgreSQL 원천, V4 Oracle 원천)에서 검증한 구조를 CFM 4.12.0
 |---|---|
 | PG-00 Trigger, PG-10 Coordinator, PG-20 Worker, PG-05 Receiver, PG-90 Error | NiFi 2.4.0 단일 노드(V3, V4)와 CFM 4.12 2노드 클러스터(V4)에서 검증 |
 | PG-40 Staging Validation, PG-50 Publish, PG-60 Target Validation | V4에 구현. CFM 4.12 + Apache Hive 4.0.1(시험용 컨테이너)에서 검증(REVIEW 7.9) |
-| Load Control API | 구현·단위 테스트 완료. 단일 인스턴스, 평문 HTTP로만 연동 시험 |
+| Load Control API | 구현·단위 테스트 완료. 단일 인스턴스, HTTP로 연동 시험 |
 | 시나리오 | 정상, 0건 파티션, 중복 실행, HDFS 실패, API 중단, 재발행, `NUMBER` 정밀도, `ORA-01555`(REVIEW 6.2, 7.4~7.7), staging DQ 실패, 게시 실패(`PUBLISH_UNKNOWN`과 운영자 확정), target 검증 실패, HiveServer2 중단(REVIEW 7.9) 통과 |
 
 PoC와 운영 환경의 차이:
@@ -17,17 +17,17 @@ PoC와 운영 환경의 차이:
 |---|---|---|
 | NiFi | Apache NiFi 2.4.0 단일 노드, CFM 4.12.0 2노드(비보안) | CFM 4.12.0(NiFi 2.6.0) cluster |
 | Oracle | 23ai Free 컨테이너 | 운영 Oracle(버전 확인 필요) |
-| HDFS | `file:///`, 이후 단일 노드 Apache Hadoop 3.4.1 컨테이너(권한 검사 끔) | 실제 HDFS |
-| Hive | Apache Hive 4.0.1 HiveServer2 컨테이너(인증 없음, Derby metastore) | CDP HiveServer2(인증, ACID 정책) |
-| NiFi ↔ API | 평문 HTTP, Bearer 토큰 | mTLS(가이드 4장, API 설계 10.2) |
-| 배포 | `poc/build_flow_v4.py`가 REST API로 생성 | Registry 또는 조직 표준 배포 절차 |
+| HDFS | `file:///`, 이후 단일 노드 Apache Hadoop 3.4.1 컨테이너(권한 검사 끔) | 실제 HDFS(권한 검사 하지 않음) |
+| Hive | Apache Hive 4.0.1 HiveServer2 컨테이너(인증 없음, Derby metastore) | CDP HiveServer2(인증 없음, ACID 정책 확인 필요) |
+| NiFi ↔ API | HTTP, Bearer 토큰 | 같음(HTTP만 사용) |
+| 배포 | `poc/build_flow_v4.py`가 REST API로 생성 | 같음(환경별 config 파일) |
 
 ## 1. 플랫폼과 버전 확정
 
 - [x] CFM 4.12.0(NiFi 2.6.0)에서 V4 빌더로 Flow를 생성하고 Processor가 모두 VALID인지 확인한다(REVIEW 7.8, 7.9). 2.4.0과 다른 속성 이름은 없었다
 - [x] CFM 4.12.0 배포본에 `nifi-parquet-nar`, `nifi-hadoop-nar`, `nifi-hadoop-libraries-nar`가 포함돼 있는지 확인한다(포함, REVIEW 7.8)
 - [x] CFM 4.12.0 Hive Processor·Connection Pool의 실제 이름을 확정하고 `CS_HIVE3_DBCP`에 반영한다: `ClouderaHiveConnectionPool`, `PutClouderaHiveQL`(가이드 4장·10장)
-- [ ] CDP HiveServer2(Hive 3)와 실제 인증(Kerberos/LDAP)으로 V4를 다시 시험한다. PoC는 Apache Hive 4.0.1, 인증 없음이었다. 특히 target 테이블이 ACID managed table이면 `INSERT OVERWRITE`와 external staging 조합을 확인한다
+- [ ] CDP HiveServer2(Hive 3, 인증 없음)로 V4를 다시 시험한다. PoC는 Apache Hive 4.0.1이었다. 특히 target 테이블이 ACID managed table이면 `INSERT OVERWRITE`와 external staging 조합을 확인한다
 - [ ] 운영 Oracle 버전에 맞는 ojdbc 버전을 정하고 모든 노드의 같은 경로에 배포한다(`ORACLE.JDBC.DRIVER.PATH`)
 - [ ] 관리 DB PostgreSQL 버전과 JDBC 드라이버 경로를 정한다(`META.JDBC.DRIVER.PATH`)
 
@@ -63,16 +63,14 @@ PoC와 운영 환경의 차이:
 ## 5. HDFS와 Hive
 
 - [ ] `HADOOP.CONF.FILES`(core-site, hdfs-site)를 모든 노드의 같은 경로에 배포한다
-- [ ] `HDFS.STAGE.ROOT` 경로, 소유자, umask(`027`)와 Hive가 읽을 수 있는 권한을 정한다. Simple 인증이므로 NiFi OS 사용자가 HDFS 사용자가 된다(가이드 8.5)
+- [ ] `HDFS.STAGE.ROOT` 경로를 정한다. HDFS 권한 검사는 하지 않는다(`dfs.permissions.enabled=false`)
 - [ ] 실패 run 경로와 오래된 성공 run 경로의 보존·정리 절차를 정한다
-- [ ] HiveServer2 인증 방식과 NiFi Hive 계정 권한(staging DDL, target `INSERT OVERWRITE`)을 정한다
 
 ## 6. Load Control API 운영 배포
 
 - [ ] API 2개 이상을 LB 뒤에 두고, worker(dispatcher + sweeper) 2개를 띄운다(API 설계 10.1)
 - [ ] 관리 DB(`nifi_ops`)를 운영 PostgreSQL에 만들고 migration 전용 계정으로 `alembic upgrade head`를 실행한다
 - [ ] 런타임 계정을 나눈다: API는 원장 쓰기, NiFi는 `load_event` INSERT만. 두 계정 모두 `DELETE`·`TRUNCATE`·`DROP` 없음(가이드 4.1 권한 예시)
-- [ ] NiFi → API mTLS(`CS_SSL_CLIENT`), API → NiFi PG-05 mTLS(`CS_SSL_SERVER`, Client Auth=Required), 방화벽으로 PG-05 수신 포트를 제한한다(가이드 4장, API 설계 10.2)
 - [ ] 토큰을 발급하고 digest를 API 설정에 넣는다. NiFi에는 Sensitive Parameter `CONTROL.API.AUTHORIZATION`으로만 둔다
 - [ ] `recovery` 설정을 운영값으로 정한다: `mode=FAIL`, `run_timeout`, `extract_query_timeout`, `stale`. 재발행(`REISSUE`)을 쓸지 결정한다(가이드 13장)
 - [ ] `CONTROL.API.RETRY.MAX`와 backoff 합계가 API 재기동 시간보다 길게 정한다(API 설계 10.1)
@@ -86,12 +84,12 @@ PoC와 운영 환경의 차이:
 - [ ] Concurrent Tasks와 Retry Count는 Parameter를 참조할 수 없으므로 배포 스크립트가 환경별 정수로 넣는다(가이드 2.3)
 - [ ] Yield Duration, Back Pressure, Provenance 보존 기간, Bulletin 수집 연계를 정한다(가이드 15장, 18장)
 - [ ] NiFi Policy를 운영자와 개발자로 나누고, Parameter Context 변경 권한을 제한한다
-- [ ] 배포 방식 결정: PoC 빌더를 운영 배포 도구로 쓸지, 빌더로 만든 Flow를 Registry flow definition으로 버전 관리할지 정한다. 민감 Parameter는 flow JSON에 평문으로 넣지 않는다
+- [ ] 배포는 빌더(`poc/build_flow_v4.py`)를 환경별 config 파일로 실행한다. 비밀번호·토큰이 든 config 파일은 권한 `600`으로 두고 저장소에 넣지 않는다
 - [ ] Trigger는 DISABLED로 배포하고 운영 전환 시점에 enable한다. 스케줄(PoC는 1일 Timer)을 운영 일정에 맞춘다
 
 ## 8. cluster 환경 재시험
 
-- [ ] 운영과 같은 구성(cluster, 실제 HDFS·Hive, mTLS)의 검증 환경에서 V3·V4 시나리오를 다시 수행한다(REVIEW 6.2, 7.4)
+- [ ] 운영과 같은 구성(cluster, 실제 HDFS·Hive)의 검증 환경에서 V3·V4 시나리오를 다시 수행한다(REVIEW 6.2, 7.4)
 - [ ] PoC에서 못 한 장애를 주입한다: NiFi 노드 종료·재기동(파티션 처리 중), API 인스턴스 1개 종료, worker 종료, 관리 DB 연결 차단, 검증 호출 수신 실패(가이드 19장 9)
 - [ ] 2/4/8 파티션과 운영 규모 데이터로 처리 시간, API 응답 시간, run 잠금 대기, Oracle·관리 DB 부하를 측정하고 `PARTITION.COUNT`, `EXTRACT.ROWS.PER.FILE`, Concurrent Tasks를 정한다(가이드 19장 4)
 - [ ] 운영 승인 조건(가이드 19장)을 항목별로 확인한다. 특히 NiFi 계정으로 원장 테이블을 변경할 수 없는지, `source = partition sum = staging = target`일 때만 SUCCESS인지

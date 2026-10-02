@@ -298,7 +298,7 @@ Concurrent Tasks와 Retry Count는 정수 스케줄링 설정이라 Parameter(`#
 
 | Parameter | 예시 | Sensitive | 용도 |
 |---|---|---:|---|
-| `CONTROL.API.URL` | `https://load-control.internal:8443/v1` | N | Load Control API base URL |
+| `CONTROL.API.URL` | `http://load-control.internal:8080/v1` | N | Load Control API base URL. NiFi↔API는 HTTP만 쓴다 |
 | `CONTROL.API.AUTHORIZATION` | 미표시(`Bearer <token>`) | Y | API 인증 헤더 값 전체(role=`nifi`). Sensitive 속성은 Parameter 참조 하나만 값으로 가질 수 있어 `Bearer `까지 Parameter에 넣는다(9.2) |
 | `CONTROL.API.TIMEOUT` | `30 sec` | N | `InvokeHTTP` Socket Read Timeout |
 | `CONTROL.API.RETRY.MAX` | `5` | N | `InvokeHTTP` Retry Count 기준값. Retry Count는 정수 설정이라 Parameter를 참조할 수 없으므로 배포 시 입력한다. backoff와 곱해 API 재기동 시간보다 길게(9.3) |
@@ -312,11 +312,11 @@ Concurrent Tasks와 Retry Count는 정수 스케줄링 설정이라 Parameter(`#
 | `ORACLE.JDBC.PASSWORD` | 미표시 | Y | 원천 암호 |
 | `ORACLE.JDBC.DRIVER.PATH` | `/opt/nifi/jdbc/ojdbc11.jar` | N | 원천 Oracle JDBC Driver |
 | `HIVE.JDBC.URL` | 환경별 HiveServer2 URL | N | HiveQL 실행 |
-| `HIVE.USER` | service account | N | Hive 계정 |
+| `HIVE.USER` | service account | N | Hive 접속 사용자 이름. HiveServer2는 인증 없이 쓴다 |
 | `HADOOP.CONF.FILES` | `core-site.xml,hdfs-site.xml` 절대경로 | N | PutHDFS |
-| `HDFS.AUTH.MODE` | `simple` | N | 비-Ker버 HDFS 인증 방식 문서화 |
+| `HDFS.AUTH.MODE` | `simple` | N | 비-Kerberos HDFS. 권한 검사는 하지 않는다 |
 | `HDFS.STAGE.ROOT` | `/data/nifi/stage` | N | staging root |
-| `HDFS.PERMISSIONS.UMASK` | `027` | N | PutHDFS 생성 파일/경로 umask |
+| `HDFS.PERMISSIONS.UMASK` | `027` | N | PutHDFS 생성 파일/경로 umask(HDFS 권한 검사를 하지 않으므로 접근 제어 수단은 아니다) |
 | `HDFS.REPLICATION` | 환경 기본값 또는 `3` | N | 필요 시 PutHDFS replication override |
 | `WORKER.CONCURRENT.TASKS` | `2` | N | 노드당 추출 병렬도 기준값. Concurrent Tasks에는 참조할 수 없으므로 배포 시 정수로 입력 |
 | `ORACLE.POOL.MAX` | `8` | N | `CS_DBCP_ORACLE` 최대 연결 수. 전체 노드 정책과 맞춤 |
@@ -368,16 +368,14 @@ run timeout, stale 판정, dispatch 재시도 같은 제어 설정은 NiFi Param
 |---|---|---|
 | `CS_DBCP_ORACLE` | `HikariCPConnectionPool` | Driver Class=`oracle.jdbc.OracleDriver`, URL·계정·Driver 경로=`#{ORACLE.JDBC.*}`, Max Total=`#{ORACLE.POOL.MAX}`, validation query=`SELECT 1 FROM DUAL` |
 | `CS_DBCP_META` | `HikariCPConnectionPool` | 관리 DB(PostgreSQL), `load_event` INSERT 전용(PG-90). Driver Class=`org.postgresql.Driver`, URL·계정·Driver 경로=`#{META.JDBC.*}`, validation query=`SELECT 1`, Max Total 4~8 |
-| `CS_HIVE3_DBCP` | CFM 4.12 `ClouderaHiveConnectionPool`(`nifi-cdf-hive-nar`) | HiveServer2의 실제 인증 방식 적용. `DBCPService`를 구현하므로 `ExecuteSQLRecord`에도 쓴다. URL에 `hive.resultset.use.unique.column.names=false`(10.3). Apache NiFi 2.x에는 Hive 구성요소가 없다 |
+| `CS_HIVE3_DBCP` | CFM 4.12 `ClouderaHiveConnectionPool`(`nifi-cdf-hive-nar`) | HiveServer2는 인증 없이 접속한다(Kerberos User Service 없음). `DBCPService`를 구현하므로 `ExecuteSQLRecord`에도 쓴다. URL에 `hive.resultset.use.unique.column.names=false`(10.3). Apache NiFi 2.x에는 Hive 구성요소가 없다 |
 | `CS_JSON_WRITER_ARRAY` | `JsonRecordSetWriter` | Output Grouping=`Array`, pretty print=false |
 | `CS_PARQUET_WRITER` | `ParquetRecordSetWriter` | Schema=`Inherit Record Schema`, compression=`SNAPPY` |
 | `CS_PARQUET_READER` | `ParquetReader` | ValidateRecord에서 기록 결과 schema를 다시 읽음 |
 | `CS_SCHEMA_REGISTRY` | 조직 표준 Schema Registry | target Avro schema를 버전으로 고정 |
-| `CS_SSL_CLIENT` | `StandardRestrictedSSLContextService` | NiFi→API `InvokeHTTP` mTLS. truststore에 API 서버 CA, keystore에 NiFi client 인증서 |
-| `CS_SSL_SERVER` | `StandardRestrictedSSLContextService` | API→NiFi `HandleHttpRequest` 수신 TLS. Client Auth=Required로 API client 인증서 검증 |
 | `CS_HTTP_CONTEXT_MAP` | `StandardHttpContextMap` | `HandleHttpRequest`/`HandleHttpResponse` 요청 연결 보관, Request Expiration 1 min |
 
-가이드 초안의 `CS_DMC_SERVER`(`MapCacheServer`)와 `CS_DMC_CLIENT`(`MapCacheClientService`)는 Wait/Notify를 쓰지 않으므로 두지 않는다.
+가이드 초안의 `CS_DMC_SERVER`(`MapCacheServer`)와 `CS_DMC_CLIENT`(`MapCacheClientService`)는 Wait/Notify를 쓰지 않으므로 두지 않는다. NiFi↔API는 HTTP만 쓰므로 SSL Context Service(`CS_SSL_CLIENT`, `CS_SSL_SERVER`)도 두지 않는다. API 호출은 Bearer 토큰으로 role을 구분한다.
 
 운영 데이터에는 schema inference를 사용하지 않는다. Oracle JDBC schema를 상속하되, Oracle `NUMBER`, `DATE`, `TIMESTAMP`, CLOB 처리 결과가 Hive DDL과 일치하는지 사전 시험하고 필요하면 `ConvertRecord`를 추가해 명시적 schema로 변환한다.
 
@@ -1122,7 +1120,7 @@ load.stage  = CHUNK_WRITE
 | Retry | Retry Count=`PARTITION.RETRY.MAX` 기준값, Retried Relationships=failure, Backoff=Penalize FlowFile |
 | Concurrent Tasks | Worker 동시성과 HDFS 부하에 맞춰 설정 |
 
-HDFS에는 Kerberos가 적용되지 않았으므로 `Kerberos User Service`, principal, keytab을 구성하지 않는다. NiFi 프로세스를 실행하는 OS 사용자가 HDFS client의 effective user가 되므로 staging root와 하위 경로에 필요한 POSIX 권한 또는 ACL을 사전에 부여한다. `core-site.xml`의 인증 방식과 `fs.defaultFS`가 실제 HDFS 환경을 가리키는지 확인한다. `replace`는 run 전용 경로와 결정적 파일명인 경우에만 허용한다.
+HDFS에는 Kerberos가 적용되지 않았으므로 `Kerberos User Service`, principal, keytab을 구성하지 않는다. HDFS 권한 검사는 하지 않으므로(`dfs.permissions.enabled=false`) NiFi가 쓴 파일을 Hive가 별도 권한 부여 없이 읽는다. `core-site.xml`의 인증 방식과 `fs.defaultFS`가 실제 HDFS 환경을 가리키는지 확인한다. `replace`는 run 전용 경로와 결정적 파일명인 경우에만 허용한다.
 
 38 `ReplaceText`는 PutHDFS **성공 이후에** content를 보고 JSON으로 바꾼다. 그 전에 `InvokeHTTP`를 호출하면 Parquet content가 요청 본문으로 전송된다. Replacement Strategy=Always Replace이므로 Parquet content를 읽지 않는다.
 
@@ -1203,7 +1201,7 @@ PoC에서 PG-30이 실패 후 0.1초 만에 run 실패를 확정하던 동작은
 |---|---|
 | HTTP Method | `POST` (조회는 `GET`) |
 | HTTP URL | `#{CONTROL.API.URL}/runs/${load.run.id}/...` |
-| SSL Context Service | `CS_SSL_CLIENT` |
+| SSL Context Service | 설정하지 않음(HTTP) |
 | Connection Timeout | `5 sec` |
 | Socket Read Timeout | `#{CONTROL.API.TIMEOUT}` |
 | Request Content-Type | `application/json` |
@@ -1273,7 +1271,7 @@ flowchart LR
 
 | ID | Processor | Scheduling | 주요 Properties | Relationship |
 |---|---|---|---|---|
-| 05 | `HandleHttpRequest` | All Nodes, 1 | Listening Port=`#{CONTROL.LISTEN.PORT}`, SSL Context Service=`CS_SSL_SERVER`, Client Authentication=`REQUIRED`, HTTP Context Map=`CS_HTTP_CONTEXT_MAP`, Allowed Paths=`/(validate\|reissue)/(ORACLE_INSP_DTL_DAILY\|...)`(등록된 Job만), Allow GET/PUT/DELETE/HEAD/OPTIONS=false | success→06 |
+| 05 | `HandleHttpRequest` | All Nodes, 1 | Listening Port=`#{CONTROL.LISTEN.PORT}`(HTTP), HTTP Context Map=`CS_HTTP_CONTEXT_MAP`, Allowed Paths=`/(validate\|reissue)/(ORACLE_INSP_DTL_DAILY\|...)`(등록된 Job만), Allow GET/PUT/DELETE/HEAD/OPTIONS=false | success→06 |
 | 06 | `RouteOnAttribute` | All Nodes, 1 | `http.method`=POST, `http.headers.X-Run-Id`와 `X-Dispatch-Id`가 UUID 형식 | valid→08, unmatched→07 |
 | 07 | `HandleHttpResponse` | All Nodes, 1 | HTTP Status Code=400 | success→auto-terminate |
 | 08 | `HandleHttpResponse` | All Nodes, 1 | HTTP Status Code=202 | success→09 |
@@ -1284,7 +1282,7 @@ flowchart LR
 - 등록되지 않은 `jobKey`는 05의 Allowed Paths에서 걸러져 `HandleHttpRequest`가 404로 응답한다. 07·09·10의 unmatched도 API 쪽에서 ACK timeout 후 재전송되고, 계속 실패하면 dispatch가 `DEAD`가 되어 API가 `DISPATCH_DEAD` 이벤트로 알린다. 그래서 PG-05는 별도 오류 기록 Processor를 두지 않는다. 원인은 NiFi Bulletin과 Provenance로 확인한다.
 - `HandleHttpRequest`는 모든 노드에서 동작한다. API는 NiFi LB 주소(`nifi.receiver_url`)로 호출하며, 어느 노드가 받든 Job PG의 첫 단계 CAS가 중복 실행을 막는다. 그래서 PG-40~60은 All Nodes로 스케줄한다(2.3).
 - 새 Job을 추가하면 05의 Allowed Paths에 `jobKey`를 넣고, 10에 route 두 개(validate, reissue)와 Output Port를 추가해 새 Job PG의 Input Port에 연결한다.
-- 05의 TLS client 인증으로 API만 호출할 수 있게 한다. 방화벽으로 수신 포트를 API 서버 대역에만 연다.
+- 05는 HTTP로 받는다. 방화벽으로 수신 포트를 API worker 호스트에만 연다. 06이 `X-Run-Id`, `X-Dispatch-Id` 형식을 검사하고, 실제 처리 여부는 PG-40의 `/validation/start` CAS가 정한다.
 
 ---
 
@@ -1792,8 +1790,8 @@ API 쪽 구현과 동시성 테스트는 API 설계 9.5~9.6, 11장을 따른다.
 - Provenance: run/partition/chunk 상관 분석이 가능한 기간 유지. API 로그와 `X-Request-Id`, `run_id`로 대조
 - Bulletin: ERROR/WARN 수집을 모니터링 시스템에 연계
 - Parameter Context 변경 권한과 NiFi Policy를 운영자/개발자로 분리
-- 민감 Parameter(`CONTROL.API.AUTHORIZATION`, DB 암호)는 버전관리 flow JSON에 평문으로 포함하지 않음. `InvokeHTTP`의 `Authorization`은 Sensitive 동적 속성으로 설정
-- flow definition은 NiFi Registry 또는 조직 표준 Git 배포 절차로 승격. Load Control API와 API 계약(엔드포인트, 필드)을 함께 버전 관리한다
+- 민감 Parameter(`CONTROL.API.AUTHORIZATION`, DB 암호)는 빌더 config 파일(권한 `600`, 저장소 밖)에만 둔다. `InvokeHTTP`의 `Authorization`은 Sensitive 동적 속성으로 설정
+- Flow는 빌더(`poc/build_flow_v4.py`)를 환경별 config 파일로 실행해 만든다. 빌더와 Load Control API 계약(엔드포인트, 필드)을 같은 저장소에서 함께 버전 관리한다
 
 ---
 
@@ -1890,7 +1888,7 @@ PUBLISH_UNKNOWN은 사람 또는 별도 reconciliation 없이 자동 재실행�
 | Connection Pool | DB Connection을 재사용하고 동시 접속 수를 제한하는 서비스 | `CS_DBCP_ORACLE`, `CS_DBCP_META`, `CS_HIVE3_DBCP`로 구분한다. |
 | Fetch Size | JDBC가 한 번에 가져오는 row 수에 대한 힌트 | Oracle 왕복 횟수와 NiFi memory 사용량을 조정한다. |
 | HDFS | Hadoop Distributed File System | Oracle 추출 결과 Parquet와 `_SUCCESS` marker를 저장한다. |
-| Simple Authentication | Kerberos 없이 OS 사용자명 기반으로 동작하는 Hadoop 인증 방식 | 이 프로젝트의 HDFS 인증 방식이며 NiFi OS 사용자의 POSIX/ACL 권한이 필요하다. |
+| Simple Authentication | Kerberos 없이 OS 사용자명 기반으로 동작하는 Hadoop 인증 방식 | 이 프로젝트의 HDFS 인증 방식이다. HDFS 권한 검사는 하지 않는다. |
 | Effective User | HDFS가 요청 주체로 인식하는 사용자 | 비-Ker버 환경에서는 일반적으로 NiFi 프로세스 OS 사용자다. |
 | Parquet | 컬럼 기반 파일 형식 | Oracle 추출 결과의 기본 HDFS 저장 형식이다. |
 | Staging | 최종 게시 전 데이터를 격리하고 검증하는 임시 영역 | `run_id`별 HDFS 경로와 Hive external table로 구성한다. |

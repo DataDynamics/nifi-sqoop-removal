@@ -38,10 +38,7 @@ auth:
       - "<sha256-hex>"
 
 nifi:                     # worker → NiFi PG-05 호출
-  receiver_url: https://nifi-lb.internal:9443
-  client_cert: /etc/load-control/tls/client.crt
-  client_key: /etc/load-control/tls/client.key
-  ca_bundle: /etc/load-control/tls/nifi-ca.pem
+  receiver_url: http://nifi-lb.internal:9443   # NiFi↔API는 HTTP만 쓴다(client_cert/client_key/ca_bundle 설정 안 함)
   timeout_seconds: 10
 
 recovery:                 # sweeper 기준(가이드 13.1)

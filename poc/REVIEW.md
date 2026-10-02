@@ -84,7 +84,7 @@ python3 poc/build_flow_v1.py http://10.0.1.50:10001/nifi-api my-config.json   # 
 - 실행 환경: Apache NiFi 2.4.0(단일 노드, `http://10.0.1.50:10001`), PostgreSQL 16, Load Control API(`load-control-api`, api 1 프로세스 + worker 1 프로세스, 관리 DB `nifiops_v3`)
 - 추가 설치: 1장과 같음
 - 데이터: 1장과 같음(`srcdb.app.insp_dtl` 업무일자 `2026-09-28` 105,000건, seq 30001~45000 공백)
-- NiFi↔API는 평문 HTTP로 연결했다. 운영에서는 SSL Context Service(mTLS)를 붙인다.
+- NiFi↔API는 HTTP로 연결했다. 운영도 HTTP만 쓴다(2026-10-03 결정).
 
 | PG | 역할 | Processor | Port |
 |---|---|---:|---|

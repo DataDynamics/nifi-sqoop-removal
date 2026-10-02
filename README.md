@@ -242,9 +242,9 @@ error_class, error_code, message
 - 전체 테이블 또는 특정 partition overwrite 여부
 - 원천 0건 처리 정책
 - 필수 업무 검증 지표와 허용 오차
-- Kerberos, Ranger, HDFS 경로와 서비스 계정 권한
+- HDFS 경로(HDFS 권한 검사·Hive 인증은 쓰지 않음)
 - Load Control API 배포 환경(컨테이너/VM), 이중화 대수, 관리 DB 연결 수 한도
-- NiFi↔API mTLS 인증서 발급 주체와 방화벽 경로(NiFi→API, API→NiFi PG-05 포트)
+- NiFi↔API 방화벽 경로(NiFi→API, API→NiFi PG-05 포트). 통신은 HTTP
 - API 소유·운영 조직과 장애 대응 절차
 
 ## 참고 자료

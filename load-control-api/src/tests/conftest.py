@@ -21,7 +21,7 @@ from load_control.config import Settings
 from load_control.main import create_app
 from load_control.security import token_digest
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]  # src/tests/conftest.py → 프로젝트 루트
 NIFI_TOKEN = "test-nifi-token"
 OPERATOR_TOKEN = "test-operator-token"
 TABLES = "load_event, load_dispatch, load_validation, load_file, load_partition, load_run"
@@ -41,7 +41,7 @@ def database_url() -> Iterator[str]:
 
 @pytest.fixture(scope="session")
 def migrated_url(database_url: str) -> str:
-    cfg = Config(str(ROOT / "alembic.ini"))
+    cfg = Config(str(ROOT / "config" / "alembic.ini"))
     cfg.attributes["database_url"] = database_url
     cfg.attributes["configure_logger"] = False
     command.upgrade(cfg, "head")

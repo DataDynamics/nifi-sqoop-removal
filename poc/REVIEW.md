@@ -138,9 +138,7 @@ PG 간 연결은 상위 PG(`SQOOP_REPLACEMENT_POC_V3`)에 둔다. `partitions`(P
 
 ```bash
 # 1. 관리 DB migration과 API·worker 실행(load-control-api/README.md)
-LCA_CONFIG=config.yaml alembic upgrade head
-python -m load_control.server --config config.yaml
-python -m load_control.worker --config config.yaml     # nifi.receiver_url = http://<nifi-host>:<CONTROL.LISTEN.PORT>
+bin/migrate.sh && bin/start.sh   # load-control-api 디렉터리. nifi.receiver_url = http://<nifi-host>:<CONTROL.LISTEN.PORT>
 
 # 2. NiFi Flow 생성(config.v3.example.json 사본에 API URL, 인증 헤더, DB, 경로를 채운다)
 python3 poc/build_flow_v3.py http://<nifi-host>:<port>/nifi-api my-config.json
@@ -330,7 +328,7 @@ V4를 Cloudera CFM 4.12(NiFi 2.6.0.4.12.0.1-9) 2노드 비보안 클러스터(`r
 
 1. root 연결을 지우려면 양 끝(PG-05 Output Port와 Job PG Input Port)이 모두 멈춰 있어야 한다(409 `Destination of Connection ... is running`). 첫 teardown이 이 때문에 실패해 PG-05가 멈춘 채 남았다. Job PG를 먼저 멈추도록 고쳤다
 2. Job을 추가하거나 지우는 동안 PG-05가 몇 초 멈춘다. 그동안 온 호출은 연결 실패가 되고 API dispatcher가 backoff 후 다시 보낸다
-3. 재발행(`reissue-in`) 경로는 검증 경로와 같은 방식으로 연결했지만 이 구조에서 재발행 시나리오를 다시 돌리지는 않았다(7.4에서 PG-05가 Job PG 안에 있을 때 확인)
+3. 재발행(`reissue-in`)도 이 구조에서 확인했다. API를 `recovery.mode=REISSUE`, `stale=PT20S`, `extract_query_timeout=PT10S`, `sweeper_interval=PT5S`로 띄우고, 38의 URL을 `${partition.id:equals('0004'):and(${http.request.uri:isEmpty()}):ifElse(<닫힌 포트>, <API>)}`로 바꿔 0004의 첫 시도 보고만 실패시켰다(재발행 FlowFile은 PG-05가 붙인 `http.request.uri`가 있어 정상 경로로 보고). 결과: claim 22초 뒤 `RECOVERY_REISSUED`, `REISSUE_PARTITION` dispatch 202·`ACKED`(root PG-05 → `reissue-in` → PG-20, attempt 2) → 0004 SUCCESS → run `SUCCESS`(105,000건). URL을 되돌리자 재시도 중이던 첫 시도의 보고가 409 `CLAIM_MISMATCH`(WARN)로 거부되고 run은 그대로였다. HDFS Parquet 7개로 중복 없음. 시험 후 API 설정을 `mode=FAIL`로 되돌렸다
 
 이름 변경: 가이드 2장·3장 이름으로 맞췄다. Job PG `SQOOP_REPLACEMENT_POC_V4` → `JOB_<JOB.KEY>`(`JOB_ORACLE_INSP_DTL_DAILY`), Job Context `PC_JOB_ORACLE_INSP_DTL_DAILY_V4` → `PC_JOB_<JOB.KEY>`, 공통 Context `PC_SQOOP_REPLACEMENT_COMMON_V4` → `PC_SQOOP_REPLACEMENT_COMMON`. 빌더와 teardown이 `JOB.KEY`로 이름을 정하므로 config에 `names`를 두지 않아도 된다. 새 이름으로 다시 만든 Flow에서 run `SUCCESS`, Job B(`JOB_ORACLE_INSP_DTL_DAILY_B`) 생성·삭제도 확인했다. 7.10 이전 기록의 이름은 당시 이름이다. V1 설정 예시에는 teardown이 V1 이름을 찾도록 `names`를 적었다(V1 빌더는 이름을 코드에 고정해 쓴다).
 

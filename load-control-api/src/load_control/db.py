@@ -19,7 +19,7 @@ FOREIGN_KEY_VIOLATION = "23503"
 def make_engine(settings: Settings) -> AsyncEngine:
     """프로세스당 하나 만드는 async 엔진. pool_pre_ping으로 끊긴 연결을 자동으로 버린다."""
     return create_async_engine(
-        settings.database.url.get_secret_value(),
+        settings.database.url,
         pool_size=settings.database.pool_size,
         max_overflow=settings.database.max_overflow,
         pool_pre_ping=True,

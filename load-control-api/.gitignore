@@ -1,4 +1,4 @@
-.venv/
+.venv*/
 __pycache__/
 *.egg-info/
 .pytest_cache/
@@ -7,4 +7,13 @@ __pycache__/
 .env
 .coverage
 htmlcov/
-config.yaml
+dist/
+# 실제 설정(비밀값 포함)
+config/config.yaml
+# 실행 중 생성(로그, PID)
+logs/*
+!logs/.gitkeep
+# airgap 설치 파일은 bin/download-packages.sh로 받는다. 목록(requirements.txt)만 저장소에 둔다
+packages/*
+!packages/requirements.txt
+!packages/README.md

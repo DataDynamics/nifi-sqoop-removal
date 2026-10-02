@@ -69,7 +69,7 @@ PoC와 운영 환경의 차이:
 ## 6. Load Control API 운영 배포
 
 - [ ] API 2개 이상을 LB 뒤에 두고, worker(dispatcher + sweeper) 2개를 띄운다(API 설계 10.1)
-- [ ] 관리 DB(`nifi_ops`)를 운영 PostgreSQL에 만들고 migration 전용 계정으로 `alembic upgrade head`를 실행한다
+- [ ] 관리 DB(`nifi_ops`)를 운영 PostgreSQL에 만들고 migration 전용 계정으로 `bin/migrate.sh`(alembic upgrade head)를 실행한다
 - [ ] 런타임 계정을 나눈다: API는 원장 쓰기, NiFi는 `load_event` INSERT만. 두 계정 모두 `DELETE`·`TRUNCATE`·`DROP` 없음(가이드 4.1 권한 예시)
 - [ ] 토큰을 발급하고 digest를 API 설정에 넣는다. NiFi에는 Sensitive Parameter `CONTROL.API.AUTHORIZATION`으로만 둔다
 - [ ] `recovery` 설정을 운영값으로 정한다: `mode=FAIL`, `run_timeout`, `extract_query_timeout`, `stale`. 재발행(`REISSUE`)을 쓸지 결정한다(가이드 13장)

@@ -75,7 +75,7 @@ async def fail_run(conn: AsyncConnection, run_id: UUID, req: RunFailRequest) -> 
                         message=req.message, details={"stage": req.error_stage,
                                                       "from": run.status, "to": req.fail_status})
     log.error("run_failed", runId=str(run_id), fromStatus=run.status, toStatus=req.fail_status,
-              stage=req.error_stage, errorCode=req.error_code, message=req.message[:300])
+              stage=req.error_stage, errorCode=req.error_code, errorMessage=req.message[:300])
     return RunFailResponse(run_id=str(run_id), run_status=req.fail_status, changed=True)
 
 

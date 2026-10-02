@@ -1,7 +1,7 @@
 """설정: config.yaml(API 설계 9.4).
 
 로드 순서(앞이 우선): 생성자 인자 > 환경변수 > config.yaml > 기본값.
-- 파일 위치: LCA_CONFIG 환경변수, 없으면 현재 디렉터리의 config.yaml.
+- 파일 위치: LCA_CONFIG 환경변수, 없으면 현재 디렉터리의 config/config.yaml.
 - 환경변수 덮어쓰기는 비밀값 주입용이다. 섹션 구분자는 '__'이다. 예: LCA_DATABASE__URL
 - 모르는 키는 거부한다(오타 방지).
 """
@@ -13,7 +13,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field, SecretStr, model_validator
+from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field, model_validator
 from pydantic_settings import (
     BaseSettings,
     PydanticBaseSettingsSource,
@@ -22,7 +22,7 @@ from pydantic_settings import (
 )
 
 CONFIG_ENV = "LCA_CONFIG"
-DEFAULT_CONFIG_FILE = "config.yaml"
+DEFAULT_CONFIG_FILE = "config/config.yaml"  # 설치 디렉터리(bin 스크립트의 작업 디렉터리) 기준
 
 _config_file: ContextVar[Path | None] = ContextVar("lca_config_file", default=None)
 
@@ -67,9 +67,10 @@ class ServerSettings(Section):
 class DatabaseSettings(Section):
     """관리 DB(PostgreSQL nifi_ops) 연결."""
 
-    url: SecretStr  # postgresql+asyncpg://load_control_api@meta:5432/nifiops (API 런타임 계정)
-    migration_url: SecretStr | None = None  # alembic 전용 DDL 계정. 없으면 url 사용
-    listen_dsn: SecretStr | None = None  # worker LISTEN 전용: postgresql://... (asyncpg 직접 연결)
+    # 비밀번호를 포함한 URL을 그대로 둔다(config.yaml은 권한 600으로 관리). 로그에는 host·DB 이름만 남긴다.
+    url: str  # postgresql+asyncpg://load_control_api:<pw>@meta:5432/nifiops (API 런타임 계정)
+    migration_url: str | None = None  # alembic 전용 DDL 계정. 없으면 url 사용
+    listen_dsn: str | None = None  # worker LISTEN 전용: postgresql://... (asyncpg 직접 연결)
     pool_size: int = Field(default=10, ge=1)
     max_overflow: int = Field(default=5, ge=0)
     tx_attempts: int = Field(default=3, ge=1)
@@ -143,6 +144,7 @@ class LogFileSettings(Section):
     """파일 로그. 크기 기준으로 회전한다."""
 
     path: Path
+    format: Literal["text", "json"] = "text"  # text: 사람이 읽는 한 줄 형식, json: 수집기용
     max_bytes: int = Field(default=100 * 1024 * 1024, ge=1024)
     backup_count: int = Field(default=10, ge=0)
 
@@ -156,10 +158,12 @@ class LoggingSettings(Section):
     """로그 설정. structlog 이벤트와 stdlib 로그(uvicorn, SQLAlchemy 등)를 같은 형식으로 낸다."""
 
     level: LogLevel = "INFO"  # root 수준
-    format: Literal["json", "console"] = "json"  # 운영은 json, 개발은 console
-    stdout: bool = True  # 표준출력으로 낼지(컨테이너 수집용)
-    file: LogFileSettings | None = None  # 파일로도 낼 때. 파일은 항상 json
-    access_log: bool = True  # API 요청마다 access 로그(구조화)를 남길지
+    format: Literal["text", "json", "console"] = "text"  # 표준출력 형식. console은 개발용(색상)
+    stdout: bool = True  # 표준출력으로 낼지(컨테이너·systemd journal 수집용)
+    file: LogFileSettings | None = None  # 파일로도 낼 때
+    access_log: bool = True  # API 요청마다 수신·응답 로그를 남길지
+    access_body: bool = True  # 수신·응답 로그에 요청·응답 본문(JSON)을 넣을지
+    access_body_max: int = Field(default=2000, ge=0)  # 본문을 이 글자 수에서 자른다
     # logger별 수준. 예: SQL을 보려면 sqlalchemy.engine: INFO
     loggers: dict[str, LogLevel] = Field(default_factory=_default_logger_levels)
 

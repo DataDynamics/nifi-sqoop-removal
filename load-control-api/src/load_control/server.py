@@ -22,7 +22,7 @@ log = structlog.get_logger("load_control.server")
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """명령행 인자."""
     parser = argparse.ArgumentParser(description="Load Control API server")
-    parser.add_argument("--config", help=f"config.yaml 경로(기본: ${CONFIG_ENV} 또는 ./config.yaml)")
+    parser.add_argument("--config", help=f"config.yaml 경로(기본: ${CONFIG_ENV} 또는 ./config/config.yaml)")
     return parser.parse_args(argv)
 
 

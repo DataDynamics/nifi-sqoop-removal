@@ -2,6 +2,7 @@
 
 import asyncio
 import contextlib
+import time
 from datetime import timedelta
 
 import asyncpg
@@ -80,16 +81,21 @@ class Dispatcher:
             await self._dead(d, None, f"build failed: {e!r}")
             return
         headers = {"X-Run-Id": str(d.run_id), "X-Dispatch-Id": str(d.dispatch_id)}
+        log.info("dispatch_sending", dispatchId=str(d.dispatch_id), runId=str(d.run_id), type=d.dispatch_type,
+                 partitionId=d.partition_id, url=url, attempt=d.attempt_count, body=body)
+        started = time.perf_counter()
         try:
             r = await self.client.post(url, json=body, headers=headers)
         except httpx.HTTPError as e:
             await self._retry(d, None, repr(e))
             return
+        elapsed_ms = round((time.perf_counter() - started) * 1000, 1)
         if r.is_success:
             await in_tx(self.engine, lambda conn: dispatch.mark_sent(conn, d.dispatch_id, r.status_code))
             metrics.DISPATCH.labels(d.dispatch_type, "sent").inc()
             log.info("dispatch_sent", dispatchId=str(d.dispatch_id), runId=str(d.run_id),
-                     type=d.dispatch_type, httpStatus=r.status_code, attempt=d.attempt_count)
+                     type=d.dispatch_type, httpStatus=r.status_code, attempt=d.attempt_count,
+                     durationMs=elapsed_ms, url=url)
         elif 400 <= r.status_code < 500:
             await self._dead(d, r.status_code, r.text)
         else:
@@ -104,7 +110,8 @@ class Dispatcher:
             conn, d.dispatch_id, http_status=status, error=error, delay=delay))
         metrics.DISPATCH.labels(d.dispatch_type, "retry").inc()
         log.warning("dispatch_retry", dispatchId=str(d.dispatch_id), runId=str(d.run_id),
-                    httpStatus=status, attempt=d.attempt_count, delaySeconds=delay.total_seconds(),
+                    type=d.dispatch_type, httpStatus=status, attempt=d.attempt_count,
+                    delaySeconds=delay.total_seconds(),
                     error=error[:300])
 
     async def _dead(self, d: LeasedDispatch, status: int | None, error: str) -> None:
@@ -118,7 +125,7 @@ class Dispatcher:
         await in_tx(self.engine, fn)
         metrics.DISPATCH.labels(d.dispatch_type, "dead").inc()
         log.error("dispatch_dead", dispatchId=str(d.dispatch_id), runId=str(d.run_id),
-                  httpStatus=status, attempt=d.attempt_count, error=error[:300])
+                  type=d.dispatch_type, httpStatus=status, attempt=d.attempt_count, error=error[:300])
 
     async def run(self, stop: asyncio.Event) -> None:
         """LISTEN으로 즉시 깨어나고, 알림을 놓쳐도 poll 주기마다 확인한다."""
@@ -142,7 +149,7 @@ class Dispatcher:
         if self.settings.database.listen_dsn is None:
             log.warning("listen_disabled", reason="LCA_LISTEN_DSN not set; polling only")
             return
-        dsn = self.settings.database.listen_dsn.get_secret_value()
+        dsn = self.settings.database.listen_dsn
         while not stop.is_set():
             conn: asyncpg.Connection | None = None
             try:

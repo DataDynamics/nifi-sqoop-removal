@@ -1,20 +1,22 @@
-# Load Control API 설정 예시. 복사해서 config.yaml로 쓴다(config.yaml은 git에 올리지 않는다).
-#   파일 위치: LCA_CONFIG 환경변수, 없으면 현재 디렉터리의 config.yaml
-#   환경변수가 같은 항목을 덮어쓴다(비밀값 주입용). 섹션 구분자는 '__'. 예: LCA_DATABASE__URL
+# Load Control API 설정 예시. 복사해서 config/config.yaml로 쓴다(config.yaml은 git에 올리지 않는다).
+#   파일 위치: LCA_CONFIG 환경변수, 없으면 현재 디렉터리의 config/config.yaml. bin 스크립트는 설치 디렉터리에서 실행한다
+#   비밀번호 등도 이 파일에 평문으로 적는다. 파일 권한을 600으로 두고 git에 올리지 않는다.
+#   환경변수가 같은 항목을 덮어쓴다. 섹션 구분자는 '__'. 예: LCA_DATABASE__URL
 #   모르는 키가 있으면 시작하지 않는다.
 #   기간 값은 ISO 8601(PT90M, PT6H) 또는 초 단위 숫자로 쓴다.
 
 server:                   # API HTTP 서버(python -m load_control.server)
   host: 0.0.0.0           # bind address. 같은 호스트의 프록시 뒤에만 둔다면 127.0.0.1
   port: 8080
-  workers: 4              # 프로세스 수(보통 CPU 코어 수). 1보다 크면 /metrics는 프로세스별 값
+  workers: 4              # 프로세스 수(보통 CPU 코어 수). 1보다 크면 /metrics는 프로세스별 값이고,
+                          # 여러 프로세스가 같은 로그 파일을 회전하므로 회전은 logrotate(copytruncate)에 맡기는 편이 안전하다
   root_path: ""           # 리버스 프록시가 경로 접두사를 붙일 때(예: /load-control)
   proxy_headers: true     # X-Forwarded-For/Proto 신뢰 여부
   forwarded_allow_ips: "127.0.0.1"   # 위 헤더를 신뢰할 프록시 IP(쉼표 구분, "*" 가능)
   timeout_keep_alive: 5   # 초
   timeout_graceful_shutdown: 30      # SIGTERM 후 진행 중 요청을 기다리는 초
   limit_concurrency: null # 프로세스당 동시 연결 상한(초과 시 503). null이면 제한 없음
-  # 앱에서 TLS를 직접 종료할 때만 설정한다. 보통은 LB/ingress에서 mTLS를 종료한다.
+  # NiFi↔API는 HTTP만 쓴다. 아래 TLS 항목은 비워 둔다.
   ssl_certfile: null
   ssl_keyfile: null
   ssl_ca_certs: null      # 클라이언트 인증서 검증용 CA
@@ -69,13 +71,17 @@ worker:                   # python -m load_control.worker
   metrics_host: 0.0.0.0   # /metrics bind address
   metrics_port: 9100      # null이면 /metrics를 열지 않는다
 
-logging:
+logging:                  # 시각은 서버 현지 시각 YYYY-MM-DD HH:MM:SS.SSS, 메시지는 한글(이벤트 코드도 함께)
   level: INFO             # root 수준: DEBUG, INFO, WARNING, ERROR, CRITICAL
-  format: json            # 표준출력 형식: json(운영) 또는 console(개발)
-  stdout: true            # 표준출력으로 낼지(컨테이너 로그 수집용)
-  access_log: true        # API 요청마다 access 로그를 남길지(/healthz, /readyz, /metrics 제외)
-  file:                   # 파일로도 낼 때. 파일은 항상 json. 필요 없으면 file: null
-    path: /var/log/load-control/load-control.log
+  format: text            # 표준출력 형식: text(한 줄), json(수집기용), console(개발, 색상)
+  stdout: false           # 표준출력으로도 낼지. bin 스크립트로 띄우면 logs/*.out에 같은 내용이 중복되므로 false.
+                          # 컨테이너·systemd journal로 모을 때는 true
+  access_log: true        # API 호출마다 수신(api_request)·응답(api_response) 로그를 남길지(/healthz 등 제외)
+  access_body: true       # 위 로그에 요청·응답 본문(JSON)을 넣을지. Authorization 헤더는 남기지 않는다
+  access_body_max: 2000   # 본문을 이 글자 수에서 자른다
+  file:                   # 파일 로그. 필요 없으면 file: null
+    path: logs/{service}.log      # {service}는 server 또는 worker. 설치 디렉터리 기준
+    format: text          # text(사람이 읽는 한 줄) 또는 json
     max_bytes: 104857600  # 100MB마다 회전
     backup_count: 10
   loggers:                # logger별 수준(root보다 우선)

@@ -1,0 +1,28 @@
+# Load Control API 서버(uvicorn). bin/systemd/install.sh가 @LCA_HOME@, @LCA_USER@를 채워 설치한다.
+# bin/start.sh와 함께 쓰지 않는다(같은 포트를 두 번 열게 된다).
+[Unit]
+Description=Load Control API server (Sqoop replacement ledger)
+Documentation=file://@LCA_HOME@/README.md
+Wants=network-online.target
+After=network-online.target postgresql.service
+
+[Service]
+Type=simple
+User=@LCA_USER@
+Group=@LCA_GROUP@
+WorkingDirectory=@LCA_HOME@
+Environment=PYTHONPATH=@LCA_HOME@/src
+Environment=LCA_CONFIG=@LCA_HOME@/config/config.yaml
+Environment=PYTHONUNBUFFERED=1
+ExecStart=@LCA_HOME@/.venv/bin/python -m load_control.server --config @LCA_HOME@/config/config.yaml
+# 종료 신호 후 진행 중 요청을 기다린다(server.timeout_graceful_shutdown 30초 + 여유)
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=45
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+# 표준출력은 journal로 간다(journalctl -u load-control-api). 구조화 로그는 logging.file.path(logs/server.log)
+
+[Install]
+WantedBy=multi-user.target

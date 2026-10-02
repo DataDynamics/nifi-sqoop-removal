@@ -1,0 +1,26 @@
+# Load Control worker(dispatcher + sweeper). bin/systemd/install.sh가 @LCA_HOME@, @LCA_USER@를 채워 설치한다.
+# bin/start.sh와 함께 쓰지 않는다(같은 dispatch를 두 프로세스가 처리해도 안전하지만 관리가 섞인다).
+[Unit]
+Description=Load Control worker (dispatcher + sweeper)
+Documentation=file://@LCA_HOME@/README.md
+Wants=network-online.target
+After=network-online.target postgresql.service
+
+[Service]
+Type=simple
+User=@LCA_USER@
+Group=@LCA_GROUP@
+WorkingDirectory=@LCA_HOME@
+Environment=PYTHONPATH=@LCA_HOME@/src
+Environment=LCA_CONFIG=@LCA_HOME@/config/config.yaml
+Environment=PYTHONUNBUFFERED=1
+ExecStart=@LCA_HOME@/.venv/bin/python -m load_control.worker --config @LCA_HOME@/config/config.yaml
+# SIGTERM을 받으면 진행 중인 dispatch·sweeper 작업을 끝내고 종료한다
+KillSignal=SIGTERM
+TimeoutStopSec=45
+Restart=on-failure
+RestartSec=5
+# 표준출력은 journal로 간다(journalctl -u load-control-worker). 구조화 로그는 logging.file.path(logs/worker.log)
+
+[Install]
+WantedBy=multi-user.target

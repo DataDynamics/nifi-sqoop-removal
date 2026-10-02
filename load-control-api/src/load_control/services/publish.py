@@ -85,7 +85,7 @@ async def result(conn: AsyncConnection, run_id: UUID, req: PublishResultRequest)
     await events.record(conn, name, run, level=level, error_code=req.error_code,
                         message=req.message or None)
     log.log(logging.INFO if outcome == RunStatus.PUBLISHED else logging.ERROR, "publish_result",
-            runId=str(run_id), outcome=req.outcome, errorCode=req.error_code, message=req.message[:300])
+            runId=str(run_id), outcome=req.outcome, errorCode=req.error_code, errorMessage=req.message[:300])
     return PublishResultResponse(run_status=outcome, changed=True)
 
 

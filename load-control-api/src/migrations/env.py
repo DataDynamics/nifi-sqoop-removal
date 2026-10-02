@@ -22,7 +22,7 @@ def database_url() -> str:
     from load_control.config import Settings
 
     db = Settings.load().database
-    return (db.migration_url or db.url).get_secret_value()
+    return db.migration_url or db.url
 
 
 def do_run_migrations(connection: Connection) -> None:

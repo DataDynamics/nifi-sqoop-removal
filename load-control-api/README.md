@@ -15,13 +15,27 @@ API 설계 12장 전환 순서 중 API 쪽 작업을 모두 구현했다. NiFi F
 | 정리 | `GET /v1/cleanup/candidates`, `POST /v1/runs/{id}/cleanup` (NiFi PG-70, 운영자 수동 기록) |
 | worker | outbox dispatcher(LISTEN/NOTIFY, lease, backoff, DEAD), sweeper(stale 파티션, run timeout, ACK timeout 재전송, 검증 정체 경보, 게시 결과 불명) |
 
-## 구조
+## 디렉터리 구조
+
+```text
+load-control-api/
+├── bin/          운영 스크립트(아래 "운영 스크립트"), systemd/(서비스 파일)
+├── config/       config.example.yaml, alembic.ini, config.yaml(실제 설정, git 제외)
+├── logs/         server.log, worker.log(로그), server.out, worker.out(표준출력), *.pid (git 제외)
+├── packages/     airgap 설치용 wheel(git 제외)과 requirements.txt(고정 버전 목록)
+├── src/
+│   ├── load_control/   소스 코드
+│   ├── migrations/     Alembic migration(가이드 4.1 DDL)
+│   └── tests/          실제 PostgreSQL 대상 통합·동시성 테스트
+├── pyproject.toml, Dockerfile, README.md
+└── .venv/        실행 환경(bin/install.sh가 만든다, git 제외)
+```
 
 ```text
 src/load_control/
 ├── main.py           # create_app() factory, 예외 처리기, router 등록
 ├── server.py         # API 진입점(python -m load_control.server)
-├── config.py         # Settings (config.yaml 로드)
+├── config.py         # Settings (config/config.yaml 로드)
 ├── db.py             # engine, in_tx (deadlock 재시도), SQLSTATE 헬퍼
 ├── security.py       # Bearer 토큰 role 인증 (digest 비교)
 ├── errors.py         # ApiError → JSON 오류 응답
@@ -30,73 +44,138 @@ src/load_control/
 ├── domain.py         # RunStatus, PartitionStatus, 허용 실패 전이
 ├── schemas/          # Pydantic 요청·응답 모델 (camelCase JSON)
 ├── repositories/     # SQL만 (판단 없음)
-├── services/         # 트랜잭션 단위 업무 규칙 (manifest 불변식, claim, chunk 판정, 검증, 게시)
+├── services/         # 트랜잭션 단위 업무 규칙 (manifest 불변식, claim, chunk 판정, 검증, 게시, 정리)
 ├── routers/          # 인증, 입력 검증, 트랜잭션 시작
 └── worker/           # python -m load_control.worker: dispatcher + sweeper
-alembic/versions/0001_nifi_ops_baseline.py   # 가이드 4.1 DDL
-alembic/versions/0002_run_cleanup.py         # load_run.cleaned_at(정리 기록)
-tests/                                       # 실제 PostgreSQL 대상 통합·동시성 테스트
+src/migrations/versions/0001_nifi_ops_baseline.py   # 가이드 4.1 DDL
+src/migrations/versions/0002_run_cleanup.py         # load_run.cleaned_at(정리 기록)
 ```
+
+## 설치
+
+프로젝트를 패키지로 설치하지 않는다. `.venv`에는 의존 패키지만 두고, bin 스크립트가 `PYTHONPATH=src`로 소스를 실행한다. 그래서 설치 장비에 빌드 도구가 필요 없다. Python 3.12 이상이 필요하다(RHEL 9는 `dnf install python3.12`).
+
+```bash
+# 1) 인터넷이 되는 장비: wheel을 packages/에 받는다(대상 Python 3.12, manylinux x86_64)
+bin/download-packages.sh            # requirements.txt를 다시 만들려면 --lock (uv 필요)
+
+# 2) 디렉터리 전체(packages/ 포함)를 airgap 장비로 옮긴 뒤
+bin/install.sh                      # packages/만 써서 .venv 생성(pip --no-index). 인터넷이 되면 --online
+cp config/config.example.yaml config/config.yaml   # 값 채우기, 권한 600
+bin/migrate.sh                      # alembic upgrade head
+bin/start.sh
+```
+
+- `LCA_INSTALL_PYTHON`(기본 `python3.12`)으로 venv를 만들 python을 지정한다
+- `LCA_PKG_PYTHON`, `LCA_PKG_PLATFORMS`로 받을 wheel의 Python 버전과 플랫폼을 바꾼다
+- 의존성을 바꿨으면 `bin/download-packages.sh --lock`으로 `packages/requirements.txt`를 다시 만들어 커밋한다
+
+## 운영 스크립트
+
+모든 스크립트는 설치 디렉터리(`bin/`의 상위)에서 실행되고, 설정은 `config/config.yaml`(`LCA_CONFIG`로 변경 가능)을 쓴다. 서비스는 `server`(API), `worker`(dispatcher + sweeper)이고, 생략하면 둘 다다.
+
+| 스크립트 | 동작 |
+|---|---|
+| `bin/start.sh [server\|worker\|all]` | 백그라운드로 시작. PID는 `logs/<서비스>.pid`, 표준출력은 `logs/<서비스>.out`. server는 `/readyz`가 ok가 될 때까지(최대 30초) 기다린다. 이미 실행 중이면 건너뛴다 |
+| `bin/stop.sh [server\|worker\|all]` | SIGTERM 후 graceful shutdown을 기다린다. `LCA_STOP_TIMEOUT`초(기본 45) 안에 끝나지 않으면 프로세스 세션 전체를 SIGKILL |
+| `bin/restart.sh [server\|worker\|all]` | stop 후 start |
+| `bin/status.sh [server\|worker\|all] [--wait 초]` | 실행 여부와 server `/readyz`. 모두 정상이면 0, 아니면 3 |
+| `bin/migrate.sh [alembic 인자]` | 기본 `upgrade head`. 예: `bin/migrate.sh current` |
+| `bin/install.sh [--online]` | `.venv` 생성과 의존 패키지 설치 |
+| `bin/download-packages.sh [--lock]` | airgap용 wheel 받기 |
+
+- PID 파일이 남아 있어도 그 PID가 이 서비스의 python 프로세스가 아니면 중지된 것으로 본다
+- bin 스크립트와 systemd 중 하나만 쓴다
+
+## systemd
+
+`bin/systemd/`에 서비스 파일 두 개와 설치 스크립트가 있다.
+
+| 파일 | 내용 |
+|---|---|
+| `load-control-api.service` | API 서버. `TimeoutStopSec=45`, 실패 시 5초 뒤 재시작 |
+| `load-control-worker.service` | dispatcher + sweeper |
+| `install.sh` | `@LCA_HOME@`(설치 디렉터리), `@LCA_USER@`(실행 사용자)를 채워 `/etc/systemd/system`에 설치하고 enable |
+
+```bash
+bin/stop.sh                                   # bin/start.sh로 띄운 프로세스가 있으면 먼저 멈춘다
+sudo bin/systemd/install.sh [실행 사용자]     # 기본: 설치 디렉터리 소유자
+sudo systemctl start load-control-api load-control-worker
+systemctl status load-control-api load-control-worker
+sudo bin/systemd/install.sh --uninstall       # 제거
+```
+
+서비스는 bin 스크립트와 같은 명령(`PYTHONPATH=src .venv/bin/python -m load_control.server|worker --config config/config.yaml`)을 설치 디렉터리에서 실행한다. 표준출력은 journal(`journalctl -u load-control-api`)로 가고, 로그 파일은 아래와 같다.
+
+## 로그
+
+| 파일 | 내용 |
+|---|---|
+| `logs/server.log` | API 로그. 요청 수신·응답, 상태 전이, 오류 |
+| `logs/worker.log` | worker 로그. NiFi 호출(dispatch), sweeper 조치 |
+| `logs/server.out`, `logs/worker.out` | bin 스크립트로 띄웠을 때의 표준출력(시작 실패 등). `logging.stdout: true`면 같은 로그가 중복된다 |
+
+한 줄 형식(`logging.file.format: text`):
+
+```text
+2026-10-03 04:12:40.557 INFO  [load_control.services.runs] run 생성: ORACLE_INSP_DTL_DAILY 업무일자 2026-09-28 (run_created) runId=ca803dd4-... jobKey=ORACLE_INSP_DTL_DAILY requestId=3f06e0d2-...
+2026-10-03 04:13:35.734 WARN  [load_control.access] API 응답: POST /v1/runs/.../fail → 404 (31.6ms) (api_response) httpStatus=404 runId=... requestId=manual-trace-1 responseBody={"code":"RUN_NOT_FOUND",...}
+```
+
+- 시각은 서버 현지 시각 `YYYY-MM-DD HH:MM:SS.SSS`
+- 메시지는 한글이고 괄호 안이 이벤트 코드다. 이벤트 코드와 메시지는 `src/load_control/log_messages.py`에 있다
+- API 호출마다 `api_request`(수신: 경로, 요청 본문)와 `api_response`(응답: 상태, 소요 ms, 응답 본문) 두 줄을 남긴다. 본문은 `logging.access_body_max`(기본 2000자)에서 자른다. Authorization 헤더는 남기지 않는다
+- 같은 요청의 모든 로그에 `requestId`(NiFi가 보낸 `X-Request-Id`)와 경로의 `runId`, `partitionId`가 붙는다. 추적은 `grep <runId> logs/*.log` 또는 `grep <requestId> logs/server.log`
+- worker는 NiFi 호출 전(`dispatch_sending`: URL, 본문)과 후(`dispatch_sent`/`dispatch_retry`/`dispatch_dead`: 상태, 소요 ms)를 남긴다
+- 수집기로 보낼 때는 `logging.file.format: json`으로 바꾼다(같은 필드, 한 줄 JSON)
+- 파일은 `logging.file.max_bytes`마다 회전한다. `server.workers`가 2 이상이면 여러 프로세스가 같은 파일을 회전하므로, 회전은 logrotate(copytruncate)에 맡기고 `max_bytes`를 크게 둔다. `logs/*.out`도 logrotate로 회전한다
 
 ## 설정
 
-설정은 `config.yaml` 하나로 관리한다. 항목 설명은 [`config.example.yaml`](./config.example.yaml)에 있다.
+설정은 `config/config.yaml` 하나로 관리한다. 항목 설명은 [`config/config.example.yaml`](./config/config.example.yaml)에 있다. DB 비밀번호도 URL에 평문으로 적는다. 파일 권한을 `600`으로 두고 git에 올리지 않는다(`.gitignore`). 로그에는 DB host와 이름만 남는다.
 
-- 파일 위치: `LCA_CONFIG` 환경변수, 없으면 현재 디렉터리의 `config.yaml`. 파일이 없으면 시작하지 않는다.
-- 우선순위: 환경변수 > `config.yaml` > 기본값. 비밀값은 `LCA_DATABASE__URL`처럼 환경변수로 덮어쓸 수 있다(섹션 구분자 `__`).
+- 파일 위치: `--config`, 없으면 `LCA_CONFIG` 환경변수, 그것도 없으면 현재 디렉터리의 `config/config.yaml`. 파일이 없으면 시작하지 않는다.
+- 우선순위: 환경변수 > `config.yaml` > 기본값. `LCA_DATABASE__URL`처럼 환경변수로 덮어쓸 수 있다(섹션 구분자 `__`).
 - 모르는 키(오타)나 잘못된 값이 있으면 시작하지 않는다.
 - 기간 값은 ISO 8601(`PT90M`) 또는 초 단위 숫자.
+- 상대 경로(`logging.file.path` 등)는 설치 디렉터리 기준이다(bin 스크립트가 그 디렉터리에서 실행한다).
 
 | 섹션 | 내용 |
 |---|---|
-| `server` | API bind address(`host`), `port`, 프로세스 수(`workers`), 프록시 헤더, graceful shutdown, 선택적 TLS/mTLS |
+| `server` | API bind address(`host`), `port`, 프로세스 수(`workers`), 프록시 헤더, graceful shutdown, 선택적 TLS |
 | `database` | DB URL(런타임, migration, LISTEN), pool |
 | `auth` | role별 토큰 digest |
 | `nifi` | worker가 NiFi PG-05를 호출할 주소(HTTP) |
 | `recovery`, `dispatch` | sweeper·outbox 기준 |
 | `cleanup` | 정리 대상 보존 기간(`success_retention` 3일, `failed_retention` 14일), `max_batch` |
 | `worker` | worker `/metrics` bind address와 port |
-| `logging` | 수준, 형식(json/console), 표준출력, 회전 파일, access 로그 on/off, logger별 수준 |
-
-## 개발 환경
-
-```bash
-uv venv -p 3.12 .venv
-uv pip install -p .venv/bin/python -e ".[dev]"
-cp config.example.yaml config.yaml   # 값 채우기 (config.yaml은 git에 올리지 않음)
-```
+| `logging` | 수준, 형식(text/json/console), 표준출력, 회전 파일(`{service}` → server·worker), API 수신·응답 로그와 본문, logger별 수준 |
 
 토큰 digest 생성:
 
 ```bash
-.venv/bin/python -m load_control.security '<token>'
+PYTHONPATH=src .venv/bin/python -m load_control.security '<token>'
 ```
 
 ## Migration
 
 ```bash
-# config.yaml의 database.migration_url(없으면 database.url)을 쓴다
-.venv/bin/alembic upgrade head
+bin/migrate.sh            # config의 database.migration_url(없으면 database.url)로 upgrade head
 ```
 
+- 설정 파일은 `config/alembic.ini`, migration 스크립트는 `src/migrations/`다.
 - 버전 테이블은 `nifi_ops.alembic_version`이다.
-- 가이드 4.1 DDL로 이미 수동 생성한 DB는 `alembic stamp 0001_nifi_ops_baseline`으로 기준점만 맞춘다.
+- 가이드 4.1 DDL로 이미 수동 생성한 DB는 `bin/migrate.sh stamp 0001_nifi_ops_baseline`으로 기준점만 맞춘다.
 - `load_control_api`, `nifi_runtime` 역할이 있으면 권한도 함께 부여한다. 역할 생성은 DBA가 한다.
 
-## 실행
+## 실행 상세
+
+운영은 bin 스크립트로 한다. 스크립트가 실행하는 명령은 다음과 같다.
 
 ```bash
-# API: config.yaml의 server 섹션(host, port, workers, TLS 등)으로 uvicorn 실행. Dockerfile 기본 명령과 같다
-python -m load_control.server --config config.yaml      # 또는 설치 후 load-control-api
-
-# worker (dispatcher + sweeper). 같은 이미지에서 명령만 바꿔 2개 띄운다
-python -m load_control.worker --config config.yaml      # 또는 load-control-worker
-
-# 개발 중 자동 재시작
-LCA_CONFIG=config.yaml .venv/bin/uvicorn --factory load_control.main:create_app --reload --port 8080
+PYTHONPATH=src .venv/bin/python -m load_control.server --config config/config.yaml   # API
+PYTHONPATH=src .venv/bin/python -m load_control.worker --config config/config.yaml   # worker
 ```
-
-`--config`를 주지 않으면 `LCA_CONFIG`, 그것도 없으면 현재 디렉터리의 `config.yaml`을 읽는다.
 
 worker는 `nifi.receiver_url`(NiFi LB의 PG-05 주소)이 없으면 시작하지 않는다. `database.listen_dsn`이 없으면 NOTIFY 없이 `dispatch.poll_interval`마다 폴링만 한다. SIGTERM을 받으면 진행 중인 작업을 끝내고 종료한다. 여러 개를 띄워도 lease와 advisory lock 때문에 같은 dispatch를 두 번 보내거나 같은 정리를 두 번 하지 않는다.
 
@@ -108,23 +187,35 @@ worker는 `nifi.receiver_url`(NiFi LB의 PG-05 주소)이 없으면 시작하지
 - worker `/metrics`: `worker.metrics_host`:`worker.metrics_port`(기본 0.0.0.0:9100). dispatch backlog, 활성 run 수, sweeper 처리 건수.
 - OpenAPI 문서: `/docs`, `/openapi.json`
 
-## 테스트
+## 개발 환경과 테스트
+
+개발 도구(pytest, ruff, mypy)는 운영 `.venv`와 분리한 `.venv-dev`에 둔다.
+
+```bash
+uv venv -p 3.12 .venv-dev
+uv pip install -p .venv-dev/bin/python -e ".[dev]"
+
+# 개발 중 자동 재시작
+LCA_CONFIG=config/config.yaml .venv-dev/bin/python -m uvicorn --factory load_control.main:create_app --reload --port 8080
+```
 
 테스트는 실제 PostgreSQL이 필요하다. 동시성 규칙(run 행 잠금, CAS, partial unique index)은 mock으로 검증할 수 없기 때문이다.
 
 ```bash
 # 이미 떠 있는 PostgreSQL 사용 (DB는 비어 있어야 함, 테스트마다 nifi_ops 테이블을 TRUNCATE)
-LCA_TEST_DATABASE_URL=postgresql+asyncpg://postgres@127.0.0.1:5432/lca_test .venv/bin/pytest
+LCA_TEST_DATABASE_URL=postgresql+asyncpg://postgres@127.0.0.1:5432/lca_test .venv-dev/bin/python -m pytest
 
 # Docker가 있으면 testcontainers가 postgres:16-alpine을 띄운다
-.venv/bin/pytest
+.venv-dev/bin/python -m pytest
 
-.venv/bin/ruff check .
-.venv/bin/mypy src
+.venv-dev/bin/python -m ruff check src
+.venv-dev/bin/python -m mypy src/load_control
 
 # 커버리지(greenlet 추적 설정은 pyproject.toml에 있음)
-.venv/bin/pytest --cov
+.venv-dev/bin/python -m pytest --cov
 ```
+
+`test_dispatcher.py::test_listen_reconnects_after_connection_loss`는 서버 전체의 `LISTEN` 연결 수를 센다. 같은 PostgreSQL에 다른 worker가 붙어 있으면 실패하고, 그 worker의 LISTEN 연결도 끊는다(worker는 다시 연결한다).
 
 주요 동시성 테스트:
 
@@ -133,4 +224,4 @@ LCA_TEST_DATABASE_URL=postgresql+asyncpg://postgres@127.0.0.1:5432/lca_test .ven
 - `test_validation_start.py`, `test_publish_flow.py`: 동시 검증 시작·동시 publish claim에서 승자 1명
 - `test_sweeper.py`: 여러 sweeper가 동시에 돌아도 같은 run을 한 번만 정리
 
-`tests/test_concurrency.py`는 마지막 파티션들의 chunk를 `asyncio.gather`로 동시에 보고해 검증 호출 예약이 정확히 1회인지 확인한다. run 행 잠금과 run 행 UPDATE를 모두 제거하면 "아무도 run을 완료하지 못하는" 경합이 재현되어 이 테스트가 실패한다.
+`src/tests/test_concurrency.py`는 마지막 파티션들의 chunk를 `asyncio.gather`로 동시에 보고해 검증 호출 예약이 정확히 1회인지 확인한다. run 행 잠금과 run 행 UPDATE를 모두 제거하면 "아무도 run을 완료하지 못하는" 경합이 재현되어 이 테스트가 실패한다.

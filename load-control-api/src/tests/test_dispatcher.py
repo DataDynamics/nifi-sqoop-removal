@@ -6,7 +6,6 @@ from uuid import UUID
 import httpx
 import pytest
 import respx
-from pydantic import SecretStr
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from load_control.config import Settings
@@ -27,7 +26,7 @@ def worker_settings(settings: Settings, migrated_url: str) -> Settings:
         nifi={"receiver_url": NIFI},
         dispatch={"max_attempts": 3, "backoff_min": timedelta(seconds=5),
                   "backoff_max": timedelta(minutes=1), "poll_interval": timedelta(seconds=60)},
-        database={"listen_dsn": SecretStr(migrated_url.replace("+asyncpg", ""))},
+        database={"listen_dsn": migrated_url.replace("+asyncpg", "")},
     )
 
 

@@ -152,16 +152,15 @@ PARTITIONED BY (base_dt STRING) STORED AS PARQUET TBLPROPERTIES ('external.table
 
 ```bash
 cd load-control-api
-# 관리 DB migration
-LCA_CONFIG=config.yaml alembic upgrade head
-# NiFi용 토큰의 digest를 만들어 config.yaml auth.token_digests.nifi에 넣는다
-python -m load_control.security "<nifi-token>"
-# API와 worker(dispatcher + sweeper) 실행
-python -m load_control.server --config config.yaml
-python -m load_control.worker --config config.yaml
+bin/install.sh                       # .venv 생성(airgap: packages/의 wheel 사용)
+cp config/config.example.yaml config/config.yaml
+# NiFi용 토큰의 digest를 만들어 config/config.yaml auth.token_digests.nifi에 넣는다
+PYTHONPATH=src .venv/bin/python -m load_control.security "<nifi-token>"
+bin/migrate.sh                       # 관리 DB migration
+bin/start.sh                         # API와 worker(dispatcher + sweeper). 상태는 bin/status.sh, 중지는 bin/stop.sh
 ```
 
-`config.yaml`의 `nifi.receiver_url`은 `http://<nifi-host>:<CONTROL.LISTEN.PORT>`로 둔다. 정리 보존 기간은 `cleanup.success_retention`(기본 `P3D`)과 `cleanup.failed_retention`(기본 `P14D`)이다. migration `0002_run_cleanup`이 `load_run.cleaned_at`을 추가한다. `curl <API>/readyz`가 `{"status":"ok"}`면 준비된 것이다.
+`config/config.yaml`의 `nifi.receiver_url`은 `http://<nifi-host>:<CONTROL.LISTEN.PORT>`로 둔다. 정리 보존 기간은 `cleanup.success_retention`(기본 `P3D`)과 `cleanup.failed_retention`(기본 `P14D`)이다. migration `0002_run_cleanup`이 `load_run.cleaned_at`을 추가한다. `curl <API>/readyz`가 `{"status":"ok"}`면 준비된 것이다.
 
 ## 4. 설정 파일
 

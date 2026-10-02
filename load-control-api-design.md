@@ -516,8 +516,8 @@ ORM을 쓰지 않는 이유: 이 API의 핵심은 `SELECT ... FOR UPDATE`, 조�
 
 | 프로세스 | 진입점 | 역할 | 인스턴스 |
 |---|---|---|---|
-| `api` | `python -m load_control.server --config config.yaml` | HTTP 엔드포인트(5장). bind address·port·workers는 `server` 섹션 | 2개 이상, LB 뒤 |
-| `worker` | `python -m load_control.worker --config config.yaml` | dispatcher(4장), sweeper(7장) | 2개(활성-활성) |
+| `api` | `bin/start.sh server`(`python -m load_control.server --config config/config.yaml`) | HTTP 엔드포인트(5장). bind address·port·workers는 `server` 섹션 | 2개 이상, LB 뒤 |
+| `worker` | `bin/start.sh worker`(`python -m load_control.worker --config config/config.yaml`) | dispatcher(4장), sweeper(7장) | 2개(활성-활성) |
 
 dispatcher와 sweeper를 HTTP 프로세스와 분리하는 이유는 다음과 같다.
 
@@ -531,14 +531,16 @@ dispatcher와 sweeper를 HTTP 프로세스와 분리하는 이유는 다음과 �
 
 ```text
 load-control-api/
-├── pyproject.toml
-├── alembic.ini
-├── config.example.yaml
-├── alembic/
+├── pyproject.toml, Dockerfile
+├── bin/                   # start.sh stop.sh restart.sh status.sh migrate.sh install.sh download-packages.sh
+├── config/                # config.example.yaml, alembic.ini, config.yaml(git 제외)
+├── logs/                  # *.out, load-control.log, *.pid(git 제외)
+├── packages/              # airgap 설치용 wheel(git 제외), requirements.txt
+├── src/migrations/
 │   ├── env.py
 │   └── versions/
 │       ├── 0001_nifi_ops_baseline.py      # 가이드 4.1 DDL
-│       └── 0002_...py
+│       └── 0002_run_cleanup.py
 ├── src/load_control/
 │   ├── main.py            # create_app() factory, lifespan, router 등록, 예외 처리기
 │   ├── server.py          # API 진입점: config.yaml의 server 섹션으로 uvicorn 실행
@@ -561,7 +563,7 @@ load-control-api/
 │       ├── __main__.py    # dispatcher + sweeper 실행
 │       ├── dispatcher.py
 │       └── sweeper.py
-└── tests/
+└── src/tests/
     ├── conftest.py        # testcontainers PostgreSQL, alembic upgrade
     ├── test_partitions.py test_concurrency.py test_dispatcher.py test_sweeper.py
     ├── test_validation_start.py test_publish_flow.py test_ops.py ...
@@ -574,7 +576,7 @@ load-control-api/
 
 ### 9.4 설정과 요청 모델
 
-설정은 `config.yaml` 하나로 관리한다. 전체 예시와 각 항목 설명은 [`load-control-api/config.example.yaml`](./load-control-api/config.example.yaml)에 있다.
+설정은 `config/config.yaml` 하나로 관리한다. 전체 예시와 각 항목 설명은 [`load-control-api/config/config.example.yaml`](./load-control-api/config/config.example.yaml)에 있다.
 
 ```yaml
 database:
@@ -617,7 +619,7 @@ logging:
 - 기간은 ISO 8601(`PT90M`, `PT6H`) 또는 초 단위 숫자로 쓴다.
 - `recovery.stale <= recovery.extract_query_timeout`이면 검증 오류로 시작을 거부한다.
 - 비밀값(DB URL)은 `SecretStr`이라 로그와 `repr`에 찍히지 않는다.
-- `config.yaml`은 git에 올리지 않는다(`.gitignore`). 저장소에는 `config.example.yaml`만 둔다.
+- `config/config.yaml`은 git에 올리지 않는다(`.gitignore`). 저장소에는 `config/config.example.yaml`만 둔다.
 
 ```python
 # schemas/partitions.py
@@ -909,11 +911,14 @@ sweeper는 tick마다 한 트랜잭션에서 `pg_try_advisory_xact_lock(hashtext
 ```yaml
 logging:
   level: INFO              # root 수준
-  format: json             # 표준출력 형식: json | console
-  stdout: true
-  access_log: true         # API 요청 로그(/healthz, /readyz, /metrics 제외)
-  file:                    # 선택. 파일은 항상 json, 크기 기준 회전
-    path: /var/log/load-control/load-control.log
+  format: text             # 표준출력 형식: text | json | console
+  stdout: false            # bin 스크립트 실행 시 logs/*.out 중복을 피한다. 컨테이너·journal 수집이면 true
+  access_log: true         # API 수신·응답 로그(/healthz, /readyz, /metrics 제외)
+  access_body: true        # 요청·응답 본문 포함
+  access_body_max: 2000
+  file:                    # 선택. 크기 기준 회전
+    path: logs/{service}.log   # server.log, worker.log
+    format: text           # text | json
     max_bytes: 104857600
     backup_count: 10
   loggers:                 # logger별 수준
@@ -921,11 +926,13 @@ logging:
     load_control: INFO           # 판정 과정을 자세히 보려면 DEBUG
 ```
 
-- structlog 이벤트와 stdlib 로그(uvicorn, SQLAlchemy, alembic, asyncpg)가 같은 handler와 형식으로 나온다. uvicorn 자체 access 로그는 끄고, 미들웨어가 구조화 access 로그를 남긴다.
+- structlog 이벤트와 stdlib 로그(uvicorn, SQLAlchemy, alembic, asyncpg)가 같은 handler와 형식으로 나온다. uvicorn 자체 access 로그는 끄고, 미들웨어가 API 수신(`api_request`)·응답(`api_response`) 로그를 남긴다.
+- 시각은 서버 현지 시각 `YYYY-MM-DD HH:MM:SS.SSS`. 코드는 영어 이벤트 코드와 필드만 쓰고, 로그를 쓸 때 `log_messages.py`의 표로 한글 `message`를 붙인다. text 형식은 `시각 수준 [logger] 한글 메시지 (이벤트 코드) key=value ...` 한 줄이다.
 - request id: NiFi `InvokeHTTP` 동적 속성으로 `X-Request-Id: ${UUID()}`를 보내고, 없으면 API가 생성한다. 응답 헤더와 그 요청 중에 남는 모든 로그에 `requestId`로 붙는다.
-- access 로그 수준: 2xx·3xx는 INFO, 4xx는 WARNING, 5xx는 ERROR. 필드는 `method`, `endpoint`(경로 템플릿), `httpStatus`, `durationMs`, `runId`, `partitionId`, `role`, `client`, `requestId`.
+- API 로그: 수신은 INFO(`method`, `path`, `client`, `xRunId`, `requestBody`). 응답은 2xx·3xx INFO, 4xx WARNING, 5xx ERROR(`endpoint`(경로 템플릿), `httpStatus`, `durationMs`, `role`, `responseBody`). 경로의 `runId`, `partitionId`와 `requestId`는 그 요청의 모든 로그(서비스 로그 포함)에 붙는다. 본문은 `access_body_max`에서 자르고 Authorization 헤더는 남기지 않는다.
+- worker의 NiFi 호출: `dispatch_sending`(URL, 본문), `dispatch_sent`(상태, `durationMs`), `dispatch_retry`, `dispatch_dead`.
 - 업무 로그(`load_control.services.*`): 상태 전이(`run_created`, `manifest_registered`, `partition_claimed`, `partition_success`, `extract_validated`, `validation_started`, `stage_validated`, `publish_claimed`, `publish_result`, `run_success`)는 INFO, 정상 경합(`partition_claim_refused`, `validation_start_duplicate`)도 INFO, 소유권 충돌·거부(`chunk_claim_mismatch`, `chunk_conflict_after_success` 등)는 WARNING, 실패(`run_failed`, `partition_failed`, `partition_row_mismatch`, `manifest_invalid`)는 ERROR, 멱등 재요청과 진행 중 chunk(`chunk_recorded`)는 DEBUG다.
-- 비밀값: DB URL은 호스트·포트·DB 이름만 남기고, 토큰은 digest 앞 8자리만 남긴다.
+- 비밀값: `config.yaml`에는 DB 비밀번호를 평문으로 둔다(권한 600, git 제외). 로그에는 DB URL의 호스트·포트·DB 이름만 남기고, 토큰은 digest 앞 8자리만 남긴다.
 - `load_event` 테이블(가이드 14.4)은 업무 이벤트의 영속 기록이고, 애플리케이션 로그는 운영 진단용이다. 둘 다 `runId`로 대조한다.
 - Prometheus 메트릭(`GET /metrics`):
 

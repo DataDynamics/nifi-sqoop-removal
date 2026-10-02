@@ -44,7 +44,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         """DB 연결 pool을 프로세스 수명 동안 하나 만들고 종료 시 닫는다."""
         app.state.engine = make_engine(settings)
-        db = make_url(settings.database.url.get_secret_value())
+        db = make_url(settings.database.url)
         # 비밀번호가 로그에 남지 않도록 호스트·DB 이름만 기록한다.
         log.info("api_started", version=__version__, dbHost=db.host, dbPort=db.port,
                  dbName=db.database, poolSize=settings.database.pool_size,
@@ -62,7 +62,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                   root_path=settings.server.root_path,
                   description="Sqoop 대체 적재의 상태 원장 기록과 완료 판정(load-control-api-design.md).")
     app.state.settings = settings
-    app.add_middleware(RequestContextMiddleware, access_log=settings.logging.access_log)
+    app.add_middleware(RequestContextMiddleware, access_log=settings.logging.access_log,
+                       access_body=settings.logging.access_body,
+                       access_body_max=settings.logging.access_body_max)
 
     @app.exception_handler(ApiError)
     async def api_error(request: Request, exc: ApiError) -> JSONResponse:

@@ -45,13 +45,13 @@ async def run_worker(settings: Settings, stop: asyncio.Event) -> None:
 def main(argv: list[str] | None = None) -> None:
     """설정을 읽고 worker를 실행한다. SIGTERM/SIGINT로 정상 종료한다."""
     parser = argparse.ArgumentParser(description="Load Control worker (dispatcher + sweeper)")
-    parser.add_argument("--config", help=f"config.yaml 경로(기본: ${CONFIG_ENV} 또는 ./config.yaml)")
+    parser.add_argument("--config", help=f"config.yaml 경로(기본: ${CONFIG_ENV} 또는 ./config/config.yaml)")
     args = parser.parse_args(argv)
     if args.config:
         os.environ[CONFIG_ENV] = args.config
 
     settings = Settings.load()
-    configure_logging(settings.logging)
+    configure_logging(settings.logging, service="worker")
     if settings.nifi.receiver_url is None:
         raise SystemExit("nifi.receiver_url must be set in config.yaml for the worker")
     if settings.worker.metrics_port:

@@ -67,6 +67,11 @@ NiFi root
     └── PG-90 Error and Event
 ```
 
+> [!IMPORTANT]
+> 위 `JOB_<JOB.KEY>` 구조는 원천 테이블마다 하나씩 생성한다. 예를 들어 Oracle 테이블 6개면 Job PG 6개,
+> Job별 자식 PG 8개로 총 48개의 자식 PG가 생기며, PG-05만 하나를 공유한다. 빌더는 설정을 템플릿처럼
+> 사용해 생성 작업을 자동화하지만, 생성된 Processor를 여러 Job이 공유하지는 않는다.
+
 ```mermaid
 flowchart LR
     T[PG-00] -->|start-run| C[PG-10]
@@ -83,6 +88,10 @@ flowchart LR
 Trigger 00과 Cleanup 70만 Primary Node에서 실행한다. 다른 Processor는 All Nodes다. PG-20의 실질적인
 최대 병렬도는 `NiFi 노드 수 × 34_Execute_Partition_Query Concurrent Tasks`이며 Oracle 연결 풀과
 승인 세션 수보다 크면 안 된다.
+
+6개 Job을 동시에 실행하면 이 병렬도와 Oracle 연결 풀이 Job별로 존재한다. 전체 Oracle 최대 부하는
+`동시 실행 Job 수 × NiFi 노드 수 × Job별 PG-20 Concurrent Tasks`를 기준으로 계산하고, PG-10의 SCN·manifest
+조회 연결도 여유분에 포함한다.
 
 ## 4. 식별자와 산출물 격리
 

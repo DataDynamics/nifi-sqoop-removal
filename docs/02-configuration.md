@@ -18,7 +18,326 @@
 - Job Parameter Context는 빌드 때 삭제 후 다시 만든다. 같은 Job PG가 있으면 빌더가 중단된다.
 - Load Control API는 알 수 없는 설정 키를 거부하므로 오타가 있으면 시작되지 않는다.
 
-## 2. NiFi 빌더 최상위 구조
+## 2. PoC 검증에 사용한 예시
+
+아래 값은 [`poc/VERIFICATION.md`](../poc/VERIFICATION.md)에 기록된 실제 검증 시나리오와
+[`poc/config.v4.example.json`](../poc/config.v4.example.json)을 한곳에서 볼 수 있도록 정리한 것이다.
+비밀번호·token·호스트명은 저장소에 남기지 않았으므로 placeholder를 실제 환경 값으로 바꿔야 한다.
+
+### 2.1 시험 환경과 원천 데이터 기준값
+
+| 항목 | 검증값 |
+|---|---|
+| NiFi | CFM 4.12 / NiFi 2.6.0, 2노드, 비보안 |
+| Oracle | Oracle Database 23ai Free, ojdbc11 21.15 |
+| HDFS/Hive | Hadoop 3.4.1, Hive 4.0.1 |
+| 관리 DB | PostgreSQL 16 |
+| 원천 | `APP.INSP_DTL` |
+| 업무일자 | `2026-09-28` |
+| 전체 건수 | `105,000` |
+| split column | `INSP_DTL_SEQ`, 최솟값 `1`, 최댓값 `120000`, NULL `0`건 |
+| 의도적 공백 | `30001`~`45000`이 없음 |
+| 파티션 | 8개 중 `0002`가 0건, 나머지 7개는 각 15,000건 |
+| 금액 합계 | `71,853,075` |
+| 검증 결과 | source = extracted = staging = target = `105,000`, 모든 STAGING/TARGET 지표 PASS |
+
+이 데이터는 0건 파티션이 worker로 전달되지 않는지와 2노드 분산 추출을 동시에 확인하도록 구성했다.
+8개 파티션의 기대 범위와 건수는 다음과 같다.
+
+| partition ID | 조건 | 기대 건수 |
+|---|---|---:|
+| `0000` | `1 <= seq < 15001` | 15,000 |
+| `0001` | `15001 <= seq < 30001` | 15,000 |
+| `0002` | `30001 <= seq < 45001` | 0 |
+| `0003` | `45001 <= seq < 60001` | 15,000 |
+| `0004` | `60001 <= seq < 75001` | 15,000 |
+| `0005` | `75001 <= seq < 90001` | 15,000 |
+| `0006` | `90001 <= seq < 105001` | 15,000 |
+| `0007` | `105001 <= seq <= 120000` | 15,000 |
+
+### 2.2 테스트 Job의 NiFi 설정 예시
+
+다음 JSON은 검증 Job의 전체 설정 예시다. `names`를 생략했으므로 기본 이름을 사용한다.
+
+```json
+{
+  "common_params": {
+    "CONTROL.API.URL": "http://<api-host>:8080/v1",
+    "CONTROL.API.AUTHORIZATION": "Bearer <nifi-token>",
+    "CONTROL.API.TIMEOUT": "30 secs",
+    "CONTROL.LISTEN.PORT": "9443",
+    "META.JDBC.URL": "jdbc:postgresql://<meta-host>:5432/nifiops",
+    "META.JDBC.USER": "nifi_runtime",
+    "META.JDBC.PASSWORD": "<secret>",
+    "META.JDBC.DRIVER.PATH": "/opt/nifi/jdbc/postgresql-42.7.3.jar",
+    "ORACLE.JDBC.URL": "jdbc:oracle:thin:@//<oracle-host>:1521/ORCLPDB1",
+    "ORACLE.JDBC.USER": "NIFI_READER",
+    "ORACLE.JDBC.PASSWORD": "<secret>",
+    "ORACLE.JDBC.DRIVER.PATH": "/opt/nifi/jdbc/ojdbc11.jar",
+    "ORACLE.POOL.MAX": "8",
+    "ORACLE.NUMBER.DEFAULT.PRECISION": "38",
+    "ORACLE.NUMBER.DEFAULT.SCALE": "10",
+    "HADOOP.CONF.FILES": "/etc/hadoop/conf/core-site.xml,/etc/hadoop/conf/hdfs-site.xml",
+    "HDFS.STAGE.ROOT": "/data/nifi/stage",
+    "HDFS.PERMISSIONS.UMASK": "027",
+    "EXTRACT.FETCH.SIZE": "5000",
+    "EXTRACT.ROWS.PER.FILE": "500000",
+    "EXTRACT.QUERY.TIMEOUT": "60 min",
+    "HIVE.JDBC.URL": "jdbc:hive2://<hs2-host>:10000/default?hive.resultset.use.unique.column.names=false",
+    "HIVE.JDBC.USER": "nifi",
+    "HIVE.JDBC.PASSWORD": "<secret>",
+    "HIVE.POOL.MAX": "4",
+    "HIVE.QUERY.TIMEOUT": "1800",
+    "CLEANUP.BATCH": "50"
+  },
+  "job_params": {
+    "JOB.KEY": "ORACLE_INSP_DTL_DAILY",
+    "BUSINESS.KEY": "2026-09-28",
+    "SRC.OWNER": "APP",
+    "SRC.TABLE": "INSP_DTL",
+    "SRC.COLUMNS": "INSP_DTL_SEQ, BASE_DT, ITEM_CD, CAST(AMOUNT AS NUMBER(18,2)) AS AMOUNT, REG_TS, NOTE",
+    "SRC.SPLIT.COLUMN": "INSP_DTL_SEQ",
+    "SRC.BASE.WHERE": "BASE_DT = TO_DATE('${load.business.key}', 'YYYY-MM-DD')",
+    "DQ.AMOUNT.COLUMN": "AMOUNT",
+    "DQ.TIMESTAMP.COLUMN": "REG_TS",
+    "PARTITION.COUNT": "8",
+    "HIVE.STAGE.TABLE.PREFIX": "TMP_INSP_DTL_",
+    "ALLOW.EMPTY.SOURCE": "false",
+    "HIVE.STAGE.DB": "stg",
+    "HIVE.STAGE.DDL.COLUMNS": "INSP_DTL_SEQ DECIMAL(19,0), BASE_DT TIMESTAMP, ITEM_CD STRING, AMOUNT DECIMAL(18,2), REG_TS TIMESTAMP, NOTE STRING",
+    "HIVE.TARGET.DB": "dw",
+    "HIVE.TARGET.TABLE": "insp_dtl",
+    "TARGET.PARTITION.CLAUSE": "PARTITION (base_dt='${load.business.key}')",
+    "HIVE.INSERT.COLUMNS": "INSP_DTL_SEQ, ITEM_CD, AMOUNT, REG_TS, NOTE",
+    "TARGET.BUSINESS.WHERE": "base_dt = '${load.business.key}'",
+    "DQ.PK.COLUMN": "INSP_DTL_SEQ"
+  }
+}
+```
+
+테스트 테이블과 Hive staging schema의 대응은 다음과 같다.
+
+| Oracle 추출 결과 | Hive staging | 용도 |
+|---|---|---|
+| `INSP_DTL_SEQ` | `DECIMAL(19,0)` | split 및 PK 중복 검사 |
+| `BASE_DT` | `TIMESTAMP` | 원천 업무일자 컬럼 |
+| `ITEM_CD` | `STRING` | 업무 데이터 |
+| `CAST(AMOUNT AS NUMBER(18,2))` | `DECIMAL(18,2)` | 합계 검증 |
+| `REG_TS` | `TIMESTAMP` | 최소·최대 시각 검증 |
+| `NOTE` | `STRING` | 문자열 적재 검증 |
+
+### 2.3 대응하는 Load Control API 설정 예시
+
+NiFi 예시와 직접 연관되는 API 설정은 다음과 같다. 전체 logging/monitor 설정은
+[`config.example.yaml`](../load-control-api/config/config.example.yaml)을 사용한다.
+
+```yaml
+server:
+  host: 0.0.0.0
+  port: 8080
+  workers: 4
+
+database:
+  url: postgresql+asyncpg://load_control_api:<secret>@<meta-host>:5432/nifiops
+  migration_url: postgresql+asyncpg://nifi_ops_migrator:<secret>@<meta-host>:5432/nifiops
+  listen_dsn: postgresql://load_control_api:<secret>@<meta-host>:5432/nifiops
+  pool_size: 10
+  max_overflow: 5
+  tx_attempts: 3
+
+auth:
+  token_digests:
+    nifi: ["<sha256-of-nifi-token>"]
+    operator: ["<sha256-of-operator-token>"]
+
+nifi:
+  receiver_url: http://<nifi-lb>:9443
+  timeout_seconds: 10
+
+recovery:
+  run_timeout: PT6H
+  extract_query_timeout: PT60M
+  stale: PT90M
+  mode: FAIL
+  max_attempts: 3
+  validation_stale: PT2H
+  publish_stale: PT2H
+  sweeper_interval: PT1M
+
+dispatch:
+  max_attempts: 20
+  backoff_min: PT5S
+  backoff_max: PT5M
+  ack_timeout: PT10M
+  lease: PT60S
+  poll_interval: PT5S
+  batch: 20
+
+cleanup:
+  success_retention: P3D
+  failed_retention: P14D
+  max_batch: 200
+```
+
+두 설정을 함께 적용할 때 다음 값이 서로 맞아야 한다.
+
+- `CONTROL.API.URL`의 host/port와 API `server` 또는 앞단 LB 주소
+- `CONTROL.LISTEN.PORT=9443`과 API `nifi.receiver_url`의 port
+- `EXTRACT.QUERY.TIMEOUT=60 min`과 API `extract_query_timeout=PT60M`
+- API `stale=PT90M`이 query timeout보다 큰 관계
+- NiFi의 Bearer token 원문과 API `auth.token_digests.nifi`의 SHA-256 digest
+
+### 2.4 정상 실행 후 기대값
+
+| 확인 위치 | 기대값 |
+|---|---|
+| `load_run` | 최종 `SUCCESS`, source/extracted/staging/target 모두 `105000` |
+| `load_partition` | 8개 모두 `SUCCESS`; `0002`는 실제 추출 없이 등록 시점 성공 |
+| `load_file` | 활성 파티션 7개의 Parquet chunk 원장 |
+| HDFS | `/data/nifi/stage/ORACLE_INSP_DTL_DAILY/run_id=<run_id>`와 `_SUCCESS` |
+| Hive staging | run 전용 `stg.tmp_insp_dtl_<run-id-hex>` |
+| Hive target | `dw.insp_dtl`의 `base_dt='2026-09-28'` 파티션 105,000건 |
+| validation | 건수, NULL, PK 중복, 금액 합계, 시각 최소·최대 모두 PASS |
+
+## 3. 6개 Oracle 테이블 적용 방법과 현재 제약
+
+> [!IMPORTANT]
+> 현재 빌더는 설정 JSON 하나당 Job PG 전체를 하나 만든다. Oracle 테이블 6개를 처리하려면 설정 파일
+> 6개와 서로 다른 `JOB.KEY` 6개가 필요하고, 빌더를 6번 실행해야 한다. 각 Job에는 PG-00·10·20·40·50·60·70·90이
+> 모두 생성된다. 공통 PG-05와 공통 Parameter Context만 공유한다.
+
+즉, `build_flow_v4.py`가 생성 템플릿 역할을 하므로 NiFi UI에서 Processor를 직접 복사할 필요는 없지만,
+실행 결과는 동일한 Processor 구성을 가진 Job PG 6개다. **한 개의 PG에서 FlowFile 변수만 바꿔 6개
+테이블을 처리하는 구조는 현재 구현되어 있지 않다.** 실행 중 Parameter Context 값을 다른 테이블 값으로
+바꾸는 것도 이미 흐르는 FlowFile과 섞일 수 있으므로 대안으로 사용하면 안 된다.
+
+### 3.1 테이블·Oracle 파티션·split 컬럼 지원 상태
+
+| 요구값 | 현재 설정 | 지원 여부와 적용 방법 |
+|---|---|---|
+| Oracle owner | `SRC.OWNER` | Job별 변경 가능 |
+| Oracle 테이블명 | `SRC.TABLE` | Job별 변경 가능 |
+| Oracle 물리 파티션명 | 전용 Parameter 없음 | `PARTITION(P_...)` 직접 지정은 현재 미지원 |
+| 업무/파티션 조건 | `SRC.BASE.WHERE` | Job별 변경 가능. 파티션 키 조건을 주면 Oracle partition pruning 가능 |
+| Sqoop `--split-by` 컬럼 | `SRC.SPLIT.COLUMN` | Job별 변경 가능하며 병렬 범위 분할에 이미 사용됨 |
+| 논리 분할 수 | `PARTITION.COUNT` | Job별 manifest partition 수 |
+| Hive target 파티션 | `TARGET.PARTITION.CLAUSE` | Job별 변경 가능. Oracle 물리 파티션과 다른 설정 |
+
+여기서 “index column”은 Oracle 인덱스 객체 이름이 아니라 Sqoop `--split-by`에 해당하는 **컬럼명**이다.
+예를 들어 원천이 자동으로 유일한 `LOAD_SEQ`를 채운다면 다음처럼 설정한다.
+
+```json
+{
+  "SRC.TABLE": "TABLE_01",
+  "SRC.SPLIT.COLUMN": "LOAD_SEQ",
+  "PARTITION.COUNT": "8"
+}
+```
+
+현재 구현에서 `SRC.SPLIT.COLUMN`은 다음 위치에 실제로 적용된다.
+
+1. PG-10이 같은 SCN에서 `MIN(LOAD_SEQ)`, `MAX(LOAD_SEQ)`, NULL 수를 계산한다.
+2. 최솟값~최댓값을 `PARTITION.COUNT`개의 연속 범위로 나눈다.
+3. 각 범위의 예상 건수를 manifest에 저장한다.
+4. PG-20이 `LOAD_SEQ >= lower`와 `< upper` 조건으로 병렬 SELECT한다. 마지막 범위만 `<= upper`다.
+5. API가 파티션별 실제 건수를 예상 건수와 비교하고 전체 완료를 판정한다.
+
+따라서 자동 증가·유일·숫자형·업무 범위 내 NOT NULL인 컬럼은 이 방식에 적합하다. Oracle 인덱스는
+Optimizer가 선택하며 Flow 설정에 인덱스 이름을 넣지 않는다. 업무 조건이 `BASE_DT`이고 split 컬럼이
+`LOAD_SEQ`라면 `(BASE_DT, LOAD_SEQ)` 형태의 인덱스 또는 파티션별 local index를 DBA와 검토한다.
+
+적용 전에 각 테이블에서 다음을 확인한다.
+
+```sql
+SELECT COUNT(*) AS total_count,
+       COUNT(LOAD_SEQ) AS non_null_count,
+       COUNT(DISTINCT LOAD_SEQ) AS distinct_count,
+       MIN(LOAD_SEQ) AS min_value,
+       MAX(LOAD_SEQ) AS max_value
+  FROM APP.TABLE_01
+ WHERE BASE_DT = DATE '2026-09-28';
+```
+
+`total_count = non_null_count = distinct_count`여야 가장 안전하다. 값 분포가 한쪽에 몰려 있으면 범위별
+건수가 달라져 병렬 처리 시간이 긴 파티션 하나에 의해 결정될 수 있으므로 manifest 결과도 확인한다.
+
+### 3.2 Oracle 물리 파티션명 처리
+
+현재 SQL은 다음 형태다.
+
+```sql
+FROM #{SRC.OWNER}.#{SRC.TABLE} AS OF SCN <snapshot_scn>
+WHERE #{SRC.BASE.WHERE}
+```
+
+따라서 `SRC.TABLE`에 `TABLE_01 PARTITION(P_20260928)` 같은 SQL 조각을 억지로 넣지 않는다. 식별자 검증,
+cleanup 추적, 설정 리뷰가 어려워진다. 현재 코드 변경 없이 적용하려면 `SRC.BASE.WHERE`에 파티션 키 조건을
+넣어 Oracle이 partition pruning하도록 한다.
+
+```json
+{
+  "SRC.TABLE": "TABLE_01",
+  "SRC.BASE.WHERE": "BASE_DT = TO_DATE('${load.business.key}', 'YYYY-MM-DD')"
+}
+```
+
+반드시 `PARTITION(P_20260928)`처럼 물리 파티션명을 직접 지정해야 한다면 빌더에 별도의
+`SRC.PARTITION.NAME`을 추가하고 PG-10/20의 모든 원천 SQL을 함께 변경해야 한다. 현재 매뉴얼과 빌더에는
+이 기능이 구현되어 있지 않다. 반면 `TARGET.PARTITION.CLAUSE`는 Hive 게시 대상을 정하는 값이며 Oracle
+파티션명으로 사용되지 않는다.
+
+### 3.3 6개 Job 설정 구성
+
+공통 접속값은 여섯 파일에서 완전히 같아야 한다. Job별로 다음 값을 각각 정의한다.
+
+| 구분 | Job별 고유 또는 검토가 필요한 값 |
+|---|---|
+| 식별 | `JOB.KEY`, `BUSINESS.KEY` |
+| 원천 | `SRC.OWNER`, `SRC.TABLE`, `SRC.COLUMNS`, `SRC.BASE.WHERE`, `SRC.SPLIT.COLUMN` |
+| 병렬도 | `PARTITION.COUNT` |
+| 품질 | `DQ.AMOUNT.COLUMN`, `DQ.TIMESTAMP.COLUMN`, `DQ.PK.COLUMN` |
+| staging | `HIVE.STAGE.TABLE.PREFIX`, `HIVE.STAGE.DDL.COLUMNS` |
+| target | `HIVE.TARGET.DB`, `HIVE.TARGET.TABLE`, `TARGET.PARTITION.CLAUSE`, `HIVE.INSERT.COLUMNS`, `TARGET.BUSINESS.WHERE` |
+
+예시 파일 배치:
+
+```text
+config/jobs/
+├── table-01.json  # JOB.KEY=ORACLE_TABLE_01_DAILY, SRC.TABLE=TABLE_01, SRC.SPLIT.COLUMN=TABLE_01_SEQ
+├── table-02.json  # JOB.KEY=ORACLE_TABLE_02_DAILY, SRC.TABLE=TABLE_02, SRC.SPLIT.COLUMN=TABLE_02_SEQ
+├── table-03.json
+├── table-04.json
+├── table-05.json
+└── table-06.json
+```
+
+각 파일로 빌더를 한 번씩 실행한다.
+
+```bash
+python3 poc/build_flow_v4.py http://<nifi-host>:<port>/nifi-api config/jobs/table-01.json
+python3 poc/build_flow_v4.py http://<nifi-host>:<port>/nifi-api config/jobs/table-02.json
+python3 poc/build_flow_v4.py http://<nifi-host>:<port>/nifi-api config/jobs/table-03.json
+python3 poc/build_flow_v4.py http://<nifi-host>:<port>/nifi-api config/jobs/table-04.json
+python3 poc/build_flow_v4.py http://<nifi-host>:<port>/nifi-api config/jobs/table-05.json
+python3 poc/build_flow_v4.py http://<nifi-host>:<port>/nifi-api config/jobs/table-06.json
+```
+
+결과는 `JOB_ORACLE_TABLE_01_DAILY`부터 `JOB_ORACLE_TABLE_06_DAILY`까지 6개의 독립 Job PG다. Job마다
+Trigger, queue, Controller Service, 오류 처리와 상태가 분리되고, root의 PG-05만 6개 Job route를 공유한다.
+
+6개 Job을 동시에 실행할 때는 기본 PG-20 Concurrent Tasks가 노드당 4이므로 2노드 기준 최대 48개의
+파티션 SELECT가 동시에 시작될 수 있다(`6 Job × 2 node × 4 task`). Job별 `ORACLE.POOL.MAX`와 Oracle
+전체 승인 세션을 함께 계산하고, 필요하면 schedule을 분산하거나 Concurrent Tasks를 낮춰 빌더를 수정한다.
+
+### 3.4 단일 Processor 세트가 필요한 경우
+
+한 벌의 Processor가 6개 테이블 설정을 FlowFile attribute로 받아 처리하게 하려면 별도 리팩터링이 필요하다.
+테이블 설정을 run 생성 시 API의 `load_run.parameters`에 저장하고, validation callback과 partition reissue에도
+그 설정을 다시 전달해야 한다. PG-05도 Job별 route가 아닌 공통 route로 바뀌어야 하며, PG-40~60의 정적
+Parameter 참조를 run별 attribute로 교체해야 한다. 현재 구현에 설정 JSON만 추가해서 달성할 수 있는 범위가
+아니므로, 이 구조가 필수라면 별도 개발·회귀 시험 항목으로 잡는다.
+
+## 4. NiFi 빌더 최상위 구조
 
 ```json
 {
@@ -28,7 +347,7 @@
 }
 ```
 
-### 2.1 `names`
+### 4.1 `names`
 
 대부분 생략한다. 여러 Job이 같은 `common_context`와 `control_receiver`를 사용해야 한다.
 
@@ -39,9 +358,9 @@
 | `common_context` | `PC_SQOOP_REPLACEMENT_COMMON` | 공유 Parameter Context |
 | `control_receiver` | `PG-05 Control Receiver` | 공유 수신 PG 이름 |
 
-## 3. NiFi `common_params`
+## 5. NiFi `common_params`
 
-### 3.1 Load Control 연결
+### 5.1 Load Control 연결
 
 | Parameter | 예 | 의미와 결정 기준 |
 |---|---|---|
@@ -54,7 +373,7 @@
 API worker의 `nifi.receiver_url`은 `http://<NiFi LB>:<CONTROL.LISTEN.PORT>`여야 한다. NiFi→API와
 API worker→NiFi 방향의 방화벽을 각각 확인한다.
 
-### 3.2 관리 PostgreSQL
+### 5.2 관리 PostgreSQL
 
 NiFi는 `load_event` INSERT만 수행한다. 상태 테이블은 API만 갱신한다.
 
@@ -65,7 +384,7 @@ NiFi는 `load_event` INSERT만 수행한다. 상태 테이블은 API만 갱신�
 | `META.JDBC.PASSWORD` | NiFi runtime 계정 비밀번호 |
 | `META.JDBC.DRIVER.PATH` | 모든 NiFi 노드의 PostgreSQL JDBC jar 경로 |
 
-### 3.3 Oracle
+### 5.3 Oracle
 
 | Parameter | 예 | 의미와 결정 기준 |
 |---|---|---|
@@ -83,7 +402,7 @@ NiFi는 `load_event` INSERT만 수행한다. 상태 테이블은 API만 갱신�
 정밀도 없는 `NUMBER`는 `SRC.COLUMNS`에서 `CAST(... AS NUMBER(p,s))`로 명시하는 것이 안전하다. 기본
 scale보다 소수 자릿수가 많으면 오류 없이 반올림될 수 있다.
 
-### 3.4 HDFS와 추출
+### 5.4 HDFS와 추출
 
 | Parameter | 예 | 의미와 결정 기준 |
 |---|---|---|
@@ -99,7 +418,7 @@ claim과 메모리 부담이 커진다. 실제 row 크기로 파일 크기를 �
 
 API의 `recovery.extract_query_timeout`을 같은 값으로 두고 `recovery.stale`은 반드시 더 크게 둔다.
 
-### 3.5 Hive
+### 5.5 Hive
 
 | Parameter | 예 | 의미와 결정 기준 |
 |---|---|---|
@@ -111,9 +430,9 @@ API의 `recovery.extract_query_timeout`을 같은 값으로 두고 `recovery.sta
 
 NiFi JVM 시간대와 Hive의 `hive.local.time.zone`은 같아야 한다.
 
-## 4. NiFi `job_params`
+## 6. NiFi `job_params`
 
-### 4.1 Job과 원천 범위
+### 6.1 Job과 원천 범위
 
 | Parameter | 예 | 의미·주의사항 |
 |---|---|---|
@@ -130,7 +449,7 @@ NiFi JVM 시간대와 Hive의 `hive.local.time.zone`은 같아야 한다.
 `SRC.OWNER`, `SRC.TABLE`, column 및 SQL 조각은 Parameter Context를 변경할 수 있는 관리자만 수정해야 한다.
 FlowFile에서 받은 자유 입력을 SQL 식별자나 조건으로 사용하면 안 된다.
 
-### 4.2 데이터 품질
+### 6.2 데이터 품질
 
 | Parameter | 의미 |
 |---|---|
@@ -142,7 +461,7 @@ FlowFile에서 받은 자유 입력을 SQL 식별자나 조건으로 사용하�
 기본 지표로 사용한다. 업무상 허용 오차가 필요하면 PG-40/60의 지표 SQL과 API에 기록하는 result를 함께
 변경한다.
 
-### 4.3 staging과 target
+### 6.3 staging과 target
 
 | Parameter | 예 | 의미·주의사항 |
 |---|---|---|
@@ -158,7 +477,7 @@ FlowFile에서 받은 자유 입력을 SQL 식별자나 조건으로 사용하�
 `TARGET.PARTITION.CLAUSE`와 `TARGET.BUSINESS.WHERE`가 다르면 게시 성공 뒤 target 검증이 실패하거나 잘못된
 범위를 성공으로 오인할 수 있다. 변경 검토 시 두 값을 한 쌍으로 본다.
 
-## 5. Parameter 상호 제약
+## 7. Parameter 상호 제약
 
 | 관계 | 조건 |
 |---|---|
@@ -173,12 +492,12 @@ FlowFile에서 받은 자유 입력을 SQL 식별자나 조건으로 사용하�
 | 시간대 | NiFi JVM timezone = Hive `hive.local.time.zone` |
 | cleanup batch | NiFi `CLEANUP.BATCH` ≤ API `cleanup.max_batch` 권장 |
 
-## 6. Load Control API 설정
+## 8. Load Control API 설정
 
 설정 우선순위는 환경 변수 > `config.yaml` > 기본값이다. 환경 변수의 중첩 구분자는 `__`다.
 예: `LCA_DATABASE__URL`.
 
-### 6.1 `server`
+### 8.1 `server`
 
 | 키 | 기본/예 | 의미 |
 |---|---|---|
@@ -197,7 +516,7 @@ FlowFile에서 받은 자유 입력을 SQL 식별자나 조건으로 사용하�
 현재 프로젝트 전제는 HTTP지만 API 자체 TLS 옵션은 구현되어 있다. LB에서 TLS/mTLS를 종료한다면 앱의 TLS
 필드는 비우고 proxy 신뢰 범위를 제한한다.
 
-### 6.2 `database`
+### 8.2 `database`
 
 | 키 | 의미 |
 |---|---|
@@ -211,7 +530,7 @@ FlowFile에서 받은 자유 입력을 SQL 식별자나 조건으로 사용하�
 최대 DB 연결 수를 계산할 때 `server workers × (pool_size + max_overflow)`와 worker 인스턴스의 pool,
 LISTEN 전용 연결, migration/운영 연결을 합산한다.
 
-### 6.3 `auth`
+### 8.3 `auth`
 
 ```yaml
 auth:
@@ -232,7 +551,7 @@ cd load-control-api
 PYTHONPATH=src .venv/bin/python -m load_control.security '<token>'
 ```
 
-### 6.4 `nifi`
+### 8.4 `nifi`
 
 | 키 | 의미 |
 |---|---|
@@ -242,7 +561,7 @@ PYTHONPATH=src .venv/bin/python -m load_control.security '<token>'
 
 worker는 `receiver_url`이 없으면 시작하지 않는다.
 
-### 6.5 `recovery`
+### 8.5 `recovery`
 
 | 키 | 기본 | 의미 |
 |---|---:|---|
@@ -257,7 +576,7 @@ worker는 `receiver_url`이 없으면 시작하지 않는다.
 
 `REISSUE`는 같은 SCN을 다시 읽으므로 Oracle undo가 충분하다는 증거가 있을 때만 사용한다.
 
-### 6.6 `dispatch`
+### 8.6 `dispatch`
 
 | 키 | 기본 | 의미 |
 |---|---:|---|
@@ -269,7 +588,7 @@ worker는 `receiver_url`이 없으면 시작하지 않는다.
 | `poll_interval` | `PT5S` | NOTIFY 유실 대비 polling |
 | `batch` | `20` | 한 번에 lease하고 병렬 전송할 수 |
 
-### 6.7 `cleanup`, `worker`, `monitor`, `logging`
+### 8.7 `cleanup`, `worker`, `monitor`, `logging`
 
 | 섹션.키 | 기본/예 | 의미 |
 |---|---|---|
@@ -294,7 +613,7 @@ worker는 `receiver_url`이 없으면 시작하지 않는다.
 | `logging.file.backup_count` | `10` | 회전 파일 수 |
 | `logging.loggers` | logger별 | SQL/HTTP 등 개별 수준 |
 
-## 7. 변경 영향도
+## 9. 변경 영향도
 
 | 변경 | 영향 |
 |---|---|

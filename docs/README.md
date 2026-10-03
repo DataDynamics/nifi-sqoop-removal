@@ -2,7 +2,7 @@
 
 이 문서는 Sqoop 기반 Oracle→Hive 적재를 Cloudera CFM의 NiFi Flow와 Load Control API로 전환하고,
 실제 환경에 배포·검증·운영하는 절차를 한곳에 모은 실행 매뉴얼이다. 설명은 현재 저장소의
-`poc/build_flow_v4.py`, Load Control API 구현, 기존 설계 문서를 기준으로 한다.
+`poc/build_flow_v4.py`, Load Control API 구현, PoC 검증 기록을 기준으로 한다.
 
 ![Sqoop replacement proposal architecture](./assets/sqoop-replacement-concept.png)
 
@@ -34,6 +34,13 @@ flowchart LR
 - 검증과 게시는 CAS와 token으로 run당 한 번만 허용한다.
 - 게시 결과가 불명확하면 자동 재게시하지 않고 `PUBLISH_UNKNOWN`으로 멈춘다.
 - 원천, 추출, staging, target의 건수와 품질 지표를 단계마다 비교한다.
+
+> [!IMPORTANT]
+> 현재 `poc/build_flow_v4.py`는 여러 테이블이 한 Processor 세트를 공유하는 런타임 템플릿이 아니다.
+> 설정 JSON 하나를 실행할 때마다 `JOB_<JOB.KEY>` 아래에 PG-00·10·20·40·50·60·70·90 전체를 새로
+> 만든다. 따라서 Oracle 테이블 6개를 이관하려면 서로 다른 `JOB.KEY`를 가진 Job PG 6개와 그 하위 PG
+> 전체가 필요하다. NiFi UI에서 Processor를 직접 복사할 필요는 없지만, 빌더가 같은 구조를 Job별로 생성한다.
+> 단일 PG 한 벌에서 변수만 바꿔 6개 테이블을 동시에 처리하는 구조는 현재 구현 범위가 아니다.
 
 ## 2. 문서 읽는 순서
 

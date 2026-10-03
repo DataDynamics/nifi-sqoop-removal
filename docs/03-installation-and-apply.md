@@ -216,6 +216,11 @@ chmod 600 /secure/path/job-insp-dtl.json
 
 ## 7. Flow 생성
 
+> [!IMPORTANT]
+> 이 절차는 설정 파일 하나당 Job PG 전체(PG-00·10·20·40·50·60·70·90)를 하나 생성한다. 원천 Oracle
+> 테이블이 6개면 서로 다른 `JOB.KEY`와 설정 파일로 이 절차를 6번 수행해야 한다. PG-05만 root에서
+> 공유한다. 빌더가 생성을 자동화하지만 한 Processor 세트를 6개 테이블이 공유하는 구조는 아니다.
+
 저장소 root에서 실행한다.
 
 ```bash

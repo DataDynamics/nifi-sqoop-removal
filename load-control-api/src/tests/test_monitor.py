@@ -80,3 +80,20 @@ async def test_run_list_has_progress(client: httpx.AsyncClient) -> None:
     progress = (item["expectedPartitionCount"], item["successPartitionCount"], item["failedPartitionCount"])
     assert progress == (3, 3, 0)
     assert item["stagingCount"] is None and item["heartbeatAt"]
+
+
+async def test_cleanup_failed_alert_shows_latest_message(client: httpx.AsyncClient,
+                                                         operator: httpx.AsyncClient, db: Db) -> None:
+    """같은 run의 정리 실패가 여러 번이면 경보는 한 건이고 가장 최근 메시지를 보여 준다."""
+    run, _ = await complete_run(client)
+    for minutes, message in [(30, "old failure"), (1, "latest failure"), (20, "middle failure")]:
+        await db.execute(
+            "INSERT INTO nifi_ops.load_event (event_id, event_level, event_name, run_id, job_key,"
+            " business_key, process_group, processor_name, message, event_time)"
+            " SELECT gen_random_uuid(), 'WARN', 'CLEANUP_FAILED', run_id, job_key, business_key,"
+            " 'TEST', 'test', :m, clock_timestamp() - make_interval(mins => :n)"
+            " FROM nifi_ops.load_run WHERE run_id = :id",
+            m=message, n=minutes, id=uuid.UUID(run.run_id))
+    alerts = (await operator.get("/v1/monitor/summary")).json()["alerts"]
+    cleanup = [a for a in alerts if a["kind"] == "CLEANUP_FAILED"]
+    assert len(cleanup) == 1 and cleanup[0]["message"] == "latest failure"

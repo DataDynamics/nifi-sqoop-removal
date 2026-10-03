@@ -138,6 +138,25 @@ async def test_run_deadline(client: httpx.AsyncClient, engine: AsyncEngine, db: 
     assert await db.scalar("SELECT status FROM nifi_ops.load_partition") == "TIMED_OUT"
 
 
+async def test_failing_rule_does_not_block_others(client: httpx.AsyncClient, engine: AsyncEngine, db: Db,
+                                                  settings: Settings,
+                                                  monkeypatch: pytest.MonkeyPatch) -> None:
+    """한 규칙이 계속 실패해도 그 규칙의 변경만 되돌리고 나머지 규칙은 적용된다(규칙별 SAVEPOINT)."""
+    created = await create_run(client)
+    await db.execute("UPDATE nifi_ops.load_run SET started_at = clock_timestamp() - interval '7 hours'")
+
+    async def broken(conn, s, done) -> None:  # type: ignore[no-untyped-def]
+        # DB를 바꾼 뒤 실패한다. 이 변경(business_key 덮어쓰기)은 SAVEPOINT로 되돌려져야 한다.
+        await conn.execute(text("UPDATE nifi_ops.load_run SET business_key = 'BROKEN'"))
+        done["broken"] += 1
+        raise RuntimeError("rule bug")
+
+    monkeypatch.setattr("load_control.worker.sweeper._stale_partitions", broken)
+    assert await sweep_once(engine, settings) == {"timeout_run_deadline": 1}
+    assert await run_status(db, created.run_id) == "TIMED_OUT"
+    assert await db.scalar("SELECT COUNT(*) FROM nifi_ops.load_run WHERE business_key = 'BROKEN'") == 0
+
+
 async def test_requeue_unacked_validation_dispatch(client: httpx.AsyncClient, engine: AsyncEngine, db: Db,
                                                    settings: Settings) -> None:
     """ack_timeout 안에 ACK가 없는 SENT 검증 호출은 PENDING으로 되돌려 다시 보낸다.

@@ -12,6 +12,7 @@ MESSAGES: dict[str, str] = {
     # 프로세스
     "server_starting": "API 서버 시작 중: {host}:{port}, 프로세스 {workers}개",
     "api_started": "API 준비 완료: DB {dbHost}:{dbPort}/{dbName}",
+    "readyz_failed": "준비 확인 실패(DB 연결 안 됨, 503): {error}",
     "api_stopped": "API 종료",
     "auth_not_configured": "인증 토큰 digest가 없어 모든 API 호출이 거부된다",
     "worker_started": "worker 시작: NiFi 수신 주소 {receiverUrl}, 복구 모드 {recoveryMode}",
@@ -92,4 +93,5 @@ MESSAGES: dict[str, str] = {
     # worker: sweeper
     "sweeper_actions": "sweeper 조치",
     "sweeper_error": "sweeper 처리 중 예외",
+    "sweeper_rule_error": "sweeper 규칙 하나가 실패해 그 규칙만 되돌림(다음 주기에 다시 시도)",
 }

@@ -8,6 +8,7 @@ sweeper(worker.sweeper)는 한 트랜잭션 안에서 이 함수들을 차례로
 stale 판정 시각은 모두 clock_timestamp()(실제 현재 시각) 기준이다.
 """
 
+from dataclasses import dataclass
 from datetime import timedelta
 from uuid import UUID
 
@@ -115,12 +116,28 @@ async def runs_past_deadline(conn: AsyncConnection, run_timeout: timedelta) -> l
     return [r[0] for r in rows]
 
 
-async def requeue_unacked_dispatches(conn: AsyncConnection, ack_timeout: timedelta) -> list[UUID]:
-    """SENT 후 ACK가 없고 아직 기다리는 상태면 다시 보낸다.
+@dataclass(frozen=True, slots=True)
+class UnackedDispatch:
+    """requeue_unacked_dispatches가 처리한 dispatch 한 건. status는 처리 뒤 상태(PENDING 또는 DEAD)다."""
 
-    SENT로 기록된 지 ack_timeout이 지났는데 ACKED가 아닌 dispatch를 PENDING으로 되돌리고
-    next_attempt_at을 지금으로 둔다. 되돌린 행의 run_id 목록(중복 가능)을 돌려준다.
-    attempt_count는 초기화하지 않으므로 재전송도 dispatcher의 max_attempts 한도에 포함된다.
+    dispatch_id: UUID
+    run_id: UUID
+    dispatch_type: str
+    partition_id: str | None
+    attempt_count: int
+    status: str
+
+
+async def requeue_unacked_dispatches(conn: AsyncConnection, ack_timeout: timedelta,
+                                     max_attempts: int) -> list[UnackedDispatch]:
+    """SENT 후 ACK가 없고 아직 기다리는 상태면 다시 보내고, 시도를 다 쓴 것은 DEAD로 바꾼다.
+
+    SENT로 기록된 지 ack_timeout이 지났는데 ACKED가 아닌 dispatch가 대상이다.
+    - attempt_count < max_attempts: PENDING으로 되돌리고 next_attempt_at을 지금으로 둔다(다시 보냄).
+    - attempt_count >= max_attempts: DEAD로 바꾼다. NiFi가 202로 받기만 하고 flow를 시작하지 않는 상태
+      (Job PG 정지, PG-05 → Job PG 연결 막힘 등)가 이어지면 무한히 다시 보내는 대신 운영자에게 알린다.
+      dispatcher의 max_attempts 확인은 전송 실패 경로에만 있으므로 여기서 막아야 한다.
+    attempt_count는 초기화하지 않는다(재전송도 한도에 포함). 처리한 행 목록을 돌려준다.
     """
     # run이 아직 그 호출을 기다리는 상태일 때만 되돌린다.
     # - VALIDATE_RUN: run이 EXTRACTED_VALIDATED일 때(검증이 시작되면 STAGE_VALIDATING이 되어 빠진다).
@@ -128,8 +145,11 @@ async def requeue_unacked_dispatches(conn: AsyncConnection, ack_timeout: timedel
     # 이미 의미 없어진 호출을 다시 보내지 않기 위해서다.
     rows = (await conn.execute(text("""
         UPDATE nifi_ops.load_dispatch d
-           SET status = 'PENDING', next_attempt_at = clock_timestamp(),
-               last_error = 'ack timeout, requeued by sweeper'
+           SET status = CASE WHEN d.attempt_count >= :max_attempts THEN 'DEAD' ELSE 'PENDING' END,
+               next_attempt_at = clock_timestamp(),
+               last_error = CASE WHEN d.attempt_count >= :max_attempts
+                                 THEN 'no ack after ' || d.attempt_count || ' attempts (ack timeout)'
+                                 ELSE 'ack timeout, requeued by sweeper' END
           FROM nifi_ops.load_run r
          WHERE r.run_id = d.run_id
            AND d.status = 'SENT'
@@ -139,9 +159,10 @@ async def requeue_unacked_dispatches(conn: AsyncConnection, ack_timeout: timedel
                     AND EXISTS (SELECT 1 FROM nifi_ops.load_partition p
                                  WHERE p.run_id = d.run_id AND p.partition_id = d.partition_id
                                    AND p.status = 'RETRY')))
-        RETURNING d.run_id
-    """), {"ack": ack_timeout})).all()
-    return [r[0] for r in rows]
+        RETURNING d.dispatch_id, d.run_id, d.dispatch_type, d.partition_id, d.attempt_count, d.status
+    """), {"ack": ack_timeout, "max_attempts": max_attempts})).mappings().all()
+    # RETURNING은 UPDATE 뒤의 값을 돌려주므로 status로 되돌림·DEAD를 구분한다.
+    return [UnackedDispatch(**dict(m)) for m in rows]
 
 
 async def alert_stale_runs(conn: AsyncConnection, stale: timedelta) -> int:

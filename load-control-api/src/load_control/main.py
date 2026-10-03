@@ -4,8 +4,10 @@
 개발 중에는 `uvicorn --factory load_control.main:create_app --reload`도 쓸 수 있다.
 """
 
+import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from http import HTTPStatus
 
 import structlog
 from fastapi import FastAPI, Request
@@ -14,6 +16,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import DBAPIError, IntegrityError, InterfaceError, OperationalError
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from load_control import __version__
 from load_control.config import Settings, get_settings
@@ -26,13 +29,17 @@ log = structlog.get_logger(__name__)
 
 
 def _error(request: Request, status: int, code: str, message: str,
-           details: dict[str, object] | None = None) -> JSONResponse:
+           details: dict[str, object] | None = None,
+           headers: dict[str, str] | None = None) -> JSONResponse:
     """모든 오류 응답의 공통 형식: {code, message, requestId, details?}."""
     body: dict[str, object] = {"code": code, "message": message,
                                "requestId": getattr(request.state, "request_id", None)}
     if details:
         body["details"] = details
-    return JSONResponse(status_code=status, content=body)
+    return JSONResponse(status_code=status, content=body, headers=headers)
+
+
+_CODE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -47,8 +54,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     - RequestValidationError: FastAPI 기본 422 응답(본문 형식은 FastAPI 기본값)
     - IntegrityError: unique 위반 409, 외래키 위반 422, 그 밖 422
     - 그 밖의 DBAPIError: 503(NiFi가 재시도한다)
-    인증 실패(security의 HTTPException 401/403)는 여기서 처리하지 않으므로 FastAPI 기본 형식
-    `{"detail": ...}`으로 응답한다.
+    - HTTPException(인증 실패 401/403, 없는 경로 404, 허용되지 않은 method 405 등): 같은 상태 코드.
+      detail이 UNAUTHENTICATED처럼 오류 코드 형식이면 그대로 code로, 아니면 상태 이름(NOT_FOUND 등)을 쓴다.
     """
     settings = settings or get_settings()
     configure_logging(settings.logging)
@@ -88,6 +95,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         """
         log.info("api_error", status=exc.status, code=exc.code, details=exc.details or None)
         return _error(request, exc.status, exc.code, exc.message, exc.details)
+
+    @app.exception_handler(StarletteHTTPException)
+    async def http_error(request: Request, exc: StarletteHTTPException) -> JSONResponse:
+        """FastAPI·Starlette의 HTTPException도 공통 오류 형식으로 바꾼다(requestId로 로그를 찾을 수 있게).
+
+        security.require_role의 401 UNAUTHENTICATED·403 FORBIDDEN과 라우팅 오류(404, 405)가 여기로 온다.
+        응답 헤더(401의 WWW-Authenticate 등)는 그대로 보낸다. 로그는 security와 접근 로그가 이미 남긴다.
+        """
+        try:
+            phrase = HTTPStatus(exc.status_code).phrase
+        except ValueError:
+            phrase = f"HTTP {exc.status_code}"
+        detail = exc.detail if isinstance(exc.detail, str) else ""
+        code = detail if _CODE.match(detail) else phrase.upper().replace(" ", "_").replace("-", "_")
+        return _error(request, exc.status_code, code, phrase if code == detail else detail or phrase,
+                      headers=dict(exc.headers) if exc.headers else None)
 
     @app.exception_handler(RequestValidationError)
     async def validation_error(request: Request, exc: RequestValidationError) -> Response:

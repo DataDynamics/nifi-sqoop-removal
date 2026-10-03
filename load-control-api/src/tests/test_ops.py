@@ -26,6 +26,9 @@ async def test_resolve_publish_unknown(client: httpx.AsyncClient, operator: http
     근거와 결정이 PUBLISH_UNKNOWN_RESOLVED 이벤트로 남는다.
     """
     run_id = await _publish_unknown(client)
+    # PUBLISH_UNKNOWN 보고는 오류 필드를 채운다. PUBLISHED로 확정하면 지워져야 한다.
+    assert await db.scalar("SELECT error_code FROM nifi_ops.load_run WHERE run_id = CAST(:r AS uuid)",
+                           r=run_id) is not None
     url = f"/v1/runs/{run_id}/publish-unknown/resolve"
     body = {"resolution": "PUBLISHED", "reason": "Hive query history에서 성공 확인, target count 일치"}
     assert (await client.post(url, json=body)).status_code == 403  # NiFi 토큰으로는 불가
@@ -36,6 +39,9 @@ async def test_resolve_publish_unknown(client: httpx.AsyncClient, operator: http
     event = await db.one("SELECT message, details->>'resolution' AS resolution FROM nifi_ops.load_event "
                          "WHERE event_name = 'PUBLISH_UNKNOWN_RESOLVED'")
     assert event["resolution"] == "PUBLISHED" and "Hive" in event["message"]
+    run = await db.one("SELECT error_stage, error_code, error_message FROM nifi_ops.load_run "
+                       "WHERE run_id = CAST(:r AS uuid)", r=run_id)
+    assert run == {"error_stage": None, "error_code": None, "error_message": None}
 
 
 async def test_resolve_requires_publish_unknown(client: httpx.AsyncClient,

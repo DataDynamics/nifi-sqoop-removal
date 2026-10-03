@@ -34,6 +34,10 @@ from load_control.repositories.dispatch import LeasedDispatch
 
 log = structlog.get_logger(__name__)
 
+# 다시 보내면 성공할 수 있는 4xx: 408 Request Timeout, 425 Too Early, 429 Too Many Requests.
+# PG-05 앞에 proxy·LB를 두면 생길 수 있다. 나머지 4xx(경로·헤더 오류 등)는 재시도해도 같으므로 바로 DEAD다.
+RETRYABLE_4XX = frozenset({408, 425, 429})
+
 
 def backoff(settings: Settings, attempt: int) -> timedelta:
     """attempt(1부터)에 따른 지수 backoff. min × 2^(attempt-1), 상한 max.
@@ -77,7 +81,7 @@ def target_url(settings: Settings, d: LeasedDispatch) -> str:
         RuntimeError: nifi.receiver_url이 설정되지 않은 경우. send_one이 잡아 DEAD로 처리한다.
     """
     if settings.nifi.receiver_url is None:
-        raise RuntimeError("LCA_NIFI_RECEIVER_URL이 설정되지 않았습니다")
+        raise RuntimeError("nifi.receiver_url이 설정되지 않았습니다(config.yaml 또는 LCA_NIFI__RECEIVER_URL)")
     action = "validate" if d.dispatch_type == "VALIDATE_RUN" else "reissue"
     return f"{str(settings.nifi.receiver_url).rstrip('/')}/{action}/{d.job_key}"
 
@@ -138,7 +142,8 @@ class Dispatcher:
         - httpx 오류(연결 실패, timeout 등): _retry(backoff 또는 최대 시도 초과 시 DEAD).
         - 2xx: SENT로 기록한다. 이후 검증 flow의 /validation/start(또는 재발행 claim)가 ACKED로 바꾸고,
           ack_timeout 안에 ACK가 없으면 sweeper가 PENDING으로 되돌려 다시 보낸다.
-        - 4xx: NiFi 설정 오류(경로·인증 등)로 보고 바로 DEAD.
+        - 4xx: NiFi 설정 오류(경로·인증 등)로 보고 바로 DEAD. 단 RETRYABLE_4XX(408, 425, 429)는
+          일시적 거절(앞단 proxy·LB의 timeout, 요청 제한)이므로 _retry.
         - 그 밖(5xx, 3xx 등): _retry.
 
         HTTP 호출 동안에는 트랜잭션을 열지 않는다. 각 결과 기록은 별도 짧은 트랜잭션이다.
@@ -169,7 +174,7 @@ class Dispatcher:
             log.info("dispatch_sent", dispatchId=str(d.dispatch_id), runId=str(d.run_id),
                      type=d.dispatch_type, httpStatus=r.status_code, attempt=d.attempt_count,
                      durationMs=elapsed_ms, url=url)
-        elif 400 <= r.status_code < 500:
+        elif 400 <= r.status_code < 500 and r.status_code not in RETRYABLE_4XX:
             await self._dead(d, r.status_code, r.text)
         else:
             await self._retry(d, r.status_code, r.text)
@@ -261,7 +266,9 @@ class Dispatcher:
         stop이 set되거나 run()이 태스크를 취소하면 연결을 닫고 끝난다.
         """
         if self.settings.database.listen_dsn is None:
-            log.warning("listen_disabled", reason="LCA_LISTEN_DSN not set; polling only")
+            log.warning("listen_disabled",
+                        reason="database.listen_dsn not set (config.yaml or LCA_DATABASE__LISTEN_DSN); "
+                               "polling only")
             return
         dsn = self.settings.database.listen_dsn
         while not stop.is_set():

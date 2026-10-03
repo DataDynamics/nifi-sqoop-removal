@@ -72,8 +72,8 @@ async def alerts(conn: AsyncConnection, *, window: timedelta, validation_stale: 
     - CLEANUP_FAILED: window 안에 PG-70이 남긴 CLEANUP_FAILED 이벤트 중 아직 정리되지 않은 run(run당 1건).
     """
     # 각 UNION ALL 분기는 같은 컬럼 순서(kind, severity, run_id, job_key, business_key, status, at,
-    # message, dispatch_id)를 지킨다. CLEANUP_FAILED 분기의 DISTINCT ON (e.run_id)는 ORDER BY가 없어
-    # run당 어느 이벤트가 남을지 정해져 있지 않다(한 건만 보여 주는 것이 목적이다).
+    # message, dispatch_id)를 지킨다. CLEANUP_FAILED 분기는 DISTINCT ON (e.run_id)와 event_time DESC로
+    # run당 가장 최근 정리 실패 이벤트 한 건만 보여 준다(ORDER BY를 쓰려고 하위 쿼리로 감쌌다).
     # 이후 run이 정리되면(cleaned_at 기록) NOT EXISTS 조건으로 경보가 사라진다.
     rows = (await conn.execute(text("""
         SELECT * FROM (
@@ -101,13 +101,16 @@ async def alerts(conn: AsyncConnection, *, window: timedelta, validation_stale: 
                 OR (status IN ('CREATED', 'EXTRACTING')
                     AND heartbeat_at < clock_timestamp() - CAST(:stale AS interval))
             UNION ALL
-            SELECT DISTINCT ON (e.run_id) 'CLEANUP_FAILED', 'WARN', e.run_id, e.job_key, e.business_key,
-                   NULL, e.event_time, e.message, NULL
-              FROM nifi_ops.load_event e
-             WHERE e.event_name = 'CLEANUP_FAILED'
-               AND e.event_time >= clock_timestamp() - CAST(:window AS interval)
-               AND NOT EXISTS (SELECT 1 FROM nifi_ops.load_run r
-                                WHERE r.run_id = e.run_id AND r.cleaned_at IS NOT NULL)
+            SELECT * FROM (
+                SELECT DISTINCT ON (e.run_id) 'CLEANUP_FAILED', 'WARN', e.run_id, e.job_key, e.business_key,
+                       NULL, e.event_time, e.message, NULL::uuid
+                  FROM nifi_ops.load_event e
+                 WHERE e.event_name = 'CLEANUP_FAILED'
+                   AND e.event_time >= clock_timestamp() - CAST(:window AS interval)
+                   AND NOT EXISTS (SELECT 1 FROM nifi_ops.load_run r
+                                    WHERE r.run_id = e.run_id AND r.cleaned_at IS NOT NULL)
+                 ORDER BY e.run_id, e.event_time DESC
+            ) c
         ) a
         ORDER BY CASE severity WHEN 'ERROR' THEN 0 ELSE 1 END, at DESC NULLS LAST
         LIMIT :limit

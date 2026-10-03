@@ -13,9 +13,9 @@ import time
 import urllib.error
 import urllib.request
 
-API = sys.argv[1].rstrip("/")
 if len(sys.argv) != 3:
     raise SystemExit(__doc__)
+API = sys.argv[1].rstrip("/")
 CFG = json.load(open(sys.argv[2]))
 NAMES = CFG.get("names", {})
 RECEIVER_NAME = NAMES.get("control_receiver", "PG-05 Control Receiver")
@@ -44,16 +44,17 @@ def call(method, path, body=None):
 
 
 def stop_pg(pid):
-    """PG(하위 PG 포함)를 STOPPED로 바꾸고, PG 바로 아래 Processor가 모두 멈출 때까지 최대 60초 기다린다.
+    """PG(하위 PG 포함)를 STOPPED로 바꾸고, 하위 PG까지 active thread가 0이 될 때까지 최대 60초 기다린다.
 
+    Job PG(`JOB_<KEY>`)는 Processor를 모두 하위 PG(PG-00~90)에 두므로 바로 아래 Processor만 보면 기다리지
+    않고 지나간다. 그래서 PG status의 aggregateSnapshot(하위 PG 합계)으로 thread 수를 본다.
     시간 안에 멈추지 않아도 예외 없이 돌아간다. 이후 삭제 요청이 실패하면 call()이 멈춘다.
     """
     call("PUT", f"/flow/process-groups/{pid}", {"id": pid, "state": "STOPPED"})
-    # 실행 중인 thread가 끝나야 controller service를 끌 수 있다.
+    # 실행 중인 thread가 끝나야 controller service를 끄고 연결·PG를 지울 수 있다.
     for _ in range(60):
-        procs = call("GET", f"/process-groups/{pid}/processors")["processors"]
-        if all(pr["status"]["aggregateSnapshot"]["activeThreadCount"] == 0
-               and pr["component"]["state"] != "RUNNING" for pr in procs):
+        snap = call("GET", f"/flow/process-groups/{pid}/status")["processGroupStatus"]["aggregateSnapshot"]
+        if snap["activeThreadCount"] == 0:
             return
         time.sleep(1)
 

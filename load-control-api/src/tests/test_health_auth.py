@@ -32,9 +32,22 @@ async def test_request_id_is_propagated(client: httpx.AsyncClient) -> None:
 async def test_missing_and_wrong_token(app: FastAPI) -> None:
     """토큰이 없으면 401, 등록되지 않은 토큰이면 403이다."""
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
-        assert (await c.post("/v1/runs", json={})).status_code == 401
+        r = await c.post("/v1/runs", json={})
+        assert r.status_code == 401 and r.headers["WWW-Authenticate"] == "Bearer"
+        # 인증 오류도 공통 오류 형식이다(requestId로 로그를 찾는다).
+        assert r.json() | {"requestId": None} == {"code": "UNAUTHENTICATED", "message": "Unauthorized",
+                                                  "requestId": None}
+        assert r.json()["requestId"] == r.headers["X-Request-Id"]
         r = await c.post("/v1/runs", json={}, headers={"Authorization": "Bearer wrong"})
-        assert r.status_code == 403
+        assert r.status_code == 403 and r.json()["code"] == "FORBIDDEN"
+
+
+async def test_unknown_path_uses_common_error_format(client: httpx.AsyncClient) -> None:
+    """없는 경로(404)·허용되지 않은 method(405)도 {code, message, requestId} 형식으로 응답한다."""
+    r = await client.post("/v1/runs/x/partitions/y/chunks-broken", json={})
+    assert r.status_code == 404 and r.json()["code"] == "NOT_FOUND" and r.json()["requestId"]
+    r = await client.delete("/v1/runs")
+    assert r.status_code == 405 and r.json()["code"] == "METHOD_NOT_ALLOWED"
 
 
 async def test_operator_can_read_but_not_write(app: FastAPI, client: httpx.AsyncClient) -> None:

@@ -108,14 +108,28 @@ async def _unacked_dispatches(conn: AsyncConnection, s: Settings, done: Counter[
     그 호출을 기다리는 상태일 때만 되돌린다(VALIDATE_RUN은 run EXTRACTED_VALIDATED, REISSUE_PARTITION은
     run EXTRACTING이고 파티션 RETRY). 되돌린 run마다 DISPATCH_REQUEUED 이벤트를 한 번 남기고,
     하나라도 있으면 pg_notify로 dispatcher를 깨운다(NOTIFY는 이 트랜잭션이 커밋될 때 전달된다).
-    attempt_count는 초기화하지 않으므로 반복되면 결국 max_attempts에서 DEAD가 된다.
+    attempt_count는 초기화하지 않는다. 이미 dispatch.max_attempts번 보냈는데도 ACK가 없으면 되돌리지
+    않고 DEAD로 바꿔 DISPATCH_DEAD(ERROR) 이벤트를 남긴다(202만 받고 flow가 시작되지 않는 상태가 계속될 때
+    무한 재전송을 막고 TUI 경보로 알린다).
 
     Args:
         conn: sweeper 트랜잭션의 연결.
         s: dispatch.ack_timeout을 읽을 설정.
-        done: requeue_dispatch에 되돌린 dispatch 수를 누적한다.
+        done: requeue_dispatch(되돌림), dead_dispatch(DEAD) 건수를 누적한다.
     """
-    requeued = await repo.requeue_unacked_dispatches(conn, s.dispatch.ack_timeout)
+    handled = await repo.requeue_unacked_dispatches(conn, s.dispatch.ack_timeout, s.dispatch.max_attempts)
+    requeued = [d.run_id for d in handled if d.status == "PENDING"]
+    for d in handled:
+        if d.status != "DEAD":
+            continue
+        # dispatcher._dead와 같은 이벤트·메트릭을 남겨 TUI·경보에서 똑같이 DISPATCH_DEAD로 보이게 한다.
+        await events.record(conn, "DISPATCH_DEAD", run_id=d.run_id, level="ERROR",
+                            partition_id=d.partition_id,
+                            message=f"no ack after {d.attempt_count} attempts (ack timeout)",
+                            details={"dispatchId": str(d.dispatch_id), "type": d.dispatch_type,
+                                     "attempt": d.attempt_count})
+        metrics.DISPATCH.labels(d.dispatch_type, "dead").inc()
+        done["dead_dispatch"] += 1
     # 같은 run에 여러 dispatch가 되돌려질 수 있으므로 이벤트는 run당 한 번만 남긴다.
     for run_id in set(requeued):
         await events.record(conn, "DISPATCH_REQUEUED", run_id=run_id, level="WARN")
@@ -151,8 +165,10 @@ async def sweep_once(engine: AsyncEngine, settings: Settings) -> dict[str, int] 
 
     모든 규칙을 하나의 트랜잭션(in_tx)에서 실행한다. 먼저 트랜잭션 범위 advisory lock을 시도하고,
     다른 worker가 잡고 있으면 아무것도 하지 않고 None을 돌려준다. lock은 커밋·롤백 때 자동으로 풀린다.
-    규칙 하나에서 예외가 나면 그 바퀴의 변경 전체가 롤백된다. deadlock·serialization 실패는 in_tx가
-    트랜잭션 전체를 다시 실행한다.
+    규칙마다 SAVEPOINT를 두어, 한 규칙에서 예외가 나면 그 규칙의 변경만 롤백하고 오류 로그
+    (sweeper_rule_error)를 남긴 뒤 나머지 규칙을 계속한다. 한 run의 데이터 문제 같은 지속 오류가
+    다른 복구(시간 초과, ACK 재전송, PUBLISH_UNKNOWN 전환)까지 막지 않게 하기 위해서다.
+    실패한 규칙은 다음 주기에 다시 시도된다.
 
     Returns:
         처리 건수가 0이 아닌 규칙만 담은 {규칙 이름: 건수}. 할 일이 없었으면 빈 dict,
@@ -164,12 +180,20 @@ async def sweep_once(engine: AsyncEngine, settings: Settings) -> dict[str, int] 
         if not await repo.try_lock(conn):
             return None
         done: Counter[str] = Counter()
-        await _stale_partitions(conn, settings, done)
-        await _run_deadline(conn, settings, done)
-        await _unacked_dispatches(conn, settings, done)
-        # 검증·게시 정체는 상태를 바꾸지 않고 경보 이벤트만 남긴다(같은 run은 stale 기간마다 한 번).
-        done["stale_alert"] += await repo.alert_stale_runs(conn, settings.recovery.validation_stale)
-        await _stale_publishing(conn, settings, done)
+
+        async def stale_alert(conn: AsyncConnection, s: Settings, done: Counter[str]) -> None:
+            """검증·게시 정체는 상태를 바꾸지 않고 경보 이벤트만 남긴다(같은 run은 stale 기간마다 한 번)."""
+            done["stale_alert"] += await repo.alert_stale_runs(conn, s.recovery.validation_stale)
+
+        for rule in (_stale_partitions, _run_deadline, _unacked_dispatches, stale_alert, _stale_publishing):
+            rule_done: Counter[str] = Counter()
+            try:
+                async with conn.begin_nested():   # SAVEPOINT: 이 규칙의 변경만 되돌릴 수 있게 한다
+                    await rule(conn, settings, rule_done)
+            except Exception:
+                log.exception("sweeper_rule_error", rule=rule.__name__.lstrip("_"))
+                continue
+            done.update(rule_done)   # 롤백된 규칙의 건수는 세지 않는다
         return {k: v for k, v in done.items() if v}
 
     result = await in_tx(engine, fn)

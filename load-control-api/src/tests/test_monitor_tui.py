@@ -289,3 +289,25 @@ async def test_service_screen_runs_bin_script(app: FastAPI, tmp_path: Path) -> N
         await wait_for(pilot, done)
         text = "\n".join("".join(seg.text for seg in line) for line in out.lines)
         assert "restart all in home" in text
+
+
+async def test_alert_cursor_follows_same_alert_after_refresh(app: FastAPI, client: httpx.AsyncClient, db: Db,
+                                                             tmp_path: Path) -> None:
+    """새로고침으로 경보 순서가 바뀌어도 커서는 같은 경보에 남는다(x가 다른 대상에 조치하지 않게)."""
+    first_id, _ = await make_dead(client, db)
+    tui = make_app(app, tmp_path, operator_token=OPERATOR_TOKEN)
+    async with tui.run_test(size=(160, 50)) as pilot:
+        dash = tui.screen
+        assert isinstance(dash, Dashboard)
+        alerts = dash.query_one("#alerts", DataTable)
+        await wait_rows(pilot, alerts, 1)
+        alerts.focus()
+        # 앞쪽에 새 경보(PUBLISH_UNKNOWN은 ERROR 중 맨 앞)가 생기게 한 뒤 새로고침한다.
+        unknown = await create_run(client)
+        await db.execute("UPDATE nifi_ops.load_run SET status = 'PUBLISH_UNKNOWN' WHERE run_id = :id",
+                         id=uuid.UUID(unknown.run_id))
+        dash.action_refresh()
+        await wait_rows(pilot, alerts, 2)
+        key = alerts.coordinate_to_cell_key(alerts.cursor_coordinate).row_key.value
+        assert dash.alert_data[key or ""]["runId"] == first_id
+        assert dash.alert_data[key or ""]["kind"] == "DISPATCH_DEAD"

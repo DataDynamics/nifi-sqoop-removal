@@ -20,6 +20,7 @@
 | 클러스터 분산 | 파티션 7개가 두 노드에 나뉘어 추출됨. Trigger는 Primary Node에서만 실행되어 run 1개 |
 | 같은 업무일자 중복 실행 | 409 `DUPLICATE_ACTIVE_RUN`(WARN). 기존 run 영향 없음 |
 | 파티션 하나의 HDFS 쓰기 실패 | 파티션 `FAILED`, run `FAILED_EXTRACT`. 검증 호출·`_SUCCESS` 없음 |
+| chunk 보고(38) 실패 | 2초 안에 파티션 `FAILED`, run `FAILED_EXTRACT`(오류 코드 그대로). 이전에는 `recovery.stale`(90분)까지 `EXTRACTING`에 머물렀다 |
 | API 중단 중 실행 | NiFi가 재시도로 기다렸다가 API 재기동 후 이어서 진행 |
 | `ORA-01555`(undo 소진) | 파티션 쿼리 재시도 없이 run `FAILED_SNAPSHOT_EXPIRED`. 검증 호출 없음. 새 run은 새 SCN으로 성공 |
 | 정밀도 없는 `NUMBER` | 기본(38,10)은 정상. scale 0이면 **오류 없이 반올림**되어 건수는 맞고 금액 합계만 다름(71,853,600 vs 71,853,075). 정수부 초과(precision 41)는 파티션 `SQL_ERROR` → `FAILED_EXTRACT` |
@@ -30,7 +31,7 @@
 | 파티션 재발행(`recovery.mode=REISSUE`) | 멈춘 파티션이 22초 뒤 같은 SCN으로 재발행되어 2번째 시도에서 성공, run `SUCCESS`. 늦게 도착한 첫 시도의 보고는 409 `CLAIM_MISMATCH`(WARN). 파일 중복 없음 |
 | Job 2개 공유(root PG-05) | 두 Job을 동시에 실행해 각각 `SUCCESS`. 한 Job을 지우면 그 경로는 404, 다른 Job은 계속 수신 |
 | 정리(PG-70) | 보존 기간이 지난 run의 staging 테이블과 HDFS 경로 삭제. 경로가 현재 `HDFS.STAGE.ROOT`와 다른 run은 거부(삭제 없음). HDFS 경로가 없는 run도 정상 처리 |
-| Load Control API 테스트 | 133개 중 132개 통과(동시 완료, 중복 보고, 동시 claim, dispatcher 경합, deadlock 재시도, TUI 화면·운영 작업 포함). 나머지 1개는 서버 전체의 LISTEN 연결 수를 세는 테스트라 같은 DB 서버에 다른 worker가 돌던 시험 환경에서 제외 |
+| Load Control API 테스트 | 140개 중 139개 통과(동시 완료, 중복 보고, 동시 claim, dispatcher 경합, deadlock 재시도, TUI 화면·운영 작업 포함). 나머지 1개는 서버 전체의 LISTEN 연결 수를 세는 테스트라 같은 DB 서버에 다른 worker가 돌던 시험 환경에서 제외 |
 
 ## 3. 설계에 반영한 제품 동작
 

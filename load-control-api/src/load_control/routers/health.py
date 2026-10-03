@@ -1,10 +1,12 @@
 """헬스체크와 메트릭. 인증 없이 열려 있으므로 LB 내부에서만 접근하게 한다."""
 
+import structlog
 from fastapi import APIRouter, Request, Response
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from sqlalchemy import text
 
 router = APIRouter(tags=["health"])
+log = structlog.get_logger(__name__)
 
 
 @router.get("/healthz")
@@ -17,12 +19,14 @@ async def healthz() -> dict[str, str]:
 async def readyz(request: Request, response: Response) -> dict[str, str]:
     """DB에 SELECT 1이 되면 200, 아니면 503. LB가 트래픽을 보낼지 판단한다.
 
-    예외 종류와 관계없이 503 {"status": "unavailable"}을 돌려준다(오류 원인은 로그에 남지 않는다).
+    예외 종류와 관계없이 503 {"status": "unavailable"}을 돌려준다. 원인(예외 종류와 메시지)은 응답에
+    넣지 않고 로그(readyz_failed)에 남긴다. 인증 없이 열린 경로라 내부 정보를 응답에 싣지 않는다.
     """
     try:
         async with request.app.state.engine.connect() as conn:
             await conn.execute(text("SELECT 1"))
-    except Exception:
+    except Exception as e:
+        log.warning("readyz_failed", error=f"{type(e).__name__}: {e}"[:500])
         response.status_code = 503
         return {"status": "unavailable"}
     return {"status": "ok"}

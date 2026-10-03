@@ -222,13 +222,13 @@ run 행 잠금이 필수다. 잠그지 않으면 마지막 두 파티션이 동�
 | `ACKED` | 검증 단계가 `/validation/start`를 호출함(재발행은 새 claim) |
 | `DEAD` | 최대 시도 초과. `DISPATCH_DEAD` 이벤트, 운영자가 재전송 |
 
-`SENT`인데 `dispatch.ack_timeout` 안에 `ACKED`가 안 되면 다시 보낸다(202 직후 NiFi 노드가 죽은 경우).
+`SENT`인데 `dispatch.ack_timeout` 안에 `ACKED`가 안 되면 다시 보낸다(202 직후 NiFi 노드가 죽은 경우). 재전송도 시도 횟수에 들어가므로, 202만 받고 flow가 시작되지 않는 상태(Job PG 정지 등)가 `dispatch.max_attempts`번 이어지면 `DEAD`가 된다.
 
 ### 5.2 dispatcher
 
 - `pg_notify`로 즉시 깨어나고, 놓쳐도 `poll_interval`마다 확인한다.
 - 짧은 트랜잭션에서 행을 선점(`FOR UPDATE SKIP LOCKED`, lease)한 뒤 커밋하고 전송한다. 전송 중 worker가 죽으면 lease가 끝난 뒤 다른 worker가 가져간다.
-- 5xx·연결 실패는 backoff 재시도, 4xx는 설정 오류로 보고 바로 `DEAD`.
+- 5xx·연결 실패와 408·425·429는 backoff 재시도, 그 밖의 4xx는 설정 오류로 보고 바로 `DEAD`.
 - 호출: `POST {nifi.receiver_url}/validate/{jobKey}` 또는 `/reissue/{jobKey}`, 헤더 `X-Run-Id`, `X-Dispatch-Id`.
 
 ### 5.3 중복 수신
@@ -364,7 +364,7 @@ worker가 `recovery.sweeper_interval`마다 실행한다. 여러 worker 중 advi
 |---|---|---|
 | 파티션 `RUNNING` | heartbeat가 `recovery.stale`보다 오래됨 | `mode=FAIL`: run과 미완료 파티션 `TIMED_OUT`. `mode=REISSUE`: claim을 지우고 `RETRY`, 이전 chunk 기록 무효화, 재발행 dispatch. 최대 시도(`max_attempts`)를 넘으면 `FAIL`과 같게 |
 | run `CREATED`, `EXTRACTING` | 시작 후 `recovery.run_timeout` 경과 | `TIMED_OUT` |
-| dispatch `SENT` | `dispatch.ack_timeout` 동안 ACK 없음 | 재전송 |
+| dispatch `SENT` | `dispatch.ack_timeout` 동안 ACK 없음 | 재전송. 이미 `dispatch.max_attempts`번 보냈으면 `DEAD`(`DISPATCH_DEAD`) |
 | run `STAGE_VALIDATING`, `PUBLISHED` | `recovery.validation_stale` 동안 변화 없음 | ERROR 이벤트만(자동 전이 없음) |
 | run `PUBLISHING` | `recovery.publish_stale` 경과 | `PUBLISH_UNKNOWN`. 자동 재실행 없음 |
 

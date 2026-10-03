@@ -687,7 +687,8 @@ c(G10, "P20", "matched", ("out", "partitions")); c(G10, "P20", ["unmatched", "fa
 # attribute를 갖는다. 30 claim token → 31·32 POST .../claim → 33 소유·숫자 형식 확인 → 34 AS OF SCN 조회
 # (EXTRACT.ROWS.PER.FILE 행마다 Parquet chunk FlowFile 하나, fragment.index/count/identifier가 붙는다)
 # → 35 파일 이름 → 36 PutHDFS → 37 chunk 보고 본문 → 38 POST .../chunks.
-# 실패는 errors로 간다. PG-90은 api.response의 claimed가 true일 때(32 응답이 남아 있을 때) 파티션 실패를 보고한다.
+# 실패는 errors로 간다. PG-90은 claim 성공(35 이후는 partition.claimed, 34 실패는 32 응답의 claimed)일 때
+# 파티션 실패를 보고한다.
 port(G20, "partitions", "in", 0, 0)
 port(G20, "errors", "out", 4, 2)
 # UpdateAttribute는 들어온 attribute 기준으로 평가하므로 token 생성과 사용(31 본문)을 다른 Processor에 둔다.
@@ -719,7 +720,10 @@ esql(G20, "P34", "34_Execute_Partition_Query", SRC,
          "dbf-default-scale": "#{ORACLE.NUMBER.DEFAULT.SCALE}"})
 ua(G20, "P35", "35_Set_Chunk_Attrs", {
     "filename": "part-${partition.id}-${fragment.index:padLeft(6,'0')}.parquet",  # run root에 평탄하게 기록
-    "chunk.index": "${fragment.index}", "load.stage": "CHUNK_WRITE"}, 1, 1)
+    "chunk.index": "${fragment.index}", "load.stage": "CHUNK_WRITE",
+    # 38(chunk 보고)이 실패하면 그 오류 본문이 api.response를 덮어써 claim 응답이 사라진다.
+    # PG-90이 38 실패도 파티션 실패로 보고할 수 있도록 claim 성공 여부를 따로 남긴다.
+    "partition.claimed": "${api.response:jsonPath('$.claimed')}"}, 1, 1)
 put_hdfs(G20, "P36", "36_PutHDFS", 2, 1, tasks=4)
 # PutHDFS 이후 content를 보고용 JSON으로 바꾼다(Parquet가 요청 본문으로 가지 않게).
 body(G20, "P37", "37_Build_Chunk_Report",
@@ -1051,8 +1055,11 @@ route(G90, "E91", "91_Route_Failure_Report", {
     "report_run": "${load.run.id:isEmpty():not():and(${load.stage:equals('MANIFEST')"
                   ":and(${invokehttp.status.code:equals('422'):not()})"
                   ":or(${load.stage:in('STAGE_VALIDATION','TARGET_VALIDATION')})})}",
-    # claim에 성공한 파티션의 추출·기록 실패는 파티션 실패로 보고한다.
-    "report_partition": "${load.stage:in('EXTRACT','CHUNK_WRITE'):and(${api.response:jsonPath('$.claimed'):equals('true')})}"},
+    # claim에 성공한 파티션의 추출·기록·chunk 보고 실패는 파티션 실패로 보고한다. 35 이후(CHUNK_WRITE)는
+    # 38 응답이 api.response를 덮어쓰므로 35가 남긴 partition.claimed를 본다. 34 실패는 32 응답이 그대로 있다.
+    # 38이 409 CLAIM_MISMATCH(다른 시도 소유)로 실패한 경우 95도 409로 거절되고 이벤트만 남는다.
+    "report_partition": "${load.stage:in('EXTRACT','CHUNK_WRITE'):and("
+                        "${partition.claimed:replaceNull(${api.response:jsonPath('$.claimed')}):equals('true')})}"},
       2, 0)
 # 오류 메시지를 1500자로 자르고 JSON 문자열로 escape한다(92·94 본문, 97 로그).
 MSG_JSON = "${error.message:replaceAll('(?s)^(.{0,1500}).*$','$1'):escapeJson()}"

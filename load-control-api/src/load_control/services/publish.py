@@ -118,7 +118,8 @@ async def resolve_unknown(conn: AsyncConnection, run_id: UUID, req: PublishUnkno
                           operator: str) -> PublishResultResponse:
     """운영자가 Hive 이력과 target 지표를 확인한 뒤 PUBLISH_UNKNOWN을 확정한다.
 
-    PUBLISH_UNKNOWN → PUBLISHED(published_at 기록, 이후 target 검증으로 SUCCESS까지 진행) 또는
+    PUBLISH_UNKNOWN → PUBLISHED(published_at 기록, 오류 필드 초기화, 이후 target 검증으로 SUCCESS까지
+    진행) 또는
     FAILED_PUBLISH(completed_at, error_code=PUBLISH_UNKNOWN_RESOLVED, error_message=사유) CAS다.
     PUBLISH_UNKNOWN_RESOLVED(WARN) 이벤트에 결정과 operator 역할을 남긴다. 이미 같은 상태면 changed=False.
     publish token은 확인하지 않는다(운영자 권한으로 호출).
@@ -133,7 +134,11 @@ async def resolve_unknown(conn: AsyncConnection, run_id: UUID, req: PublishUnkno
         return PublishResultResponse(run_status=to, changed=False)
     if run.status != RunStatus.PUBLISH_UNKNOWN:
         raise Conflict("RUN_STATUS_MISMATCH", runStatus=run.status)
-    sets: dict[str, object] = ({"published_at": runs.NOW} if to == RunStatus.PUBLISHED
+    # PUBLISHED로 확정하면 PUBLISH_UNKNOWN 때 남긴 오류(PUBLISH_STALE 등)를 지운다. 이후 SUCCESS가 된
+    # run에 오류 코드가 남아 실패처럼 보이지 않게 하기 위해서다. 경위는 PUBLISH_UNKNOWN과
+    # PUBLISH_UNKNOWN_RESOLVED 이벤트에 남는다.
+    sets: dict[str, object] = ({"published_at": runs.NOW, "error_stage": None, "error_code": None,
+                                "error_message": None} if to == RunStatus.PUBLISHED
                                else {"completed_at": runs.NOW, "error_code": "PUBLISH_UNKNOWN_RESOLVED",
                                      "error_message": req.reason})
     await runs.cas_status(conn, run_id, expected=RunStatus.PUBLISH_UNKNOWN, to=to, **sets)

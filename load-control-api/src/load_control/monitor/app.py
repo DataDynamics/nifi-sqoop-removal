@@ -434,7 +434,8 @@ class Dashboard(Screen[None]):
     def _open(self, table: DataTable[Any], key: str | None) -> None:
         """row key를 run ID로 바꿔 RunDetail을 연다.
 
-        run 표는 row key가 곧 run ID이고, 경보 표는 순번이라 alert_runs로 바꾼다(run 없는 경보는 무시).
+        run 표는 row key가 곧 run ID이고, 경보 표는 (종류, run, dispatch) key라 alert_runs로 run ID를
+        찾는다(run 없는 경보는 무시).
         """
         run_id = self.alert_runs.get(key or "") if table.id == "alerts" else key
         if run_id:
@@ -475,11 +476,13 @@ class Dashboard(Screen[None]):
         self.alert_runs = {}
         self.alert_data = {}
         alert_rows = []
-        # 경보에는 고유 ID가 없어(같은 run이 여러 경보를 가질 수 있다) API가 준 순서의 순번을 row key로 쓴다.
-        # 그래서 새로고침 뒤 커서는 "같은 경보"가 아니라 "같은 순번"에 남는다. 조치 전 확인 창에 run·dispatch
-        # ID가 보이므로 운영자가 대상을 다시 확인할 수 있다.
-        for i, a in enumerate(summary["alerts"]):
-            key = str(i)
+        # 경보에는 고유 ID가 없으므로 (종류, run, dispatch)로 row key를 만든다. 순번을 key로 쓰면 새로고침 뒤
+        # 목록이 바뀌었을 때 커서가 같은 자리의 다른 경보를 가리켜 x가 엉뚱한 대상에 조치할 수 있다.
+        # 종류마다 run당 한 건이지만(DISPATCH_DEAD는 dispatch당 한 건) 혹시 겹치면 순번을 붙여 유일하게 한다.
+        for a in summary["alerts"]:
+            key = f"{a['kind']}:{a.get('runId') or '-'}:{a.get('dispatchId') or '-'}"
+            if key in self.alert_data:
+                key = f"{key}:{len(self.alert_data)}"
             self.alert_data[key] = a
             if a.get("runId"):
                 self.alert_runs[key] = a["runId"]

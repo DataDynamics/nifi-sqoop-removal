@@ -18,6 +18,7 @@ from load_control.config import Settings
 from load_control.db import in_tx
 from load_control.repositories import dispatch
 from load_control.worker.dispatcher import Dispatcher, backoff
+from load_control.worker.sweeper import sweep_once
 from tests.conftest import Db, override
 from tests.helpers import claim, complete_run, start_run
 
@@ -134,6 +135,18 @@ async def test_client_error_marks_dead_immediately(client: httpx.AsyncClient, db
     assert (await dispatch_row(db, dispatch_id))["status"] == "DEAD"
 
 
+@pytest.mark.parametrize("status", [408, 429])
+@respx.mock
+async def test_transient_client_error_is_retried(client: httpx.AsyncClient, db: Db, engine: AsyncEngine,
+                                                 worker_settings: Settings, status: int) -> None:
+    """408·429는 앞단 proxy·LB의 일시적 거절이므로 DEAD가 아니라 backoff 후 재시도한다."""
+    _, dispatch_id = await complete_run(client)
+    respx.post(VALIDATE).mock(return_value=httpx.Response(status))
+    await (await make_dispatcher(worker_settings, engine)).dispatch_once()
+    row = await dispatch_row(db, dispatch_id)
+    assert row["status"] == "PENDING" and row["deferred"] is True and row["last_http_status"] == status
+
+
 async def test_ack_before_mark_sent_keeps_acked(client: httpx.AsyncClient, db: Db, engine: AsyncEngine,
                                                 worker_settings: Settings) -> None:
     """NiFi가 202 직후 /validation/start를 먼저 호출해도 ACKED가 SENT로 덮이지 않는다."""
@@ -246,3 +259,24 @@ async def test_listen_reconnects_after_connection_loss(client: httpx.AsyncClient
     finally:
         stop.set()
         await asyncio.wait_for(task, 5)
+
+
+@respx.mock
+async def test_unacked_dispatch_goes_dead_after_max_attempts(client: httpx.AsyncClient, db: Db,
+                                                             engine: AsyncEngine,
+                                                             worker_settings: Settings) -> None:
+    """NiFi가 202만 주고 flow를 시작하지 않으면 max_attempts(3)번 보낸 뒤 DEAD가 된다(무한 재전송 방지)."""
+    run, dispatch_id = await complete_run(client)
+    route = respx.post(VALIDATE).mock(return_value=httpx.Response(202))
+    d = await make_dispatcher(worker_settings, engine)
+    for _ in range(5):
+        await d.dispatch_once()
+        # ack_timeout이 지난 것처럼 sent_at을 과거로 돌린 뒤 sweeper를 돌린다.
+        await db.execute("UPDATE nifi_ops.load_dispatch SET sent_at = sent_at - interval '1 day' "
+                         "WHERE status = 'SENT'")
+        await sweep_once(engine, worker_settings)
+    row = await dispatch_row(db, dispatch_id)
+    assert row["status"] == "DEAD" and row["attempt_count"] == 3 and route.call_count == 3
+    assert "no ack after 3 attempts" in str(row["last_error"])
+    assert await db.scalar("SELECT COUNT(*) FROM nifi_ops.load_event WHERE event_name = 'DISPATCH_DEAD' "
+                           "AND run_id = CAST(:r AS uuid)", r=run.run_id) == 1

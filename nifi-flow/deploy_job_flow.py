@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Sqoop 대체 NiFi Flow를 REST API로 만든다(Cloudera CFM 4.12 / NiFi 2.6).
 
-사용법: build_flow_v4.py <nifi-api-url> <config.json>      (형식: config.v4.example.json)
+사용법: deploy_job_flow.py <nifi-api-url> <config.json>      (형식: job-config.example.json)
 
 만드는 것
     root: PG-05 Control Receiver(모든 Job 공통) ─validate-<JOB>▶ Job PG validate-in,  ─reissue-<JOB>▶ reissue-in
@@ -15,7 +15,7 @@
 - 완료 판정·상태 기록은 Load Control API가 하고, NiFi는 데이터 처리와 API 호출만 한다.
 - Hive 단계는 CFM의 ClouderaHiveConnectionPool(CS_HIVE3_DBCP), PutClouderaHiveQL을 쓴다. Apache NiFi에는 없다.
 - PG-05가 없으면 만들고, 있으면 이 Job의 route·Output Port·root 연결만 추가한다(PG-05를 몇 초 멈춘다).
-  공통 Parameter Context는 지우지 않고 값만 config로 맞춘다. 지우기는 teardown_flow.py.
+  공통 Parameter Context는 지우지 않고 값만 config로 맞춘다. 지우기는 remove_job_flow.py.
 - 이름: Job PG JOB_<JOB.KEY>, Job Context PC_JOB_<JOB.KEY>, 공통 Context PC_SQOOP_REPLACEMENT_COMMON.
   config의 names로 바꿀 수 있다.
 - Trigger(00_Generate_Trigger)는 DISABLED로 만든다. 실행하려면 enable 후 Run Once 한다.
@@ -40,7 +40,8 @@ PC_COMMON = NAMES.get("common_context", "PC_SQOOP_REPLACEMENT_COMMON")
 PC_JOB = NAMES.get("job_context", f"PC_JOB_{JOB_KEY}")
 RECEIVER_NAME = NAMES.get("control_receiver", "PG-05 Control Receiver")  # root에 하나, 모든 Job이 공유
 # 새 구성요소를 만들 때 쓰는 revision. 생성 요청은 version 0으로 보내고, 수정할 때는 GET으로 받은 revision을 쓴다.
-REV = {"version": 0, "clientId": "poc-builder-v4"}
+CLIENT_ID = "nifi-flow-deployer"
+REV = {"version": 0, "clientId": CLIENT_ID}
 
 
 def call(method, path, body=None):
@@ -48,7 +49,7 @@ def call(method, path, body=None):
 
     path는 /nifi-api 뒤의 경로다(API에 /nifi-api까지 포함해 받는다). body가 있으면 JSON으로 보낸다.
     응답 본문이 비어 있으면(DELETE 등) None을 돌려준다. HTTP 오류는 상태 코드와 본문 앞 2000자를 담아
-    SystemExit로 빌드를 멈춘다. 빌드는 중간 상태를 되돌리지 않으므로 실패하면 teardown_flow.py로 지우고 다시 한다.
+    SystemExit로 배포를 멈춘다. 배포는 중간 상태를 되돌리지 않으므로 실패하면 remove_job_flow.py로 지우고 다시 한다.
     """
     req =urllib.request.Request(API + path, method=method,
                                  data=None if body is None else json.dumps(body).encode(),
@@ -88,7 +89,7 @@ def drop_param_ctx(name):
     """
     for pc in call("GET", "/flow/parameter-contexts")["parameterContexts"]:
         if pc["component"]["name"] == name:
-            call("DELETE", f"/parameter-contexts/{pc['id']}?version={pc['revision']['version']}&clientId=poc-builder-v4")
+            call("DELETE", f"/parameter-contexts/{pc['id']}?version={pc['revision']['version']}&clientId={CLIENT_ID}")
 
 
 def param_ctx(name, params, inherited=None):
@@ -107,7 +108,7 @@ def param_ctx(name, params, inherited=None):
     return call("POST", "/parameter-contexts", {"revision": REV, "component": comp})["id"]
 
 
-# 같은 이름의 Job PG가 있으면 덮어쓰지 않고 멈춘다. 재배포는 teardown_flow.py로 지운 뒤 한다.
+# 같은 이름의 Job PG가 있으면 덮어쓰지 않고 멈춘다. 재배포는 remove_job_flow.py로 지운 뒤 한다.
 root = call("GET", "/flow/process-groups/root")["processGroupFlow"]["id"]
 for g in call("GET", f"/flow/process-groups/{root}")["processGroupFlow"]["flow"]["processGroups"]:
     if g["component"]["name"] == TOP_NAME:

@@ -1,5 +1,5 @@
 <?xml version="1.0"?>
-<!-- 단일 DataNode PoC. libvirt 내부망(192.168.122.1)에만 연다. -->
+<!-- 단일 DataNode 검증 환경. libvirt 내부망(192.168.122.1)에만 연다. -->
 <configuration>
   <property><name>dfs.replication</name><value>1</value></property>
   <!-- NiFi(nifi)가 쓴 파일을 HiveServer2(hive)가 읽는다. 운영도 권한 검사를 하지 않는다 -->

@@ -2,7 +2,7 @@
 
 설정은 두 파일로 나뉜다.
 
-- NiFi Flow 생성 설정: `poc/config.v4.example.json`
+- NiFi Flow 배포 설정: `nifi-flow/job-config.example.json`
 - Load Control API 설정: `load-control-api/config/config.example.yaml`
 
 두 설정은 독립적이지 않다. 특히 timeout, URL, token, Job key, HDFS root는 양쪽 관계를 함께 확인해야 한다.
@@ -20,10 +20,10 @@
 - Job Parameter Context는 빌드 때 삭제 후 다시 만든다. 같은 Job PG가 있으면 빌더가 중단된다.
 - Load Control API는 알 수 없는 설정 키를 거부하므로 오타가 있으면 시작되지 않는다.
 
-## 2. PoC 검증에 사용한 예시
+## 2. 검증에 사용한 예시
 
-아래 값은 [`poc/VERIFICATION.md`](../poc/VERIFICATION.md)에 기록된 실제 검증 시나리오와
-[`poc/config.v4.example.json`](../poc/config.v4.example.json)을 한곳에서 볼 수 있도록 정리한 것이다.
+아래 값은 [검증 결과](./08-verification-results.md)에 기록된 실제 검증 시나리오와
+[`nifi-flow/job-config.example.json`](../nifi-flow/job-config.example.json)을 한곳에서 볼 수 있도록 정리한 것이다.
 비밀번호·token·호스트명은 저장소에 남기지 않았으므로 placeholder를 실제 환경 값으로 바꿔야 한다.
 
 ### 2.1 시험 환경과 원천 데이터 기준값
@@ -208,7 +208,7 @@ cleanup:
 > 6개와 서로 다른 `JOB.KEY` 6개가 필요하고, 빌더를 6번 실행해야 한다. 각 Job에는 PG-00·10·20·40·50·60·70·90이
 > 모두 생성된다. 공통 PG-05와 공통 Parameter Context만 공유한다.
 
-즉, `build_flow_v4.py`가 생성 템플릿 역할을 하므로 NiFi UI에서 Processor를 직접 복사할 필요는 없지만,
+즉, `deploy_job_flow.py`가 생성 템플릿 역할을 하므로 NiFi UI에서 Processor를 직접 복사할 필요는 없지만,
 실행 결과는 동일한 Processor 구성을 가진 Job PG 6개다. **한 개의 PG에서 FlowFile 변수만 바꿔 6개
 테이블을 처리하는 구조는 현재 구현되어 있지 않다.** 실행 중 Parameter Context 값을 다른 테이블 값으로
 바꾸는 것도 이미 흐르는 FlowFile과 섞일 수 있으므로 대안으로 사용하면 안 된다.
@@ -316,12 +316,12 @@ config/jobs/
 각 파일로 빌더를 한 번씩 실행한다.
 
 ```bash
-python3 poc/build_flow_v4.py http://<nifi-host>:<port>/nifi-api config/jobs/table-01.json
-python3 poc/build_flow_v4.py http://<nifi-host>:<port>/nifi-api config/jobs/table-02.json
-python3 poc/build_flow_v4.py http://<nifi-host>:<port>/nifi-api config/jobs/table-03.json
-python3 poc/build_flow_v4.py http://<nifi-host>:<port>/nifi-api config/jobs/table-04.json
-python3 poc/build_flow_v4.py http://<nifi-host>:<port>/nifi-api config/jobs/table-05.json
-python3 poc/build_flow_v4.py http://<nifi-host>:<port>/nifi-api config/jobs/table-06.json
+python3 nifi-flow/deploy_job_flow.py http://<nifi-host>:<port>/nifi-api config/jobs/table-01.json
+python3 nifi-flow/deploy_job_flow.py http://<nifi-host>:<port>/nifi-api config/jobs/table-02.json
+python3 nifi-flow/deploy_job_flow.py http://<nifi-host>:<port>/nifi-api config/jobs/table-03.json
+python3 nifi-flow/deploy_job_flow.py http://<nifi-host>:<port>/nifi-api config/jobs/table-04.json
+python3 nifi-flow/deploy_job_flow.py http://<nifi-host>:<port>/nifi-api config/jobs/table-05.json
+python3 nifi-flow/deploy_job_flow.py http://<nifi-host>:<port>/nifi-api config/jobs/table-06.json
 ```
 
 결과는 `JOB_ORACLE_TABLE_01_DAILY`부터 `JOB_ORACLE_TABLE_06_DAILY`까지 6개의 독립 Job PG다. Job마다

@@ -1,6 +1,6 @@
 # Process Group별 동작 원리와 검증
 
-Processor 이름과 속성의 최종 기준은 `poc/build_flow_v4.py`다. 아래 검증은 비운영 데이터로 실행하고,
+Processor 이름과 속성의 최종 기준은 `nifi-flow/deploy_job_flow.py`다. 아래 검증은 비운영 데이터로 실행하고,
 NiFi queue, bulletin, provenance, API 원장을 함께 확인한다.
 
 ## 1. 공통 구현 규칙

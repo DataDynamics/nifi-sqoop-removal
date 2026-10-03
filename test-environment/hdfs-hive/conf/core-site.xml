@@ -1,5 +1,5 @@
 <?xml version="1.0"?>
-<!-- PoC HDFS. NiFi 노드(HADOOP.CONF.FILES)와 HiveServer2가 같은 파일을 쓴다. -->
+<!-- 검증용 HDFS. NiFi 노드(HADOOP.CONF.FILES)와 HiveServer2가 같은 파일을 쓴다. -->
 <configuration>
   <property><name>fs.defaultFS</name><value>hdfs://192.168.122.1:8020</value></property>
 </configuration>

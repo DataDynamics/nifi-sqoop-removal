@@ -59,12 +59,12 @@ flowchart LR
 ├── README.md                      이 문서
 ├── docs/                          전체 적용·설정·검증·운영 매뉴얼
 ├── TODO.md                        운영 적용에 남은 일
-├── poc/
-│   ├── build_flow_v4.py           NiFi Flow를 REST API로 만드는 빌더
-│   ├── teardown_flow.py           빌더가 만든 Job 삭제
-│   ├── config.v4.example.json     빌더 설정 예시
-│   ├── VERIFICATION.md            검증 결과
-│   └── hdfs-hive/                 시험용 HDFS·Hive 컨테이너
+├── nifi-flow/
+│   ├── deploy_job_flow.py         NiFi REST API로 Job Flow 배포
+│   ├── remove_job_flow.py         배포한 Job Flow 삭제
+│   └── job-config.example.json    Job Flow 설정 예시
+├── test-environment/
+│   └── hdfs-hive/                 HDFS·Hive 시험 환경
 └── load-control-api/              Load Control API(Python FastAPI). 사용법은 그 안의 README
 ```
 
@@ -80,10 +80,10 @@ flowchart LR
 
 ## 현재 상태
 
-Cloudera CFM 4.12(NiFi 2.6) 2노드 클러스터, Oracle 23ai, Hive 4.0.1 시험 환경에서 정상 실행과 주요 장애 시나리오를 확인했다([검증 결과](./poc/VERIFICATION.md)). 운영 적용 전에 남은 일은 [TODO.md](./TODO.md)에 있다.
+Cloudera CFM 4.12(NiFi 2.6) 2노드 클러스터, Oracle 23ai, Hive 4.0.1 시험 환경에서 정상 실행과 주요 장애 시나리오를 확인했다([검증 결과](./docs/08-verification-results.md)). 운영 적용 전에 남은 일은 [TODO.md](./TODO.md)에 있다.
 
 ## 운영 환경 전제
 
 - NiFi↔API 통신은 HTTP, API 인증은 Bearer 토큰
 - HDFS 권한 검사와 Hive 인증은 쓰지 않는다
-- Flow는 빌더(`poc/build_flow_v4.py`)로 만든다(NiFi Registry 미사용)
+- Flow는 배포 스크립트(`nifi-flow/deploy_job_flow.py`)로 만든다(NiFi Registry 미사용)

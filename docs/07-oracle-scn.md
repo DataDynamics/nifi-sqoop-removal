@@ -278,7 +278,7 @@ SELECT tablespace_name, retention
 4. 여섯 Job 전체 성공을 묶는 batch 단위 상태와 실패 정책을 추가한다.
 5. 공통 SCN의 Undo 보존 시간은 가장 늦게 끝나는 테이블까지 계산한다.
 
-이 기능은 현재 `build_flow_v4.py`와 Load Control API에 구현되어 있지 않으므로 별도 설계·개발·회귀 시험
+이 기능은 현재 `deploy_job_flow.py`와 Load Control API에 구현되어 있지 않으므로 별도 설계·개발·회귀 시험
 범위다.
 
 ## 10. 제안서 인수 기준

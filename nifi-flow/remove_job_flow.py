@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""build_flow_v4.py가 만든 Job을 지운다.
+"""deploy_job_flow.py가 만든 Job을 지운다.
 
-사용법: teardown_flow.py <nifi-api-url> <config.json>   (빌더에 쓴 config)
+사용법: remove_job_flow.py <nifi-api-url> <config.json>   (배포에 쓴 config)
 
 - Job PG(`JOB_<JOB.KEY>`)와 Job Parameter Context(`PC_JOB_<JOB.KEY>`)를 지운다.
 - root PG-05 Control Receiver에서는 이 Job의 route·Output Port·연결만 지운다.
@@ -23,7 +23,7 @@ JOB_KEY = CFG["job_params"]["JOB.KEY"]
 PG_NAME = NAMES.get("process_group", f"JOB_{JOB_KEY}")
 PC_COMMON = NAMES.get("common_context", "PC_SQOOP_REPLACEMENT_COMMON")
 PC_JOB = NAMES.get("job_context", f"PC_JOB_{JOB_KEY}")
-CID = "poc-builder"   # DELETE 요청의 clientId 쿼리 값. revision version과 함께 보낸다.
+CID = "nifi-flow-remover"   # DELETE 요청의 clientId 쿼리 값. revision version과 함께 보낸다.
 
 
 def call(method, path, body=None):

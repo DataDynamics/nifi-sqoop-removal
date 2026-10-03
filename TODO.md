@@ -1,6 +1,6 @@
 # 운영 적용 TODO
 
-시험 환경에서 확인한 구성([검증 결과](./poc/VERIFICATION.md))을 운영에 적용하기 전에 남은 일이다.
+시험 환경에서 확인한 구성([검증 결과](./docs/08-verification-results.md))을 운영에 적용하기 전에 남은 일이다.
 
 ## 1. 플랫폼
 
@@ -44,7 +44,7 @@
 
 ## 6. 운영 환경 재시험
 
-- [ ] 운영과 같은 구성(실제 HDFS·Hive, 운영 Oracle)에서 [검증 결과](./poc/VERIFICATION.md) 2장 시나리오를 다시 수행
+- [ ] 운영과 같은 구성(실제 HDFS·Hive, 운영 Oracle)에서 [검증 결과](./docs/08-verification-results.md) 2장 시나리오를 다시 수행
 - [ ] 시험하지 못한 장애: 파티션 처리 중 NiFi 노드 종료·재기동, API 인스턴스 1개 종료, worker 종료, 관리 DB 연결 차단
 - [ ] 운영 규모 데이터로 2/4/8 파티션 처리 시간과 Oracle·API·관리 DB 부하를 재고 `PARTITION.COUNT`, `EXTRACT.ROWS.PER.FILE`, Concurrent Tasks를 정한다
 

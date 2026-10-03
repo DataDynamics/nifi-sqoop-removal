@@ -289,7 +289,7 @@ tail -f logs/server.log logs/worker.log
 ## 6. Flow 설정 파일 작성
 
 ```bash
-cp poc/config.v4.example.json /secure/path/job-insp-dtl.json
+cp nifi-flow/job-config.example.json /secure/path/job-insp-dtl.json
 chmod 600 /secure/path/job-insp-dtl.json
 ```
 
@@ -312,7 +312,7 @@ chmod 600 /secure/path/job-insp-dtl.json
 저장소 root에서 실행한다.
 
 ```bash
-python3 poc/build_flow_v4.py \
+python3 nifi-flow/deploy_job_flow.py \
   http://<nifi-host>:<port>/nifi-api \
   /secure/path/job-insp-dtl.json \
   > /secure/path/job-insp-dtl-flow-ids.json
@@ -336,15 +336,15 @@ python3 poc/build_flow_v4.py \
 - 기존 공통 Context를 갱신할 때 이를 참조하는 구성요소가 NiFi에 의해 잠시 정지될 수 있다.
 - PG-05에 Job을 등록할 때 PG-05가 잠시 멈춘다. 그동안 실패한 API worker 호출은 재시도된다.
 
-중간 실패나 재배포 시 먼저 teardown한다.
+중간 실패나 재배포 시 먼저 기존 Job Flow를 제거한다.
 
 ```bash
-python3 poc/teardown_flow.py \
+python3 nifi-flow/remove_job_flow.py \
   http://<nifi-host>:<port>/nifi-api \
   /secure/path/job-insp-dtl.json
 ```
 
-teardown은 Job PG와 Job Context 및 PG-05의 해당 Job route만 지운다. PostgreSQL 원장, HDFS 산출물,
+제거 스크립트는 Job PG와 Job Context 및 PG-05의 해당 Job route만 지운다. PostgreSQL 원장, HDFS 산출물,
 Hive target은 지우지 않는다. 마지막 Job이면 공유 PG-05와 공통 Context도 제거한다.
 
 ## 8. 생성 직후 UI 점검
@@ -421,7 +421,7 @@ NiFi가 동시에 게시하지 않게 한다.
 1. NiFi Trigger를 disable하고 Job PG를 stop한다.
 2. 진행 중 run과 게시 여부를 API/TUI에서 확인한다.
 3. `PUBLISH_UNKNOWN`이면 자동 재실행하지 말고 Hive 이력과 target을 확인한다.
-4. 필요하면 teardown으로 Flow만 제거한다.
+4. 필요하면 `remove_job_flow.py`로 Flow만 제거한다.
 5. target 정합성을 확인한 뒤 기존 Sqoop schedule을 복구한다.
 
 이미 게시된 target을 되돌리는 작업은 이 프로젝트가 자동으로 수행하지 않는다. 원본 snapshot이나 기존

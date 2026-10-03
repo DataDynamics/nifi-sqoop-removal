@@ -1,6 +1,6 @@
 # 검증 결과
 
-`poc/build_flow_v4.py`로 만든 Flow와 Load Control API를 실제 클러스터에서 실행해 확인한 결과다.
+`nifi-flow/deploy_job_flow.py`로 만든 Flow와 Load Control API를 실제 클러스터에서 실행해 확인한 결과다.
 
 ## 1. 시험 환경
 
@@ -8,7 +8,7 @@
 |---|---|
 | NiFi | Cloudera CFM 4.12(NiFi 2.6.0) 2노드 클러스터(비보안). 추출 단계는 Apache NiFi 2.4.0 단일 노드에서도 확인 |
 | 원천 | Oracle Database 23ai Free(컨테이너), ojdbc11 21.15 |
-| HDFS·Hive | Apache Hadoop 3.4.1 단일 노드, Apache Hive 4.0.1 HiveServer2(`poc/hdfs-hive`, 인증 없음) |
+| HDFS·Hive | Apache Hadoop 3.4.1 단일 노드, Apache Hive 4.0.1 HiveServer2(`test-environment/hdfs-hive`, 인증 없음) |
 | 관리 DB | PostgreSQL 16 |
 | 데이터 | `APP.INSP_DTL` 업무일자 `2026-09-28` 105,000건(seq 30001~45000 공백 → 0건 파티션 1개), 파티션 8개 |
 
@@ -51,7 +51,7 @@
 | 빈 결과에서 Hive `SUM`은 NULL | 지표 SQL에 `COALESCE` |
 | Parquet timestamp는 NiFi JVM 시간대 기준 UTC로 저장된다 | NiFi JVM 시간대 = Hive `hive.local.time.zone` |
 | `DeleteHDFS`는 glob을 받고, 없는 경로는 성공으로 처리한다 | 경로를 정확히 비교한 뒤 삭제(PG-70 75) |
-| root 연결을 지우려면 양 끝(PG-05 Output Port, Job PG Input Port)이 모두 멈춰 있어야 한다 | teardown이 Job PG를 먼저 멈춘다 |
+| root 연결을 지우려면 양 끝(PG-05 Output Port, Job PG Input Port)이 모두 멈춰 있어야 한다 | 제거 스크립트가 Job PG를 먼저 멈춘다 |
 | REST로 Parameter Context를 바꿀 때 `inheritedParameterContexts`를 빼면 상속 해제로 처리된다 | 변경 요청에 상속 목록을 함께 보낸다 |
 
 ## 4. 확인하지 않은 것

@@ -121,6 +121,7 @@ sudo bin/systemd/install.sh --uninstall       # 제거
 ```bash
 bin/monitor.sh                         # config/config.yaml의 monitor 섹션 사용
 bin/monitor.sh --url http://api-host:8080 --token <token> --operator-token <operator token>
+bin/monitor.sh --mouse                 # 호환성이 확인된 터미널에서만 마우스 활성화
 ```
 
 | 화면 | 내용 | 키 |
@@ -151,6 +152,8 @@ bin/monitor.sh --url http://api-host:8080 --token <token> --operator-token <oper
 - 운영 작업은 operator role이 필요하다. 토큰이 nifi role이면 "권한 없음"이 뜨고 아무것도 바뀌지 않는다
 - 서비스 PID와 로그는 이 디렉터리의 `logs/`에서 읽으므로 API 서버 호스트에서 실행한다. 다른 호스트에서 `--url`로 붙으면 API 정보만 보인다. systemd로 띄웠으면 PID는 "PID 파일 없음"으로 나오고 API 준비 여부로 판단한다
 - 터미널이 UTF-8이어야 한글이 깨지지 않는다
+- 마우스 입력은 기본적으로 비활성화된다. 목록 이동에는 방향키, `j`/`k`, `PageUp`/`PageDown`, `Home`/`End`를 사용하고 `Enter`로 상세 화면을 연다
+- Textual 8.2.8의 Linux 입력 드라이버는 일부 터미널·SSH·tmux 환경에서 레거시 X10 마우스 이벤트를 UTF-8 문자로 잘못 해석하여 `UnicodeDecodeError`를 일으킬 수 있다. 터미널의 SGR 마우스 모드 호환성을 확인한 경우에만 `--mouse`를 사용하고, 오류가 재발하면 옵션 없이 다시 실행한다
 
 ## 로그
 

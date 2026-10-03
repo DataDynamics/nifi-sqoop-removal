@@ -1,11 +1,13 @@
 """TUI 모니터 진입점: python -m load_control.monitor [--config PATH] [--url URL] [--token TOKEN]
-                                                   [--operator-token TOKEN]
+                                                   [--operator-token TOKEN] [--mouse]
 
 API 주소와 토큰은 인자 > 환경변수(LCA_MONITOR__API_URL, LCA_MONITOR__TOKEN)
 > config.yaml의 monitor 섹션 순서로 정한다.
 운영 작업은 operator 토큰(monitor.operator_token, 없으면 token)으로 부른다.
 서비스 관리는 $LCA_HOME/bin의 start.sh·stop.sh·restart.sh를 실행한다.
 API 주소가 없으면 http://127.0.0.1:<server.port>를 쓴다.
+마우스 입력은 기본적으로 비활성화하며, 호환성이 확인된 터미널에서만
+--mouse로 명시적으로 활성화한다.
 """
 
 import argparse
@@ -29,6 +31,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--token", help="nifi 또는 operator 토큰")
     parser.add_argument("--operator-token", help="운영 작업(재전송, PUBLISH_UNKNOWN 확정)용 operator 토큰")
     parser.add_argument("--refresh", type=float, help="새로고침 주기(초)")
+    parser.add_argument("--mouse", action="store_true", help="마우스 입력 활성화(기본: 비활성)")
     return parser.parse_args(argv)
 
 
@@ -52,7 +55,7 @@ def main(argv: list[str] | None = None) -> None:
     bin_dir = Path(os.environ.get("LCA_HOME", ".")) / "bin"
     # log_dir(기본 logs)는 상대 경로면 현재 디렉터리 기준이다. bin/env.sh가 LCA_HOME으로 cd한 뒤 실행한다.
     MonitorApp(client, refresh_seconds=args.refresh or mon.refresh_seconds, log_dir=Path(mon.log_dir),
-               bin_dir=bin_dir).run()
+               bin_dir=bin_dir).run(mouse=args.mouse)
 
 
 if __name__ == "__main__":

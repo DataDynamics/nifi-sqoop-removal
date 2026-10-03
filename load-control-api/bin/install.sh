@@ -2,13 +2,13 @@
 # 실행 환경(.venv) 설치: bin/install.sh [--online]
 #   기본은 airgap 설치다. packages/의 wheel만 쓴다(pip --no-index).
 #   --online이면 PyPI에서 받는다.
-# Python 3.12 이상이 필요하다. LCA_INSTALL_PYTHON으로 지정한다(기본 python3.12). RHEL 9는 python3.12 패키지.
+# Python 3.11 이상이 필요하다. LCA_INSTALL_PYTHON으로 지정한다(기본 python3.11). RHEL 9는 python3.11 패키지.
 set -eu
 source "$(dirname "${BASH_SOURCE[0]}")/env.sh"
-py="${LCA_INSTALL_PYTHON:-python3.12}"
+py="${LCA_INSTALL_PYTHON:-python3.11}"
 command -v "$py" > /dev/null || { echo "$py not found (set LCA_INSTALL_PYTHON)" >&2; exit 1; }
-"$py" -c 'import sys; sys.exit(sys.version_info < (3, 12))' \
-    || { echo "Python 3.12+ required: $("$py" --version)" >&2; exit 1; }
+"$py" -c 'import sys; sys.exit(sys.version_info < (3, 11))' \
+    || { echo "Python 3.11+ required: $("$py" --version)" >&2; exit 1; }
 
 if [[ ! -x "$LCA_HOME/.venv/bin/python" ]]; then
     "$py" -m venv "$LCA_HOME/.venv"

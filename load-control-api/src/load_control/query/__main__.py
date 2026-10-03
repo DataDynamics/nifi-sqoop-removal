@@ -17,7 +17,7 @@ import argparse
 import getpass
 import os
 import sys
-from typing import Any
+from typing import Any, TypeVar
 
 from pydantic import BaseModel, ValidationError
 
@@ -87,8 +87,11 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def client_settings[T: BaseModel](cls: type[T], base: BaseModel | None, overrides: dict[str, Any],
-                                  section: str) -> T:
+M = TypeVar("M", bound=BaseModel)
+
+
+def client_settings(cls: type[M], base: BaseModel | None, overrides: dict[str, Any],
+                    section: str) -> M:
     """config의 clients.<section>에 명령행 값을 덮어써 검증한다. 필수 값이 없으면 SystemExit(2)."""
     data = base.model_dump() if base is not None else {}
     data.update({k: v for k, v in overrides.items() if v is not None})

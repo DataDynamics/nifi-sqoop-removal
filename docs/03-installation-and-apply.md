@@ -22,7 +22,7 @@
 - Cloudera CFM 4.12(NiFi 2.6)와 Hive NAR 구성요소
 - 모든 NiFi 노드의 동일 경로에 ojdbc11, PostgreSQL JDBC driver
 - 모든 NiFi 노드의 동일 경로에 `core-site.xml`, `hdfs-site.xml`
-- API 호스트의 Python 3.12 이상
+- API 호스트의 Python 3.11 이상(RHEL 9 `python3.11` 패키지)
 - PostgreSQL 16 권장
 - NiFi REST API에 빌더가 접근 가능한 실행 호스트
 

@@ -1,7 +1,7 @@
 """라우터 공통 의존성."""
 
 from collections.abc import Awaitable, Callable
-from typing import Annotated
+from typing import Annotated, TypeVar
 
 from fastapi import Path, Request
 from sqlalchemy.ext.asyncio import AsyncConnection
@@ -12,8 +12,10 @@ from load_control.schemas.common import PARTITION_ID_PATTERN
 # 경로의 partition_id: 4자리 번호(0000~9999) 또는 NULL 파티션. 형식이 다르면 422
 PartitionIdPath = Annotated[str, Path(pattern=PARTITION_ID_PATTERN)]
 
+T = TypeVar("T")
 
-async def run_tx[T](request: Request, fn: Callable[[AsyncConnection], Awaitable[T]]) -> T:
+
+async def run_tx(request: Request, fn: Callable[[AsyncConnection], Awaitable[T]]) -> T:
     """서비스 함수를 한 트랜잭션으로 실행한다(deadlock 시 재실행, 설정 database.tx_attempts).
 
     엔진은 main.lifespan이 app.state.engine에 만든 프로세스 공용 pool이다. fn이 ApiError를 내면

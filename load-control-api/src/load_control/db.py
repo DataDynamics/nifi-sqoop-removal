@@ -6,6 +6,7 @@ ORM 없이 SQLAlchemy Core와 asyncpg 드라이버를 사용한다. 서비스 �
 
 import asyncio
 from collections.abc import Awaitable, Callable
+from typing import TypeVar
 
 import structlog
 from sqlalchemy.exc import DBAPIError
@@ -66,7 +67,10 @@ def constraint_name(e: BaseException) -> str | None:
     return None
 
 
-async def in_tx[T](
+T = TypeVar("T")
+
+
+async def in_tx(
     engine: AsyncEngine,
     fn: Callable[[AsyncConnection], Awaitable[T]],
     attempts: int = 3,

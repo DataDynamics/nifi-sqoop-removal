@@ -72,7 +72,7 @@ flowchart LR
 | 파일 | Snappy Parquet, HDFS run 전용 경로 |
 | Hive | CFM의 `ClouderaHiveConnectionPool`, `PutClouderaHiveQL` 사용 |
 | 상태 DB | PostgreSQL `nifi_ops` 스키마 |
-| API | Python 3.12 이상, FastAPI server + background worker |
+| API | Python 3.11 이상, FastAPI server + background worker |
 | 보안 기본값 | NiFi↔API HTTP, API Bearer token, 방화벽으로 접근 제한 |
 | 배포 방식 | NiFi Registry가 아니라 `nifi-flow/deploy_job_flow.py`가 NiFi REST API로 생성 |
 

@@ -60,10 +60,10 @@ src/migrations/versions/0002_run_cleanup.py         # load_run.cleaned_at(정리
 
 ## 설치
 
-프로젝트를 패키지로 설치하지 않는다. `.venv`에는 의존 패키지만 두고, bin 스크립트가 `PYTHONPATH=src`로 소스를 실행한다. 그래서 설치 장비에 빌드 도구가 필요 없다. Python 3.12 이상이 필요하다(RHEL 9는 `dnf install python3.12`).
+프로젝트를 패키지로 설치하지 않는다. `.venv`에는 의존 패키지만 두고, bin 스크립트가 `PYTHONPATH=src`로 소스를 실행한다. 그래서 설치 장비에 빌드 도구가 필요 없다. Python 3.11 이상이 필요하다(RHEL 9는 `dnf install python3.11`). `packages/`의 wheel은 Python 3.11(cp311)용이다.
 
 ```bash
-# 1) 인터넷이 되는 장비: wheel을 packages/에 받는다(대상 Python 3.12, manylinux x86_64)
+# 1) 인터넷이 되는 장비: wheel을 packages/에 받는다(대상 Python 3.11, manylinux x86_64)
 bin/download-packages.sh            # requirements.txt를 다시 만들려면 --lock (uv 필요)
 
 # 2) 디렉터리 전체(packages/ 포함)를 airgap 장비로 옮긴 뒤
@@ -73,7 +73,7 @@ bin/migrate.sh                      # alembic upgrade head
 bin/start.sh
 ```
 
-- `LCA_INSTALL_PYTHON`(기본 `python3.12`)으로 venv를 만들 python을 지정한다
+- `LCA_INSTALL_PYTHON`(기본 `python3.11`)으로 venv를 만들 python을 지정한다
 - `LCA_PKG_PYTHON`, `LCA_PKG_PLATFORMS`로 받을 wheel의 Python 버전과 플랫폼을 바꾼다
 - 의존성을 바꿨으면 `bin/download-packages.sh --lock`으로 `packages/requirements.txt`를 다시 만들어 커밋한다
 
@@ -261,7 +261,7 @@ worker는 `nifi.receiver_url`(NiFi LB의 PG-05 주소)이 없으면 시작하지
 개발 도구(pytest, ruff, mypy)는 운영 `.venv`와 분리한 `.venv-dev`에 둔다.
 
 ```bash
-uv venv -p 3.12 .venv-dev
+uv venv -p 3.11 .venv-dev
 uv pip install -p .venv-dev/bin/python -e ".[dev]"
 
 # 개발 중 자동 재시작

@@ -706,6 +706,24 @@ worker는 `receiver_url`이 없으면 시작하지 않는다.
 | `logging.file.backup_count` | `10` | 회전 파일 수 |
 | `logging.loggers` | logger별 | SQL/HTTP 등 개별 수준 |
 
+### 8.8 `clients`
+
+운영 조회 도구(`bin/oracle.sh`, `bin/hive.sh`, `bin/hdfs.sh`)의 접속 정보다. API server·worker는 이
+섹션을 읽지 않는다. 쓰지 않는 도구는 `null`로 둔다. 자세한 내용은 [운영 조회 도구](./09-query-tools.md)에 있다.
+
+| 키 | 기본 | 설명 |
+|---|---|---|
+| `oracle.dsn`, `user`, `password` | 필수 | `host:port/service_name`. NiFi `ORACLE.JDBC.URL`·`USER`와 같은 읽기 전용 계정을 권장한다 |
+| `oracle.current_schema` | `null` | 스키마를 붙이지 않은 이름을 찾을 스키마(예: `APP`) |
+| `oracle.call_timeout`, `arraysize` | `PT10M`, `1000` | 문장 하나의 최대 실행 시간, fetch 단위 |
+| `hive.host`, `port`, `database`, `user` | 필수, `10000`, `default`, `nifi` | NiFi `HIVE.JDBC.URL`과 같은 HS2 |
+| `hive.auth`, `transport`, `http_path` | `NONE`, `binary`, `cliservice` | 인증 NONE(SASL PLAIN) 또는 NOSASL, 전송 방식 |
+| `hive.connect_timeout`, `query_timeout` | `30`, `PT30M` | 연결 초, 문장마다 보내는 `hive.query.timeout.seconds` |
+| `hdfs.namenode_urls` | 필수 | WebHDFS 주소 목록(`dfs.namenode.http-address`). HA면 standby를 건너뛴다 |
+| `hdfs.user`, `home` | `nifi`, `/` | simple 인증 `user.name`, 대화형 시작 디렉터리 |
+| `hdfs.datanode_hosts` | `{}` | 읽기·쓰기 redirect의 DataNode 이름을 바꿀 `{이름: IP}` |
+| `hdfs.timeout_seconds` | `30` | HTTP timeout |
+
 ## 9. 변경 영향도
 
 | 변경 | 영향 |

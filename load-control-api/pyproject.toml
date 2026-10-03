@@ -19,6 +19,8 @@ dependencies = [
     "structlog>=24.1",
     "prometheus-client>=0.20",
     "textual>=1.0",        # bin/monitor.sh TUI
+    "oracledb>=2.0",       # bin/oracle.sh (thin 모드)
+    "impyla>=0.21",        # bin/hive.sh (HiveServer2 Thrift)
 ]
 
 [project.scripts]
@@ -61,7 +63,7 @@ plugins = ["pydantic.mypy"]
 mypy_path = "src"
 
 [[tool.mypy.overrides]]
-module = ["asyncpg", "asyncpg.*"]
+module = ["asyncpg", "asyncpg.*", "impala", "impala.*", "thrift", "thrift.*"]
 ignore_missing_imports = true
 
 [tool.coverage.run]

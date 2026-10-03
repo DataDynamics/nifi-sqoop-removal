@@ -54,6 +54,7 @@ flowchart LR
 | 6 | [Load Control API 상호작용](./05-api-interactions.md) | 요청·응답, 상태 전이, outbox/ACK 이해 |
 | 7 | [통합 검증과 운영·복구](./06-validation-and-operations.md) | 인수 테스트, 모니터링, 장애 대응, 재처리 |
 | 8 | [검증 결과](./08-verification-results.md) | 실제 클러스터 환경과 시나리오별 검증 증적 확인 |
+| 9 | [운영 조회 도구](./09-query-tools.md) | `bin/oracle.sh`·`hive.sh`·`hdfs.sh`로 원천·HDFS·Hive 직접 대조 |
 
 ## 3. 적용 범위와 전제
 

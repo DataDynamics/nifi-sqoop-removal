@@ -108,6 +108,9 @@ CREATED → EXTRACTING → EXTRACTED_VALIDATED → STAGE_VALIDATING
 
 ### 3.4 독립 SQL 비교
 
+아래 SQL은 API 호스트에서 `bin/oracle.sh -f`, `bin/hive.sh -f`로 실행할 수 있다. HDFS chunk는
+`bin/hdfs.sh ls -h <hdfs_run_path>`로 확인한다([운영 조회 도구](./09-query-tools.md)).
+
 Oracle은 run의 SCN을 사용한다.
 
 ```sql

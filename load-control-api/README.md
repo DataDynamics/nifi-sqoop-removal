@@ -52,7 +52,8 @@ src/load_control/
 ├── services/         # 트랜잭션 단위 업무 규칙 (manifest 불변식, claim, chunk 판정, 검증, 게시, 정리)
 ├── routers/          # 인증, 입력 검증, 트랜잭션 시작
 ├── worker/           # python -m load_control.worker: dispatcher + sweeper
-└── monitor/          # python -m load_control.monitor: TUI 모니터(textual)
+├── monitor/          # python -m load_control.monitor: TUI 모니터(textual)
+└── query/            # python -m load_control.query: bin/oracle.sh·hive.sh·hdfs.sh 조회 도구
 src/migrations/versions/0001_nifi_ops_baseline.py   # nifi_ops 테이블·인덱스·권한
 src/migrations/versions/0002_run_cleanup.py         # load_run.cleaned_at(정리 기록)
 ```
@@ -90,6 +91,7 @@ bin/start.sh
 | `bin/install.sh [--online]` | `.venv` 생성과 의존 패키지 설치 |
 | `bin/download-packages.sh [--lock]` | airgap용 wheel 받기 |
 | `bin/monitor.sh [--url URL] [--token TOKEN]` | TUI 모니터(아래 "모니터") |
+| `bin/oracle.sh`, `bin/hive.sh`, `bin/hdfs.sh` | psql과 비슷한 Oracle·Hive·HDFS 조회 도구(아래 "조회 도구"). 기본 읽기 전용 |
 
 - PID 파일이 남아 있어도 그 PID가 이 서비스의 python 프로세스가 아니면 중지된 것으로 본다
 - bin 스크립트와 systemd 중 하나만 쓴다
@@ -155,6 +157,24 @@ bin/monitor.sh --mouse                 # 호환성이 확인된 터미널에서�
 - 마우스 입력은 기본적으로 비활성화된다. 목록 이동에는 방향키, `j`/`k`, `PageUp`/`PageDown`, `Home`/`End`를 사용하고 `Enter`로 상세 화면을 연다
 - Textual 8.2.8의 Linux 입력 드라이버는 일부 터미널·SSH·tmux 환경에서 레거시 X10 마우스 이벤트를 UTF-8 문자로 잘못 해석하여 `UnicodeDecodeError`를 일으킬 수 있다. 터미널의 SGR 마우스 모드 호환성을 확인한 경우에만 `--mouse`를 사용하고, 오류가 재발하면 옵션 없이 다시 실행한다
 
+## 조회 도구
+
+적재 결과를 원천·HDFS·Hive에서 직접 확인하는 명령행 도구다. sqlplus, beeline, hadoop 클라이언트 없이
+`config.yaml`의 `clients` 섹션 접속 정보로 실행한다. 설계와 전체 사용법은
+[운영 조회 도구](../docs/09-query-tools.md)에 있다.
+
+```bash
+bin/oracle.sh                                   # 대화형(\? 도움말, \dt, \d 이름, \scn, \x, \q)
+bin/oracle.sh -c "SELECT COUNT(*) FROM APP.INSP_DTL AS OF SCN 2390399 WHERE BASE_DT = DATE '2026-09-28'"
+bin/hive.sh -F csv --max-rows 0 -f check.sql > out.csv
+bin/hdfs.sh ls -h /data/nifi/stage/ORACLE_INSP_DTL_DAILY
+bin/hdfs.sh du -s -h '/data/nifi/stage/*/*'     # glob은 따옴표로 감싼다
+```
+
+- 기본은 읽기 전용이다. DML·DDL과 HDFS `mkdir`·`rm`·`mv`·`put`·`chmod`는 `--write`를 줘야 실행한다.
+  Oracle은 문장마다 `SET TRANSACTION READ ONLY`로 실행한다.
+- 종료 코드: 0 성공, 1 실행 오류, 2 사용법·설정·접속 오류, 3 읽기 전용 거부, 130 Ctrl-C.
+
 ## 로그
 
 | 파일 | 내용 |
@@ -197,6 +217,7 @@ bin/monitor.sh --mouse                 # 호환성이 확인된 터미널에서�
 | `recovery`, `dispatch` | sweeper·outbox 기준 |
 | `cleanup` | 정리 대상 보존 기간(`success_retention` 3일, `failed_retention` 14일), `max_batch` |
 | `worker` | worker `/metrics` bind address와 port |
+| `clients` | 조회 도구(`bin/oracle.sh`, `bin/hive.sh`, `bin/hdfs.sh`)의 접속 정보. server·worker는 읽지 않는다 |
 | `logging` | 수준, 형식(text/json/console), 표준출력, 회전 파일(`{service}` → server·worker), API 수신·응답 로그와 본문, logger별 수준 |
 
 토큰 digest 생성:

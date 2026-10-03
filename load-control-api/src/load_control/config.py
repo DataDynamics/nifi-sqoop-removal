@@ -181,6 +181,60 @@ class MonitorSettings(Section):
     log_dir: Path = Path("logs")       # server.log, worker.log, *.pid 위치(설치 디렉터리 기준)
 
 
+class OracleClientSettings(Section):
+    """bin/oracle.sh 접속 정보(python-oracledb thin 모드, Oracle Client 설치 불필요, Oracle 12.1 이상).
+
+    보통 NiFi의 원천 조회 계정(ORACLE.JDBC.USER)처럼 읽기 전용 계정을 쓴다.
+    """
+
+    dsn: str                    # host:port/service_name (JDBC URL의 @// 뒤 부분) 또는 TNS 연결 기술자
+    user: str
+    password: str
+    current_schema: str | None = None  # 지정하면 스키마를 붙이지 않은 이름을 이 스키마에서 찾는다(예: APP)
+    call_timeout: timedelta = timedelta(minutes=10)  # 문장 하나의 최대 실행 시간(DB 왕복 기준)
+    arraysize: int = Field(default=1000, ge=1)       # 한 번에 가져오는 행 수
+
+
+class HiveClientSettings(Section):
+    """bin/hive.sh 접속 정보(HiveServer2 Thrift, impyla). NiFi HIVE.JDBC.URL과 같은 HS2를 쓴다."""
+
+    host: str
+    port: int = Field(default=10000, ge=1, le=65535)
+    database: str = "default"   # 처음 USE할 database
+    user: str = "nifi"
+    password: str | None = None  # 인증 없는 HS2(hive.server2.authentication=NONE)는 아무 값이나 받는다
+    # NONE: HS2 기본 인증 NONE(SASL PLAIN 전송). NOSASL: hive.server2.authentication=NOSASL인 서버
+    auth: Literal["NONE", "NOSASL"] = "NONE"
+    transport: Literal["binary", "http"] = "binary"  # hive.server2.transport.mode
+    http_path: str = "cliservice"                    # transport가 http일 때 hive.server2.thrift.http.path
+    connect_timeout: float = Field(default=30.0, gt=0)  # 초
+    query_timeout: timedelta = timedelta(minutes=30)     # 문장마다 hive.query.timeout.seconds로 보낸다
+
+
+class HdfsClientSettings(Section):
+    """bin/hdfs.sh 접속 정보(WebHDFS REST). Hadoop 클라이언트 설치 없이 NameNode HTTP 포트만 쓴다."""
+
+    # NameNode WebHDFS 주소(dfs.namenode.http-address). HA면 둘 다 적고, standby는 건너뛴다
+    namenode_urls: list[AnyHttpUrl] = Field(min_length=1)
+    user: str = "nifi"          # simple 인증 user.name. 이 사용자 권한으로 조회·변경한다
+    home: str = "/"             # 대화형 시작 디렉터리와 상대 경로의 기준(예: NiFi HDFS.STAGE.ROOT)
+    # 파일 읽기·쓰기는 NameNode가 DataNode 호스트 이름으로 redirect한다. 그 이름이 이 호스트에서 풀리지
+    # 않거나 다른 주소로 가야 하면 {DataNode 호스트: 바꿀 호스트 또는 IP}로 적는다
+    datanode_hosts: dict[str, str] = Field(default_factory=dict)
+    timeout_seconds: float = Field(default=30.0, gt=0)
+
+
+class ClientsSettings(Section):
+    """운영 조회 도구(bin/oracle.sh, bin/hive.sh, bin/hdfs.sh)의 접속 정보.
+
+    API server·worker는 이 섹션을 읽지 않는다. 쓰지 않는 도구는 null로 둔다.
+    """
+
+    oracle: OracleClientSettings | None = None
+    hive: HiveClientSettings | None = None
+    hdfs: HdfsClientSettings | None = None
+
+
 class WorkerSettings(Section):
     """worker 프로세스(dispatcher, sweeper) 설정."""
 
@@ -244,6 +298,7 @@ class Settings(BaseSettings):
     cleanup: CleanupSettings = Field(default_factory=CleanupSettings)  # 정리 대상 보존 기간
     monitor: MonitorSettings = Field(default_factory=MonitorSettings)  # TUI 모니터
     worker: WorkerSettings = Field(default_factory=WorkerSettings)  # worker 프로세스(/metrics)
+    clients: ClientsSettings = Field(default_factory=ClientsSettings)  # 운영 조회 도구 접속 정보
     logging: LoggingSettings = Field(default_factory=LoggingSettings)  # 로그 형식·출력
 
     @classmethod

@@ -3,8 +3,11 @@ annotated-doc==0.0.5      # via fastapi
 annotated-types==0.8.0    # via pydantic
 anyio==4.15.1             # via httpx, starlette, watchfiles
 asyncpg==0.31.0           # via load-control-api (pyproject.toml)
+bitarray==3.11.0          # via impyla
 certifi==2026.7.22        # via httpcore, httpx
+cffi==2.1.1               # via cryptography
 click==8.5.0              # via uvicorn
+cryptography==50.0.2      # via oracledb
 fastapi==0.142.2          # via load-control-api (pyproject.toml)
 greenlet==3.5.6           # via sqlalchemy
 h11==0.16.0               # via httpcore, uvicorn
@@ -12,6 +15,7 @@ httpcore==1.0.9           # via httpx
 httptools==0.8.0          # via uvicorn
 httpx==0.28.1             # via load-control-api (pyproject.toml)
 idna==3.20                # via anyio, httpx
+impyla==0.24.0            # via load-control-api (pyproject.toml)
 linkify-it-py==2.2.0      # via markdown-it-py
 mako==1.4.3               # via alembic
 markdown-it-py==4.2.0     # via mdit-py-plugins, rich, textual
@@ -19,8 +23,11 @@ markupsafe==3.0.3         # via mako
 mdit-py-plugins==0.6.1    # via textual
 mdurl==0.1.2              # via markdown-it-py
 opentelemetry-api==1.45.0  # via fastapi
+oracledb==26.0.1          # via load-control-api (pyproject.toml)
 platformdirs==4.12.2      # via textual
 prometheus-client==0.26.0  # via load-control-api (pyproject.toml)
+pure-sasl==0.6.2          # via impyla, thrift-sasl
+pycparser==3.0            # via cffi
 pydantic==2.13.5          # via fastapi, pydantic-settings, load-control-api (pyproject.toml)
 pydantic-core==2.46.5     # via pydantic
 pydantic-settings==2.15.0  # via load-control-api (pyproject.toml)
@@ -28,11 +35,14 @@ pygments==2.21.0          # via rich, textual
 python-dotenv==1.2.4      # via pydantic-settings, uvicorn
 pyyaml==6.0.3             # via pydantic-settings, uvicorn
 rich==15.0.0              # via textual
+six==1.17.0               # via thrift-sasl
 sqlalchemy==2.1.2         # via alembic, load-control-api (pyproject.toml)
 starlette==1.7.0          # via fastapi
 structlog==26.1.0         # via load-control-api (pyproject.toml)
 textual==8.2.8            # via load-control-api (pyproject.toml)
-typing-extensions==4.16.0  # via alembic, anyio, fastapi, opentelemetry-api, pydantic, pydantic-core, sqlalchemy, starlette, textual, typing-inspection
+thrift==0.25.0            # via impyla, thrift-sasl
+thrift-sasl==0.4.3        # via impyla
+typing-extensions==4.16.0  # via alembic, anyio, fastapi, opentelemetry-api, oracledb, pydantic, pydantic-core, sqlalchemy, starlette, textual, typing-inspection
 typing-inspection==0.4.4  # via fastapi, pydantic, pydantic-settings
 uvicorn==0.54.0           # via load-control-api (pyproject.toml)
 uvloop==0.23.0            # via uvicorn

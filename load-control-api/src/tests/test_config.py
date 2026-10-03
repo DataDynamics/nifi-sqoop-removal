@@ -97,3 +97,12 @@ def test_secret_only_from_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
     s = Settings.load(write(tmp_path, "database:\n  pool_size: 4\n"))
     assert s.database.url == "postgresql+asyncpg://from-env@h/db"
     assert s.database.pool_size == 4
+
+
+def test_clients_section(tmp_path: Path) -> None:
+    """운영 조회 도구 접속 정보(clients)는 선택이고, 예시 파일의 값은 검증을 통과한다."""
+    assert Settings.load(write(tmp_path, MINIMAL)).clients.oracle is None
+    s = Settings.load(EXAMPLE)
+    assert s.clients.oracle is not None and s.clients.oracle.call_timeout == timedelta(minutes=10)
+    assert s.clients.hive is not None and s.clients.hive.auth == "NONE"
+    assert s.clients.hdfs is not None and str(s.clients.hdfs.namenode_urls[0]) == "http://namenode1:9870/"

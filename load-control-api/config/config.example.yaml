@@ -89,6 +89,34 @@ worker:                   # python -m load_control.worker
   metrics_host: 0.0.0.0   # /metrics bind address
   metrics_port: 9100      # null이면 /metrics를 열지 않는다
 
+clients:                  # 운영 조회 도구(bin/oracle.sh, bin/hive.sh, bin/hdfs.sh) 접속 정보. server·worker는 읽지 않는다
+                          # 쓰지 않는 도구는 null. 모두 기본 읽기 전용이고 쓰기는 각 도구의 --write로만 허용한다
+  oracle:                 # python-oracledb thin 모드(Oracle Client 불필요, Oracle 12.1 이상)
+    dsn: oracle-host:1521/ORCLPDB   # NiFi ORACLE.JDBC.URL의 jdbc:oracle:thin:@// 뒤 부분
+    user: NIFI_READER               # 원천 조회 계정(읽기 전용 권한 계정 권장)
+    password: CHANGE_ME
+    current_schema: null            # 예: APP. 스키마 없이 쓴 이름을 이 스키마에서 찾는다
+    call_timeout: PT10M             # 문장 하나 최대 실행 시간
+    arraysize: 1000
+  hive:                   # HiveServer2 Thrift(impyla). NiFi HIVE.JDBC.URL과 같은 HS2
+    host: hs2-host
+    port: 10000
+    database: default
+    user: nifi
+    password: null                  # 인증 없는 HS2(NONE)는 검사하지 않는다
+    auth: NONE                      # NONE(SASL PLAIN, HS2 기본) 또는 NOSASL
+    transport: binary               # binary 또는 http(hive.server2.transport.mode)
+    http_path: cliservice
+    connect_timeout: 30
+    query_timeout: PT30M            # 문장마다 hive.query.timeout.seconds로 보낸다
+  hdfs:                   # WebHDFS REST(Hadoop 클라이언트 불필요)
+    namenode_urls:                  # dfs.namenode.http-address. HA면 둘 다(standby는 건너뛴다)
+      - http://namenode1:9870
+    user: nifi                      # simple 인증 user.name
+    home: /data/nifi/stage          # 대화형 시작 디렉터리(NiFi HDFS.STAGE.ROOT)
+    datanode_hosts: {}              # 파일 읽기 redirect의 DataNode 이름이 안 풀릴 때 {이름: IP}
+    timeout_seconds: 30
+
 logging:                  # 시각은 서버 현지 시각 YYYY-MM-DD HH:MM:SS.SSS, 메시지는 한글(이벤트 코드도 함께)
   level: INFO             # root 수준: DEBUG, INFO, WARNING, ERROR, CRITICAL
   format: text            # 표준출력 형식: text(한 줄), json(수집기용), console(개발, 색상)

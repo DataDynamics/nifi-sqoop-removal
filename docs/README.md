@@ -6,10 +6,7 @@
 
 ![Sqoop replacement proposal architecture](./assets/sqoop-replacement-concept.png)
 
-> 위 이미지는 제안서용 개념도다. 정확한 연결, 상태 전이, API 호출은 아래 Mermaid와 각 장의 표를
-> 기준으로 한다.
-
-## 1. 제안 요약
+## 1. 요약
 
 기존 Sqoop Mapper가 담당하던 범위 분할과 병렬 추출을 NiFi가 수행하고, 분산 Flow만으로 보장하기
 어려운 전체 완료 판정과 중복 방지는 Load Control API가 맡는다.

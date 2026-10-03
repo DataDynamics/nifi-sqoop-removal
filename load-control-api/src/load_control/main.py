@@ -31,7 +31,7 @@ log = structlog.get_logger(__name__)
 def _error(request: Request, status: int, code: str, message: str,
            details: dict[str, object] | None = None,
            headers: dict[str, str] | None = None) -> JSONResponse:
-    """모든 오류 응답의 공통 형식: {code, message, requestId, details?}."""
+    """업무·HTTP·DB 오류의 공통 응답 `{code, message, requestId, details?}`를 만든다."""
     body: dict[str, object] = {"code": code, "message": message,
                                "requestId": getattr(request.state, "request_id", None)}
     if details:

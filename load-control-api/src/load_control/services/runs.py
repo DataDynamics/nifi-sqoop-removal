@@ -1,6 +1,6 @@
-"""run 생성, 단계 실패 기록, 조회.
+"""run 생성, 단계별 실패 기록 및 조회를 담당한다.
 
-파티션 단위 처리(claim, chunk, 파티션 실패)는 completion, manifest는 manifest 모듈이 맡는다.
+파티션 단위 처리(claim, chunk, 실패)는 `completion` 모듈이, manifest 등록은 `manifest` 모듈이 맡는다.
 """
 
 import uuid
@@ -29,11 +29,11 @@ log = structlog.get_logger(__name__)
 
 
 def build_run_paths(req: RunCreateRequest, run_id: UUID) -> tuple[str, str]:
-    """run 전용 HDFS 경로와 stage table 이름.
+    """run 전용 HDFS 경로와 staging table 이름을 만든다.
 
-    경로는 `{hdfsRoot}/{jobKey}/run_id={runId}`, table은 `{stageTablePrefix}{runId hex}`를
-    소문자로 만든 것이다.
-    run_id를 넣어 run마다 겹치지 않게 하므로, 정리(PG-70)는 이 경로·table만 지우면 된다.
+    HDFS 경로는 `{hdfsRoot}/{jobKey}/run_id={runId}`, table 이름은 소문자로 변환한
+    `{stageTablePrefix}{runId hex}`다. 두 값 모두 run ID를 포함하므로 Cleanup은 다른 run에 영향을
+    주지 않고 해당 경로와 table만 삭제할 수 있다.
     """
     hdfs_run_path = f"{req.hdfs_root.rstrip('/')}/{req.job_key}/run_id={run_id}"
     stage_table = f"{req.stage_table_prefix}{run_id.hex}".lower()
@@ -41,11 +41,11 @@ def build_run_paths(req: RunCreateRequest, run_id: UUID) -> tuple[str, str]:
 
 
 async def create_run(conn: AsyncConnection, req: RunCreateRequest) -> RunCreateResponse:
-    """CREATED run을 만든다. 같은 업무키의 활성 run이 있으면 409 DUPLICATE_ACTIVE_RUN.
+    """`CREATED` run을 만들고 `RUN_STARTED` 이벤트를 기록한다.
 
-    활성 run 중복은 미리 조회하지 않고 uq_load_run_active 부분 유니크 인덱스로 막는다. 그래서 동시 요청이
-    와도 한 건만 만들어진다. allowEmptySource는 이후 manifest 검증에서 쓰도록 parameters에 함께 저장한다.
-    RUN_STARTED 이벤트를 남긴다.
+    같은 업무 키의 활성 run은 사전 조회가 아니라 `uq_load_run_active` 부분 유니크 인덱스로 막는다.
+    따라서 생성 요청이 동시에 들어와도 하나만 성공한다. `allowEmptySource`는 이후 manifest 검증에서
+    사용하도록 `parameters`에 저장한다.
 
     Raises:
         Unprocessable: INVALID_HDFS_ROOT. hdfsRoot에 '..' 경로 조각이 있음.
@@ -77,10 +77,11 @@ async def create_run(conn: AsyncConnection, req: RunCreateRequest) -> RunCreateR
 
 
 async def fail_run(conn: AsyncConnection, run_id: UUID, req: RunFailRequest) -> RunFailResponse:
-    """파티션 외 단계(SCN, 검증, 게시 등)의 실패를 기록한다. 허용 전이는 domain.ALLOWED_RUN_FAILURES.
+    """SCN, 검증, 게시 등 파티션 외 단계의 실패를 기록한다.
 
-    run 행을 잠근 뒤 expectedStatus → failStatus CAS로 바꾸고 RUN_FAILED 이벤트를 남긴다. 이미 failStatus면
-    changed=False로 성공 응답한다(멱등).
+    허용 전이는 `domain.ALLOWED_RUN_FAILURES`에 정의되어 있다. run 행을 잠근 뒤
+    `expectedStatus → failStatus`로 CAS 전이하고 `RUN_FAILED` 이벤트를 남긴다. 이미 요청한 실패 상태면
+    멱등 재요청으로 보고 `changed=false`를 반환한다.
 
     Raises:
         Unprocessable: FAIL_TRANSITION_NOT_ALLOWED. (expected, fail) 조합이 허용 목록에 없음
@@ -110,10 +111,10 @@ async def fail_run(conn: AsyncConnection, run_id: UUID, req: RunFailRequest) -> 
 
 
 async def get_run_detail(conn: AsyncConnection, run_id: UUID) -> RunDetail:
-    """run 상태, 파티션별 상태, dispatch 상태(운영 조회·후속 Job 선행 조건 확인용).
+    """운영 조회와 후속 Job의 선행 조건 확인에 필요한 run 상세를 반환한다.
 
-    잠그지 않는 읽기 전용 조회다. run, 파티션, dispatch를 따로 읽으므로 세 값이 같은 시점이라는 보장은 없다.
-    partition_counts는 읽은 파티션 목록에서 상태별로 센다.
+    run, 파티션 및 dispatch 상태를 잠금 없이 각각 조회하므로 모두 같은 시점의 스냅샷이라는 보장은
+    없다. `partition_counts`는 조회한 파티션 목록을 상태별로 집계한다.
 
     Raises:
         NotFound: RUN_NOT_FOUND.

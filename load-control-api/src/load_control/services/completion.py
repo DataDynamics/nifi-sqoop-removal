@@ -1,8 +1,8 @@
-"""파티션 claim, chunk 보고 판정, 파티션 실패.
+"""파티션 소유권, chunk 보고, 완료 판정 및 실패 처리를 담당한다.
 
-이 모듈이 "모든 파티션이 끝났는가"를 판정하는 핵심이다. 모든 함수는 run 행을 먼저 잠가
-같은 run의 판정을 직렬화한다. 그래서 마지막 파티션들이 동시에 끝나도 run 완료와 검증 호출 예약은
-정확히 한 번 일어난다.
+이 모듈은 모든 파티션의 완료 여부를 판정하는 핵심 경로다. 항상 run 행을 먼저 잠가 같은 run의
+판정을 직렬화한다. 따라서 여러 파티션이 동시에 끝나더라도 run 완료 처리와 검증 호출 예약은 한 번만
+실행된다.
 """
 
 from uuid import UUID
@@ -50,16 +50,16 @@ async def _lock_run_and_partition(conn: AsyncConnection, run_id: UUID,
 
 async def claim(conn: AsyncConnection, run_id: UUID, partition_id: str,
                 req: ClaimRequest) -> ClaimResponse:
-    """파티션 처리 소유권을 준다. claimed=false면 NiFi Worker는 Oracle 조회를 시작하지 않는다.
+    """NiFi worker에 파티션 처리 소유권을 부여한다.
 
-    - run이 EXTRACTING이 아니면(실패·종료) 거절
-    - 같은 token 재요청(응답 유실 후 재시도)은 소유권 유지
-    - PENDING/RETRY만 새로 claim. RETRY의 claim은 재발행 요청의 수신 확인(ACK)이기도 하다
+    - run이 `EXTRACTING` 상태가 아니면 거절한다.
+    - 같은 token으로 다시 요청하면 기존 소유권을 유지한다.
+    - `PENDING`과 `RETRY` 상태만 새로 claim할 수 있다.
+    - `RETRY` 파티션의 claim은 재발행 요청에 대한 ACK 역할도 한다.
 
-    새 claim이면 파티션을 PENDING/RETRY → RUNNING으로 바꾸고(claim_token·worker_node 저장, attempt +1),
-    run heartbeat를 갱신하고 PARTITION_STARTED 이벤트를 남긴다. 거절은 예외가 아니라 claimed=false 응답이다
-    (중복 FlowFile·늦은 재발행은 정상 경합이므로 NiFi가 오류로 다루지 않게 한다).
-    거절 응답의 attempt는 현재 attempt_count다. 오류는 _lock_run_and_partition의 NotFound뿐이다.
+    새 claim에는 token과 worker 노드를 저장하고 시도 횟수를 올린 뒤 `PARTITION_STARTED` 이벤트를
+    남긴다. 중복 FlowFile이나 늦게 도착한 재발행은 정상적인 경합이므로 예외 대신 `claimed=false`를
+    반환한다. 이 응답을 받은 worker는 Oracle 조회를 시작하지 않는다.
     """
     run, part = await _lock_run_and_partition(conn, run_id, partition_id)
     ctx = {"runId": str(run_id), "partitionId": partition_id, "workerNode": req.worker_node}
@@ -95,16 +95,18 @@ async def claim(conn: AsyncConnection, run_id: UUID, partition_id: str,
 
 async def report_chunk(conn: AsyncConnection, run_id: UUID, partition_id: str,
                        req: ChunkReport) -> ChunkResult:
-    """chunk 보고를 기록하고 파티션·run 완료를 판정한다.
+    """chunk 보고를 기록하고 파티션과 run의 완료 여부를 판정한다.
 
-    1. run·파티션 잠금, claim token과 HDFS 경로 확인
-    2. load_file UPSERT(같은 chunk 재보고는 멱등), heartbeat 갱신
-    3. chunk가 다 모이면 파티션 판정: row 합계 일치 → SUCCESS, 불일치 → 파티션과 run 실패
-    4. 파티션이 SUCCESS가 되면 run 판정: 모두 SUCCESS이고 합계 일치 → EXTRACTED_VALIDATED + 검증 호출 예약
+    처리 순서:
 
-    판정(3·4)은 run이 EXTRACTING, 파티션이 RUNNING이고 받은 chunk 수가 chunkCount 이상일 때만 한다.
-    그 밖(진행 중, 이미 SUCCESS인 파티션의 같은 재보고, run이 이미 끝남)은 기록만 하고 현재 상태를 돌려준다.
-    run이 끝난 뒤의 보고도 기록하는 이유는 정리(PG-70) 대상 파일을 원장에 남기기 위해서다.
+    1. run과 파티션을 잠그고 claim token 및 HDFS 경로를 검증한다.
+    2. `load_file`에 UPSERT하고 heartbeat를 갱신한다. 같은 chunk의 재보고는 멱등이다.
+    3. 모든 chunk가 모이면 건수 합계를 비교해 파티션의 성공 또는 실패를 판정한다.
+    4. 모든 파티션이 성공하면 run을 `EXTRACTED_VALIDATED`로 바꾸고 검증 호출을 예약한다.
+
+    완료 판정은 run이 `EXTRACTING`, 파티션이 `RUNNING`이고 받은 chunk 수가 `chunkCount` 이상일 때만
+    수행한다. 그 밖의 경우에는 파일만 기록하고 현재 상태를 반환한다. run 종료 후 도착한 보고도
+    기록하여 Cleanup이 삭제해야 할 파일을 원장에 남긴다.
 
     상태 전이와 기록:
     - 성공: 파티션 RUNNING → SUCCESS, success_partition_count +1, PARTITION_SUCCESS 이벤트.
@@ -113,7 +115,7 @@ async def report_chunk(conn: AsyncConnection, run_id: UUID, partition_id: str,
     - 불일치(chunk 누락·중복 chunkCount·row 합계 차이): 파티션 → FAILED, run EXTRACTING → FAILED_EXTRACT
       (ROW_COUNT_MISMATCH), PARTITION_FAILED·RUN_FAILED 이벤트. 이 경우도 예외가 아니라 결과로 돌려준다.
 
-    run 행 잠금으로 같은 run의 보고가 직렬화되므로 run 완료와 검증 예약은 정확히 한 번 일어난다.
+    run 행 잠금으로 같은 run의 보고를 직렬화하므로 완료 처리와 검증 예약은 정확히 한 번만 일어난다.
 
     Raises:
         Unprocessable: CHUNK_INDEX_OUT_OF_RANGE(chunkIndex >= chunkCount),
@@ -130,8 +132,8 @@ async def report_chunk(conn: AsyncConnection, run_id: UUID, partition_id: str,
         # 재발행 후 늦게 살아난 이전 Worker이거나 잘못된 FlowFile이다.
         log.warning("chunk_claim_mismatch", partitionStatus=part.status, **ctx)
         raise Conflict("CLAIM_MISMATCH")
-    # 파일은 반드시 이 run 전용 경로 아래에 있어야 한다. 접두어 비교에 "/"를 붙여 run 경로와 접두어만 같은
-    # 다른 디렉터리를 막고, ".." 경로 조각으로 run 경로를 벗어나는 것도 막는다(정리는 run 경로 단위로 한다).
+    # Cleanup은 run 경로 전체를 지우므로 파일이 반드시 그 아래에 있어야 한다. 비교할 접두어 끝에 `/`를
+    # 붙여 이름만 비슷한 다른 디렉터리를 제외하고, `..`로 상위 경로를 가리키는 입력도 거부한다.
     if (run.hdfs_run_path is None or not req.hdfs_path.startswith(run.hdfs_run_path + "/")
             or ".." in req.hdfs_path.split("/")):
         log.warning("chunk_path_outside_run", hdfsPath=req.hdfs_path, hdfsRunPath=run.hdfs_run_path, **ctx)
@@ -148,7 +150,7 @@ async def report_chunk(conn: AsyncConnection, run_id: UUID, partition_id: str,
     await partitions.touch(conn, run_id, partition_id)
     await runs.touch(conn, run_id)
 
-    # 판정은 이번 보고만이 아니라 원장(load_file)의 WRITTEN chunk 전체 집계로 한다.
+    # 이번 요청의 값만 보지 않고 원장에 기록된 모든 `WRITTEN` chunk를 집계해 판정한다.
     agg = await files.aggregate(conn, run_id, partition_id)
     result = ChunkResult(recorded=True, partition_status=PartitionStatus(part.status),
                          run_status=RunStatus(run.status), received_chunks=agg.files,

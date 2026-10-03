@@ -1,8 +1,9 @@
-"""검증 flow 연동: 시작, 지표 기록, staging 통과, 최종 성공.
+"""검증 flow의 시작, 지표 기록, staging 통과 및 최종 성공을 처리한다.
 
-상태 흐름: EXTRACTED_VALIDATED → STAGE_VALIDATING(start) → STAGING_VALIDATED(stage_validated)
-→ (게시: publish 모듈) → PUBLISHED → SUCCESS(succeed). 통과 판정은 NiFi가 보낸 결론이 아니라 API에
-저장된 지표(load_validation)의 result로 한다. 모든 함수는 load_run 행을 먼저 잠근다.
+상태는 `EXTRACTED_VALIDATED → STAGE_VALIDATING → STAGING_VALIDATED → (게시) →
+PUBLISHED → SUCCESS` 순서로 전이한다. 검증 통과 여부는 NiFi가 보낸 결론을 신뢰하지 않고
+`load_validation.result`에 저장된 지표로 다시 판정한다. 상태를 다루는 함수는 먼저 `load_run` 행을
+잠근다.
 """
 
 from uuid import UUID
@@ -26,8 +27,8 @@ from load_control.schemas.validation import (
 
 log = structlog.get_logger(__name__)
 
-# stage별로 지표를 받을 수 있는 run 상태
-# (STAGING 지표는 검증 진행 중에만, TARGET 지표는 게시 완료 뒤에만 받는다.)
+# 단계별로 지표를 받을 수 있는 run 상태. STAGING 지표는 검증 중에, TARGET 지표는 게시를 마친 뒤에만
+# 기록할 수 있다.
 _STAGE_STATUS = {"STAGING": RunStatus.STAGE_VALIDATING, "TARGET": RunStatus.PUBLISHED}
 
 
@@ -40,13 +41,14 @@ async def _lock(conn: AsyncConnection, run_id: UUID) -> RunRow:
 
 
 async def start(conn: AsyncConnection, run_id: UUID, req: ValidationStartRequest) -> ValidationStartResponse:
-    """EXTRACTED_VALIDATED → STAGE_VALIDATING CAS. 성공한 호출만 started=true(중복 dispatch 제거).
+    """검증을 시작하며 `EXTRACTED_VALIDATED → STAGE_VALIDATING`으로 전이한다.
 
-    잠금 순서 load_run → load_dispatch. 요청의 dispatchId가 이 run의 VALIDATE_RUN인지 확인하고, CAS 결과와
-    관계없이 dispatch를 ACKED로 바꾼다(호출이 NiFi에 도달했다는 확인이므로 outbox 재전송을 멈춘다).
-    CAS에 성공하면 STAGE_VALIDATION_STARTED 이벤트를 남기고, 검증 flow가 쓸 run 정보(SCN, HDFS 경로,
-    stage table, source·extracted 건수, SOURCE 지표)를 돌려준다. 실패하면 started=false와 현재 상태만
-    돌려준다.
+    `load_run → load_dispatch` 순서로 잠근다. 요청의 `dispatchId`가 이 run의 `VALIDATE_RUN`인지
+    확인한 뒤, 상태 전이 성공 여부와 관계없이 dispatch를 `ACKED`로 바꾼다. 이는 호출이 NiFi에
+    도착했다는 뜻이므로 outbox 재전송을 멈춰도 되기 때문이다.
+
+    첫 호출만 `started=true`를 반환하고 `STAGE_VALIDATION_STARTED` 이벤트를 남긴다. 중복 호출은
+    `started=false`와 현재 상태만 반환한다.
 
     Raises:
         NotFound: RUN_NOT_FOUND.
@@ -108,10 +110,10 @@ async def record(conn: AsyncConnection, run_id: UUID, req: ValidationsRequest) -
 
 
 def _judge(metrics: list[dict[str, object]]) -> list[str]:
-    """지표 목록의 불통과 사유를 돌려준다. 빈 목록이면 통과다.
+    """저장된 지표를 검사해 불통과 사유를 반환한다.
 
-    지표가 하나도 없으면 NO_METRICS로 불통과다(검증을 건너뛴 채 통과하는 것을 막는다).
-    query_version이 여러 개면 모두 보며 하나라도 FAIL이면 불통과다.
+    지표가 없으면 검증을 건너뛴 것으로 보고 `NO_METRICS`를 반환한다. 여러 `query_version`의 지표가
+    섞여 있어도 모두 검사하며, `FAIL`인 지표는 각각 사유에 포함한다. 빈 목록을 반환하면 통과다.
     """
     if not metrics:
         return ["NO_METRICS"]
@@ -131,14 +133,12 @@ def _count(metrics: list[dict[str, object]], name: str) -> int | None:
 
 
 async def stage_validated(conn: AsyncConnection, run_id: UUID) -> StageValidatedResponse:
-    """저장된 STAGING 지표가 모두 PASS일 때만 STAGING_VALIDATED. NiFi 판정을 그대로 믿지 않는다.
+    """저장된 STAGING 지표가 모두 통과했을 때만 `STAGING_VALIDATED`로 전이한다.
 
-    STAGE_VALIDATING → STAGING_VALIDATED CAS이며 STAGE_COUNT 지표 값을 staging_count로 저장하고
-    STAGE_VALIDATED 이벤트를 남긴다. 이미 STAGING_VALIDATED면 stage_validated=true(멱등).
-    다른 상태이거나 지표가 통과하지 못하면 예외 없이 stage_validated=false와 사유(reasons)를 돌려준다.
-    불통과여도 run을 실패로 바꾸지 않는다. 실패 확정은 NiFi가
-    /fail(STAGE_VALIDATING → FAILED_STAGE_VALIDATION)로 한다.
-    오류는 NotFound(RUN_NOT_FOUND)뿐이다.
+    통과하면 `STAGE_COUNT`를 `staging_count`에 저장하고 `STAGE_VALIDATED` 이벤트를 남긴다. 이미
+    전이된 요청은 성공으로 응답한다. 상태가 맞지 않거나 지표가 통과하지 못하면 예외를 내지 않고
+    `stage_validated=false`와 사유를 반환한다. 이 함수는 run을 실패로 바꾸지 않는다. 실패 확정은
+    NiFi가 `/fail` 엔드포인트로 요청한다.
     """
     run = await _lock(conn, run_id)
     if run.status == RunStatus.STAGING_VALIDATED:
@@ -162,12 +162,12 @@ async def stage_validated(conn: AsyncConnection, run_id: UUID) -> StageValidated
 
 
 async def succeed(conn: AsyncConnection, run_id: UUID, req: SuccessRequest) -> SuccessResponse:
-    """저장된 TARGET 지표가 모두 PASS일 때만 PUBLISHED → SUCCESS.
+    """저장된 TARGET 지표가 모두 통과했을 때만 `PUBLISHED → SUCCESS`로 전이한다.
 
-    target_count는 요청 값이 있으면 그것을, 없으면 TARGET_COUNT 지표 값을 쓴다. completed_at을 기록하고
-    RUN_SUCCESS 이벤트를 남긴다(이후 보존 기간이 지나면 정리 대상). 이미 SUCCESS면 success=true(멱등).
-    다른 상태이거나 지표가 통과하지 못하면 예외 없이 success=false와 사유를 돌려준다. 실패 확정은 NiFi가
-    /fail(PUBLISHED → FAILED_TARGET_VALIDATION)로 한다. 오류는 NotFound(RUN_NOT_FOUND)뿐이다.
+    `target_count`는 요청값을 우선 사용하고, 없으면 `TARGET_COUNT` 지표에서 가져온다. 성공 시
+    `completed_at`과 `RUN_SUCCESS` 이벤트를 기록한다. 이미 성공한 요청은 성공으로 응답한다. 상태가
+    맞지 않거나 지표가 통과하지 못하면 `success=false`와 사유를 반환하며, 실패 확정은 NiFi가
+    `/fail` 엔드포인트로 요청한다.
     """
     run = await _lock(conn, run_id)
     if run.status == RunStatus.SUCCESS:

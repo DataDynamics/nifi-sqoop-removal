@@ -1,12 +1,13 @@
-"""설정: config.yaml.
+"""`config.yaml` 기반 애플리케이션 설정.
 
-로드 순서(앞이 우선): 생성자 인자 > 환경변수 > config.yaml > 기본값.
-- 파일 위치: LCA_CONFIG 환경변수, 없으면 현재 디렉터리의 config/config.yaml.
-- 환경변수 덮어쓰기는 비밀값 주입용이다. 섹션 구분자는 '__'이다. 예: LCA_DATABASE__URL
-- 모르는 키는 거부한다(오타 방지).
-- 기간(timedelta) 값은 config.yaml에 ISO 8601 기간(예: PT90M, PT6H) 또는 초 단위 숫자로 쓴다.
+설정값은 `생성자 인자 > 환경 변수 > config.yaml > 기본값` 순서로 우선한다.
 
-server와 worker 두 프로세스가 같은 파일을 읽는다. 섹션마다 어느 쪽이 쓰는지 docstring에 적었다.
+- 설정 파일은 `LCA_CONFIG`가 가리키는 경로에서 읽는다. 기본값은 `config/config.yaml`이다.
+- 환경 변수의 중첩 구분자는 `__`이다. 예: `LCA_DATABASE__URL`.
+- 알 수 없는 키는 오타로 보고 거부한다.
+- 기간은 ISO 8601 형식(예: `PT90M`, `PT6H`) 또는 초 단위 숫자로 입력한다.
+
+server와 worker는 같은 파일을 읽으며, 각 설정 클래스에 사용하는 프로세스를 명시한다.
 """
 
 import os
@@ -27,8 +28,8 @@ from pydantic_settings import (
 CONFIG_ENV = "LCA_CONFIG"
 DEFAULT_CONFIG_FILE = "config/config.yaml"  # 설치 디렉터리(bin 스크립트의 작업 디렉터리) 기준
 
-# Settings.load()가 읽을 config.yaml 경로를 settings_customise_sources에 넘기는 통로.
-# 클래스 변수 대신 ContextVar를 써서 load() 호출 동안에만 값이 보이게 한다(테스트 격리).
+# `Settings.load()`가 선택한 파일 경로를 `settings_customise_sources()`에 전달한다. 클래스 변수 대신
+# `ContextVar`를 사용해 현재 호출에만 경로가 보이게 하고 병렬 테스트 사이의 간섭을 막는다.
 _config_file: ContextVar[Path | None] = ContextVar("lca_config_file", default=None)
 
 
@@ -45,12 +46,12 @@ class Section(BaseModel):
 class ServerSettings(Section):
     """API HTTP 서버(uvicorn) 설정. `python -m load_control.server`가 읽는다."""
 
-    host: str = "0.0.0.0"  # bind address. 같은 호스트의 프록시 뒤에만 둔다면 127.0.0.1
-    port: int = Field(default=8080, ge=1, le=65535)  # listen 포트. 모니터 api_url 기본값도 이 포트를 쓴다
+    host: str = "0.0.0.0"  # 바인딩 주소. 같은 호스트의 프록시만 접근하면 127.0.0.1 사용
+    port: int = Field(default=8080, ge=1, le=65535)  # 수신 포트. 모니터의 기본 API 주소에도 사용
     workers: int = Field(default=1, ge=1)  # 프로세스 수. 1보다 크면 메트릭은 프로세스별로 나뉜다
     root_path: str = ""  # 리버스 프록시가 경로 접두사를 붙일 때(예: /load-control)
-    proxy_headers: bool = True  # X-Forwarded-For/Proto를 신뢰할지
-    forwarded_allow_ips: str = "127.0.0.1"  # proxy_headers를 신뢰할 프록시 IP 목록(쉼표 구분, "*" 가능)
+    proxy_headers: bool = True  # `X-Forwarded-For`와 `X-Forwarded-Proto` 헤더 신뢰 여부
+    forwarded_allow_ips: str = "127.0.0.1"  # 신뢰할 프록시 IP. 쉼표로 구분하며 `*`도 허용
     timeout_keep_alive: int = Field(default=5, ge=1)  # 초
     timeout_graceful_shutdown: int = Field(default=30, ge=1)  # SIGTERM 후 진행 중 요청을 기다리는 초
     limit_concurrency: int | None = Field(default=None, ge=1)  # 프로세스당 동시 연결 상한, 초과 시 503
@@ -76,13 +77,13 @@ class ServerSettings(Section):
 
 
 class DatabaseSettings(Section):
-    """관리 DB(PostgreSQL nifi_ops) 연결. server, worker, alembic이 함께 쓴다."""
+    """server, worker 및 Alembic이 공유하는 관리 DB 연결 설정."""
 
-    # 비밀번호를 포함한 URL을 그대로 둔다(config.yaml은 권한 600으로 관리). 로그에는 host·DB 이름만 남긴다.
+    # URL에 비밀번호가 포함되므로 `config.yaml`은 권한 600으로 관리한다. 로그에는 호스트와 DB 이름만 남긴다.
     url: str  # postgresql+asyncpg://load_control_api:<pw>@meta:5432/nifiops (API 런타임 계정)
     migration_url: str | None = None  # alembic 전용 DDL 계정. 없으면 url 사용
-    # worker dispatcher의 LISTEN 전용: postgresql://... (asyncpg 직접 연결).
-    # 없으면 pg_notify로 깨어나지 못하고 dispatch.poll_interval 폴링만 한다.
+    # dispatcher가 PostgreSQL `LISTEN`을 유지할 때 쓰는 asyncpg 전용 DSN이다. 설정하지 않으면
+    # `pg_notify` 알림 없이 `dispatch.poll_interval` 주기로만 조회한다.
     listen_dsn: str | None = None
     pool_size: int = Field(default=10, ge=1)  # 프로세스당 SQLAlchemy 연결 pool 상시 크기
     max_overflow: int = Field(default=5, ge=0)  # pool_size를 넘어 잠시 더 열 수 있는 연결 수
@@ -112,15 +113,15 @@ class NifiSettings(Section):
 
 
 class RecoverySettings(Section):
-    """sweeper의 stale·timeout 기준(worker)."""
+    """worker의 sweeper가 정체와 시간 초과를 판단하는 기준."""
 
     # CREATED·EXTRACTING run이 시작(started_at) 후 이 시간을 넘기면 TIMED_OUT으로 끝낸다.
     run_timeout: timedelta = timedelta(hours=6)
     extract_query_timeout: timedelta = timedelta(minutes=60)  # NiFi EXTRACT.QUERY.TIMEOUT과 같은 값
     # RUNNING 파티션의 heartbeat(claim·chunk 보고 때 갱신)가 이보다 오래되면 멈춘 것으로 본다.
     stale: timedelta = timedelta(minutes=90)
-    # 멈춘 파티션 처리. FAIL: run과 미완료 파티션을 TIMED_OUT으로 끝낸다(새 run으로 재실행).
-    # REISSUE: 파티션을 RETRY로 되돌리고 재발행 dispatch를 넣는다. Oracle undo 보존이 run보다 길 때만 쓴다.
+    # `FAIL`은 run과 미완료 파티션을 `TIMED_OUT`으로 끝낸다. `REISSUE`는 정체된 파티션을 `RETRY`로
+    # 되돌리고 재발행한다. 같은 SCN을 다시 읽어야 하므로 Oracle undo 보존 시간이 충분할 때만 사용한다.
     mode: Literal["FAIL", "REISSUE"] = "FAIL"
     max_attempts: int = Field(default=3, ge=1)  # REISSUE 모드에서 이 횟수에 도달하면 run TIMED_OUT
     # STAGE_VALIDATING·PUBLISHED run이 이 시간 동안 변화가 없으면 ERROR 이벤트만 남긴다(자동 전이 없음).
@@ -142,7 +143,7 @@ class RecoverySettings(Section):
 
 
 class DispatchSettings(Section):
-    """outbox(load_dispatch) 전달 정책(worker dispatcher)."""
+    """worker dispatcher의 outbox(`load_dispatch`) 전달 정책."""
 
     # 전송 시도 상한. 시도 횟수는 lease할 때마다 1씩 늘고, 이 횟수째 시도까지 실패하면 DEAD로 바꾼다.
     # 4xx 응답은 설정 오류로 보고 횟수와 관계없이 바로 DEAD.
@@ -152,9 +153,8 @@ class DispatchSettings(Section):
     backoff_max: timedelta = timedelta(minutes=5)
     # SENT(NiFi가 2xx로 받음) 후 이 시간 안에 /validation/start(ACK)가 없으면 sweeper가 다시 PENDING으로.
     ack_timeout: timedelta = timedelta(minutes=10)
-    # 전송 전 선점 기간. 전송 중 worker가 죽으면 이 시간이 지난 뒤 다른 worker가 다시 가져간다.
-    # NiFi 호출 timeout(nifi.timeout_seconds)보다 길어야 한다.
-    # 짧으면 전송 중인 행을 다른 worker가 또 가져간다.
+    # 전송 전 행을 선점하는 기간이다. worker가 전송 중 종료되면 이 시간이 지난 뒤 다른 worker가 다시
+    # 가져간다. 중복 선점을 막으려면 `nifi.timeout_seconds`보다 길어야 한다.
     lease: timedelta = timedelta(seconds=60)
     poll_interval: timedelta = timedelta(seconds=5)  # pg_notify를 놓쳤을 때를 대비한 폴링 주기
     batch: int = Field(default=20, ge=1)  # 한 번에 lease해서 동시에 보내는 최대 dispatch 수
@@ -202,8 +202,8 @@ class LogFileSettings(Section):
 def _default_logger_levels() -> dict[str, LogLevel]:
     """외부 라이브러리 logger의 기본 수준.
 
-    SQL·HTTP 클라이언트 로그는 너무 잦아 WARNING으로 낮추고, uvicorn 시작·종료와 alembic
-    migration 진행은 INFO로 남긴다.
+    빈번한 SQL·HTTP 클라이언트 로그는 `WARNING` 이상만 남긴다. Uvicorn의 시작·종료와 Alembic의
+    migration 진행 상황은 `INFO` 이상을 남긴다.
     """
     return {"sqlalchemy.engine": "WARNING", "asyncpg": "WARNING", "httpx": "WARNING",
             "httpcore": "WARNING", "uvicorn.error": "INFO", "alembic": "INFO"}

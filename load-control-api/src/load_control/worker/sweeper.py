@@ -1,18 +1,16 @@
-"""stale·timeout 정리. worker마다 돌아도 advisory lock을 얻은 하나만 실행한다.
+"""요청 없이 정체된 run, 파티션 및 dispatch를 복구한다.
 
-run이 멈추면 NiFi에서 요청이 오지 않으므로, 요청과 관계없이 recovery.sweeper_interval마다 돌며
-다음 규칙을 순서대로 적용한다(설계 문서 8장).
+NiFi가 더 이상 요청을 보내지 않는 상황도 복구할 수 있도록 `recovery.sweeper_interval`마다 다음
+규칙을 순서대로 적용한다. 자세한 흐름은 설계 문서 8장을 참고한다.
 
-1. heartbeat가 recovery.stale보다 오래된 RUNNING 파티션: mode=FAIL이면 run TIMED_OUT,
-   mode=REISSUE면 파티션을 RETRY로 되돌리고 재발행 dispatch를 만든다(최대 시도 초과 시 FAIL과 같게).
-2. 시작 후 recovery.run_timeout이 지난 CREATED/EXTRACTING run: TIMED_OUT.
-3. SENT 후 dispatch.ack_timeout 동안 ACK가 없는 dispatch: PENDING으로 되돌려 재전송.
-4. recovery.validation_stale 동안 변화 없는 STAGE_VALIDATING/PUBLISHED run: ERROR 이벤트만 남긴다.
-5. recovery.publish_stale이 지난 PUBLISHING run: PUBLISH_UNKNOWN(자동 재실행 없음, 운영자가 확정).
+1. 정체된 `RUNNING` 파티션: run을 `TIMED_OUT`으로 끝내거나 파티션을 재발행한다.
+2. 전체 제한 시간을 넘긴 `CREATED`/`EXTRACTING` run: `TIMED_OUT`으로 끝낸다.
+3. ACK가 오지 않은 `SENT` dispatch: `PENDING`으로 되돌려 재전송한다.
+4. 검증이 정체된 run: 상태는 유지하고 오류 이벤트만 남긴다.
+5. 게시 결과가 오지 않은 run: `PUBLISH_UNKNOWN`으로 바꿔 운영자 확인을 기다린다.
 
-한 바퀴의 모든 규칙은 하나의 트랜잭션에서 실행되며, 트랜잭션 범위 advisory lock
-(pg_try_advisory_xact_lock)을 얻은 worker 하나만 실제로 처리한다. 대상 run은 FOR UPDATE SKIP LOCKED로
-가져오므로 server가 같은 run을 처리 중이면 이번 바퀴에서는 건너뛰고 다음 바퀴에 다시 본다.
+한 주기의 규칙은 하나의 트랜잭션에서 실행한다. 여러 worker 중 advisory lock을 얻은 하나만 처리하며,
+`FOR UPDATE SKIP LOCKED`로 잠긴 run은 건너뛰고 다음 주기에 다시 확인한다.
 """
 
 import asyncio
@@ -34,16 +32,14 @@ log = structlog.get_logger(__name__)
 
 
 async def _stale_partitions(conn: AsyncConnection, s: Settings, done: Counter[str]) -> None:
-    """heartbeat가 끊긴 RUNNING 파티션이 있는 EXTRACTING run을 재발행하거나 TIMED_OUT으로 끝낸다.
+    """heartbeat가 끊긴 파티션을 재발행하거나 run을 시간 초과로 끝낸다.
 
-    run 행을 SKIP LOCKED로, 그 run의 stale 파티션을 FOR UPDATE로 잠근다(잠금 순서 run → partition).
-    - mode=REISSUE이고 stale 파티션 중 attempt_count가 recovery.max_attempts에 도달한 것이 없으면:
-      파티션마다 RUNNING → RETRY(claim token 초기화, 이전 Worker의 늦은 보고는 CLAIM_MISMATCH가 됨),
-      이전 시도의 WRITTEN chunk를 FAILED로 무효화, REISSUE_PARTITION dispatch 예약(pg_notify 포함),
-      RECOVERY_REISSUED 이벤트를 남긴다. run heartbeat도 갱신한다. run 상태는 EXTRACTING 그대로다.
-    - 그 밖(mode=FAIL, 또는 REISSUE인데 시도 횟수 소진): run의 미완료 파티션을 모두 TIMED_OUT으로,
-      run을 EXTRACTING → TIMED_OUT(CAS)으로 바꾸고 RUN_TIMED_OUT 이벤트를 남긴다. 오류 코드는
-      PARTITION_STALE 또는 REISSUE_ATTEMPTS_EXHAUSTED.
+    잠금 순서는 `run → partition`이다.
+
+    - `REISSUE`이고 모든 파티션에 재시도 횟수가 남아 있으면 기존 claim과 chunk를 무효화하고
+      `REISSUE_PARTITION` dispatch를 만든다. run은 `EXTRACTING` 상태를 유지한다.
+    - `FAIL`이거나 한 파티션이라도 최대 시도 횟수에 도달했으면 미완료 파티션과 run 전체를
+      `TIMED_OUT`으로 끝낸다. 일부 파티션만 재발행하지는 않는다.
 
     Args:
         conn: advisory lock을 잡은 sweeper 트랜잭션의 연결.
@@ -78,12 +74,11 @@ async def _stale_partitions(conn: AsyncConnection, s: Settings, done: Counter[st
 
 
 async def _run_deadline(conn: AsyncConnection, s: Settings, done: Counter[str]) -> None:
-    """시작 후 recovery.run_timeout이 지난 CREATED/EXTRACTING run을 TIMED_OUT으로 끝낸다.
+    """전체 실행 제한 시간을 넘긴 `CREATED`/`EXTRACTING` run을 끝낸다.
 
-    manifest가 오지 않거나 추출이 너무 오래 걸리는 run이 대상이다. run을 SKIP LOCKED로 잠근 뒤
-    미완료 파티션을 TIMED_OUT(RUN_TIMEOUT)으로 바꾸고, 지금 상태를 기대값으로 한 CAS로 run을
-    TIMED_OUT으로 바꾸며, RUN_TIMED_OUT 이벤트를 남긴다. 앞 규칙에서 이미 TIMED_OUT이 된 run은
-    같은 트랜잭션 안에서 상태가 바뀌었으므로 다시 잡히지 않는다.
+    manifest가 오지 않거나 추출이 오래 걸리는 경우다. run을 잠근 뒤 미완료 파티션과 run을
+    `TIMED_OUT`으로 바꾸고 `RUN_TIMED_OUT` 이벤트를 남긴다. 앞 규칙에서 이미 처리한 run은 같은
+    트랜잭션에서 상태가 바뀌었으므로 다시 조회되지 않는다.
 
     Args:
         conn: sweeper 트랜잭션의 연결.
@@ -102,15 +97,11 @@ async def _run_deadline(conn: AsyncConnection, s: Settings, done: Counter[str]) 
 
 
 async def _unacked_dispatches(conn: AsyncConnection, s: Settings, done: Counter[str]) -> None:
-    """SENT 후 dispatch.ack_timeout 동안 ACK가 없는 dispatch를 PENDING으로 되돌려 다시 보내게 한다.
+    """제한 시간 안에 ACK가 오지 않은 `SENT` dispatch를 복구한다.
 
-    NiFi가 202로 받은 직후 노드가 죽어 검증·재발행 flow가 시작되지 않은 경우를 복구한다. run이 아직
-    그 호출을 기다리는 상태일 때만 되돌린다(VALIDATE_RUN은 run EXTRACTED_VALIDATED, REISSUE_PARTITION은
-    run EXTRACTING이고 파티션 RETRY). 되돌린 run마다 DISPATCH_REQUEUED 이벤트를 한 번 남기고,
-    하나라도 있으면 pg_notify로 dispatcher를 깨운다(NOTIFY는 이 트랜잭션이 커밋될 때 전달된다).
-    attempt_count는 초기화하지 않는다. 이미 dispatch.max_attempts번 보냈는데도 ACK가 없으면 되돌리지
-    않고 DEAD로 바꿔 DISPATCH_DEAD(ERROR) 이벤트를 남긴다(202만 받고 flow가 시작되지 않는 상태가 계속될 때
-    무한 재전송을 막고 TUI 경보로 알린다).
+    NiFi가 202를 반환한 직후 노드가 종료되어 flow가 시작되지 않은 경우를 복구한다. run이 여전히 해당
+    호출을 기다리는 상태일 때만 `PENDING`으로 되돌리고 dispatcher를 깨운다. `attempt_count`는 유지한다.
+    최대 시도 횟수까지 ACK가 없으면 무한 재전송을 막기 위해 `DEAD`로 바꾸고 오류 이벤트를 남긴다.
 
     Args:
         conn: sweeper 트랜잭션의 연결.
@@ -139,12 +130,11 @@ async def _unacked_dispatches(conn: AsyncConnection, s: Settings, done: Counter[
 
 
 async def _stale_publishing(conn: AsyncConnection, s: Settings, done: Counter[str]) -> None:
-    """recovery.publish_stale 동안 게시 결과가 오지 않은 PUBLISHING run을 PUBLISH_UNKNOWN으로 바꾼다.
+    """게시 결과가 제한 시간 안에 오지 않은 run을 `PUBLISH_UNKNOWN`으로 바꾼다.
 
-    게시(target 반영)가 실제로 됐는지 API가 알 수 없으므로 자동으로 재실행하거나 실패 처리하지 않는다.
-    PUBLISH_UNKNOWN은 진행 중인 run으로 취급되어(uq_load_run_active) 같은 business_key의 새 run을 막고,
-    운영자가 /publish-unknown/resolve로 PUBLISHED 또는 FAILED_PUBLISH로 확정한다.
-    PUBLISH_UNKNOWN(ERROR) 이벤트를 남긴다.
+    API는 target 반영 여부를 알 수 없으므로 게시를 자동으로 재실행하거나 실패 처리하지 않는다.
+    이 상태는 활성 run으로 취급해 같은 업무 키의 새 run을 막는다. 운영자가 실제 결과를 확인한 뒤
+    `/publish-unknown/resolve`로 확정해야 한다.
 
     Args:
         conn: sweeper 트랜잭션의 연결.
@@ -161,14 +151,12 @@ async def _stale_publishing(conn: AsyncConnection, s: Settings, done: Counter[st
 
 
 async def sweep_once(engine: AsyncEngine, settings: Settings) -> dict[str, int] | None:
-    """한 번 정리한다. 다른 worker가 실행 중이면 None.
+    """복구 규칙을 한 번 실행하고 규칙별 처리 건수를 반환한다.
 
-    모든 규칙을 하나의 트랜잭션(in_tx)에서 실행한다. 먼저 트랜잭션 범위 advisory lock을 시도하고,
-    다른 worker가 잡고 있으면 아무것도 하지 않고 None을 돌려준다. lock은 커밋·롤백 때 자동으로 풀린다.
-    규칙마다 SAVEPOINT를 두어, 한 규칙에서 예외가 나면 그 규칙의 변경만 롤백하고 오류 로그
-    (sweeper_rule_error)를 남긴 뒤 나머지 규칙을 계속한다. 한 run의 데이터 문제 같은 지속 오류가
-    다른 복구(시간 초과, ACK 재전송, PUBLISH_UNKNOWN 전환)까지 막지 않게 하기 위해서다.
-    실패한 규칙은 다음 주기에 다시 시도된다.
+    트랜잭션 범위 advisory lock을 다른 worker가 보유하고 있으면 `None`을 반환한다. 각 규칙은 별도의
+    SAVEPOINT에서 실행한다. 한 규칙이 실패하면 그 규칙의 변경만 rollback하고 나머지는 계속 처리한다.
+    따라서 특정 데이터의 지속적인 오류가 다른 복구 작업까지 막지 않으며, 실패한 규칙은 다음 주기에
+    다시 시도된다.
 
     Returns:
         처리 건수가 0이 아닌 규칙만 담은 {규칙 이름: 건수}. 할 일이 없었으면 빈 dict,

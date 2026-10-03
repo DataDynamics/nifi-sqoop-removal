@@ -1,19 +1,16 @@
-"""outbox(load_dispatch)를 NiFi PG-05로 전달한다.
+"""outbox(`load_dispatch`)에 쌓인 요청을 NiFi PG-05로 전달한다.
 
-server는 run 완료 판정(또는 sweeper는 재발행 결정)과 같은 트랜잭션에서 load_dispatch 행만 만들고,
-실제 HTTP 호출은 커밋 뒤에 이 dispatcher가 한다. 그래서 "호출은 됐는데 커밋 실패"나
-"커밋은 됐는데 호출 실패"가 생기지 않는다.
+server와 sweeper는 상태 변경 트랜잭션에서 `load_dispatch` 행만 만든다. dispatcher는 commit된 행을
+읽어 실제 HTTP 요청을 보낸다. 이 outbox 구조는 상태 변경이 rollback됐는데 외부 호출만 실행되는
+문제를 막는다.
 
 전달 방식:
-- 깨우기: pg_notify(LISTEN)로 즉시 깨어나고, 알림을 놓쳐도 dispatch.poll_interval마다 확인한다.
-- 선점(lease): 짧은 트랜잭션에서 FOR UPDATE SKIP LOCKED로 행을 골라 attempt_count를 올리고
-  next_attempt_at을 lease만큼 미룬 뒤 바로 커밋한다. 상태는 PENDING 그대로라서 전송 중 worker가
-  죽으면 lease가 끝난 뒤 다른 worker(또는 재시작한 자신)가 다시 가져간다. 여러 worker가 동시에
-  돌아도 같은 행을 동시에 보내지 않는다.
-- 결과: 2xx → SENT, 연결 실패·5xx 등 → backoff 뒤 재시도(PENDING 유지), 4xx·본문 생성 실패·
-  최대 시도 초과 → DEAD(DISPATCH_DEAD 이벤트). DEAD는 운영자가 resend로 되살린다.
-- 전달은 "최소 1회"다. 중복 수신은 NiFi 쪽 /validation/start의 CAS(첫 요청만 started=true)와
-  재발행 claim token으로 걸러진다.
+
+- 깨우기: `LISTEN/NOTIFY`로 즉시 깨우며, 알림을 놓쳐도 설정된 주기마다 다시 조회한다.
+- 선점: `FOR UPDATE SKIP LOCKED`로 행을 lease한다. 전송 중 worker가 종료되면 lease 만료 후 다른
+  worker가 다시 가져간다.
+- 결과: 2xx는 `SENT`, 일시 오류는 backoff 후 재시도, 영구 오류나 최대 시도 초과는 `DEAD`로 기록한다.
+- 보장 수준: 최소 1회 전달이다. 중복 요청은 NiFi의 CAS와 claim token으로 걸러낸다.
 """
 
 import asyncio
@@ -40,10 +37,10 @@ RETRYABLE_4XX = frozenset({408, 425, 429})
 
 
 def backoff(settings: Settings, attempt: int) -> timedelta:
-    """attempt(1부터)에 따른 지수 backoff. min × 2^(attempt-1), 상한 max.
+    """시도 횟수에 따른 지수 backoff를 계산한다.
 
-    attempt는 lease 때 이미 1 올린 load_dispatch.attempt_count이므로 첫 실패 뒤에는 backoff_min을
-    기다린다. 기본값(5초, 상한 5분)이면 5s, 10s, 20s, ... 5분으로 늘어난다.
+    계산식은 `min × 2^(attempt-1)`이며 `max`를 넘지 않는다. `attempt`는 lease할 때 이미 1 증가한
+    값이므로 첫 실패 후에는 `backoff_min`만큼 기다린다.
 
     Args:
         settings: dispatch.backoff_min/backoff_max를 읽을 설정.
@@ -117,12 +114,11 @@ class Dispatcher:
         self.wake = asyncio.Event()
 
     async def dispatch_once(self) -> int:
-        """기한이 된 dispatch를 모두 보낸다. 보낸 건수를 돌려준다.
+        """전송 기한이 된 dispatch를 모두 처리하고 시도한 건수를 반환한다.
 
-        dispatch.batch개씩 lease로 선점(별도 짧은 트랜잭션, 커밋 후 전송)하고 한 batch를 동시에
-        보낸다. 선점할 행이 없을 때까지 반복한다. 반환값은 전송을 시도한 건수이며 성공 건수가 아니다.
-        send_one 안에서 DB 오류 같은 예외가 나면 그대로 올라가 run()이 로그를 남긴다. 그 batch의
-        나머지 행은 lease가 끝나면 다시 선점된다.
+        `dispatch.batch`개씩 짧은 트랜잭션으로 lease한 뒤 commit하고 동시에 전송한다. 선점할 행이
+        없을 때까지 반복한다. 반환값은 성공 건수가 아니라 전송을 시도한 건수다. batch 처리 중 예외가
+        발생하면 남은 행은 lease 만료 후 다시 처리할 수 있다.
         """
         sent = 0
         while True:
@@ -135,7 +131,7 @@ class Dispatcher:
             sent += len(batch)
 
     async def send_one(self, d: LeasedDispatch) -> None:
-        """dispatch 하나를 보내고 결과(SENT, 재시도, DEAD)를 기록한다.
+        """dispatch 하나를 전송하고 `SENT`, 재시도 또는 `DEAD` 결과를 기록한다.
 
         처리 규칙:
         - 본문 생성·URL 계산 실패: 설정·데이터 문제라 재시도해도 같으므로 바로 DEAD.
@@ -146,7 +142,8 @@ class Dispatcher:
           일시적 거절(앞단 proxy·LB의 timeout, 요청 제한)이므로 _retry.
         - 그 밖(5xx, 3xx 등): _retry.
 
-        HTTP 호출 동안에는 트랜잭션을 열지 않는다. 각 결과 기록은 별도 짧은 트랜잭션이다.
+        HTTP 응답을 기다리는 동안에는 DB 트랜잭션을 열어 두지 않는다. 결과만 별도의 짧은
+        트랜잭션으로 기록한다.
         """
         s = self.settings
         try:
@@ -229,12 +226,11 @@ class Dispatcher:
                   type=d.dispatch_type, httpStatus=status, attempt=d.attempt_count, error=error[:300])
 
     async def run(self, stop: asyncio.Event) -> None:
-        """LISTEN으로 즉시 깨어나고, 알림을 놓쳐도 poll 주기마다 확인한다.
+        """알림이나 polling으로 dispatch를 찾아 전송하는 주 루프.
 
-        한 바퀴: dispatch_once로 기한이 된 행을 모두 보낸 뒤, wake(알림) 또는 stop이 set되거나
-        dispatch.poll_interval이 지날 때까지 기다린다. backoff로 미뤄진 행은 알림 없이 poll 때
-        집어 간다. dispatch_once의 예외는 로그만 남기고 다음 바퀴로 넘어간다(DB 일시 장애 등).
-        stop이 set되면 진행 중인 batch를 마친 뒤 루프를 빠져나오고 LISTEN 태스크를 취소한다.
+        기한이 된 행을 모두 처리한 뒤 PostgreSQL 알림, 종료 요청 또는 polling 주기 만료를 기다린다.
+        처리 중 일시 오류가 발생하면 로그를 남기고 다음 주기에 재시도한다. 종료 요청을 받으면 진행
+        중인 batch를 마친 뒤 `LISTEN` 태스크를 정리한다.
         """
         listener_task = asyncio.create_task(self._listen(stop))
         poll = self.settings.dispatch.poll_interval.total_seconds()

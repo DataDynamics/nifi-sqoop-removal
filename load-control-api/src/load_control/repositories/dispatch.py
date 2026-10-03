@@ -1,8 +1,8 @@
-"""outbox(load_dispatch) SQL. 상태: PENDING → SENT → ACKED, 실패 누적 시 DEAD.
+"""outbox(`load_dispatch`) SQL. 상태: `PENDING → SENT → ACKED`, 실패 누적 시 `DEAD`.
 
-API→NiFi 호출(검증 시작 VALIDATE_RUN, 파티션 재발행 REISSUE_PARTITION)은 상태 전이와 같은 트랜잭션에서
-이 테이블에 행으로만 예약한다(transactional outbox). 실제 HTTP 전송은 worker 프로세스의 dispatcher가
-commit 이후에 하므로 "상태는 바뀌었는데 호출은 안 나감" 또는 그 반대가 생기지 않는다.
+API→NiFi 호출은 상태 전이와 같은 트랜잭션에서 이 테이블에 예약한다. 실제 HTTP 전송은 commit 후
+worker의 dispatcher가 맡는다. 따라서 rollback된 상태 변경의 외부 호출이 실행되지 않으며, commit 후
+전송에 실패해도 예약이 남아 재시도하거나 `DEAD` 상태로 운영자에게 드러난다.
 
 - PENDING: 보낼 차례를 기다린다. dispatcher는 next_attempt_at을 lease로 써서 행을 선점한다.
 - SENT: NiFi가 2xx로 받았다. NiFi flow가 실제로 시작했다는 확인(ACK)을 기다린다.
@@ -19,7 +19,7 @@ from uuid import UUID
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncConnection
 
-# LISTEN/NOTIFY 채널 이름. dispatcher가 이 채널을 LISTEN하다가 새 예약이 commit되면 바로 깨어난다.
+# dispatcher가 구독하는 `LISTEN/NOTIFY` 채널. 새 예약이 commit되면 즉시 dispatcher를 깨운다.
 CHANNEL = "load_dispatch"
 
 

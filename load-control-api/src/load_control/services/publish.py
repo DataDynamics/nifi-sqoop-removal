@@ -1,10 +1,12 @@
-"""게시 소유권과 결과. INSERT OVERWRITE는 token 소유자 1명만 실행한다.
+"""게시 소유권과 `INSERT OVERWRITE` 결과를 관리한다.
 
-상태 흐름: STAGING_VALIDATED → PUBLISHING(claim) → PUBLISHED | FAILED_PUBLISH | PUBLISH_UNKNOWN(result).
-PUBLISH_UNKNOWN은 게시가 반영됐는지 알 수 없는 상태라 자동으로 끝내지 않고 운영자가 resolve_unknown으로
-PUBLISHED 또는 FAILED_PUBLISH로 확정한다. sweeper도 publish_stale 동안 결과가 없으면
-PUBLISH_UNKNOWN으로 바꾼다.
-모든 함수는 load_run 행을 먼저 잠근다.
+publish token을 가진 요청 하나만 실제 게시를 수행할 수 있다. 상태 흐름은 다음과 같다.
+
+`STAGING_VALIDATED → PUBLISHING → PUBLISHED | FAILED_PUBLISH | PUBLISH_UNKNOWN`
+
+`PUBLISH_UNKNOWN`은 게시 반영 여부를 알 수 없는 상태다. 자동으로 재시도하거나 종료하지 않으며,
+운영자가 확인 후 `PUBLISHED` 또는 `FAILED_PUBLISH`로 확정한다. `publish_stale` 동안 결과가 없어도
+sweeper가 같은 상태로 전환한다. 모든 함수는 먼저 `load_run` 행을 잠근다.
 """
 
 import logging
@@ -44,12 +46,12 @@ async def _lock(conn: AsyncConnection, run_id: UUID) -> RunRow:
 
 
 async def claim(conn: AsyncConnection, run_id: UUID, req: PublishClaimRequest) -> PublishClaimResponse:
-    """STAGING_VALIDATED → PUBLISHING. 같은 token 재요청은 claimed=true(응답 유실 재시도).
+    """게시 소유권을 부여하며 `STAGING_VALIDATED → PUBLISHING`으로 전이한다.
 
-    NiFi가 만든 publish_token을 저장하고 publish_started_at을 기록한 뒤 PUBLISH_STARTED 이벤트를 남긴다.
-    이미 PUBLISHING이면 저장된 token과 비교해 같으면 claimed=true, 다르면 claimed=false(다른 소유자)다.
-    그 밖의 상태에서는 CAS가 실패해 claimed=false를 돌려준다. 거절은 예외가 아니라 응답 값이며,
-    claimed=false를 받은 NiFi는 INSERT OVERWRITE를 실행하지 않는다. 오류는 NotFound(RUN_NOT_FOUND)뿐이다.
+    NiFi가 만든 token과 시작 시각을 저장하고 `PUBLISH_STARTED` 이벤트를 남긴다. 이미 게시 중이면
+    저장된 token이 같은 요청만 `claimed=true`를 받는다. 다른 token이나 다른 run 상태는 정상적인
+    경합으로 보고 `claimed=false`를 반환한다. 이 응답을 받은 NiFi는 `INSERT OVERWRITE`를 실행하지
+    않는다.
     """
     run = await _lock(conn, run_id)
     if run.status == RunStatus.PUBLISHING:
@@ -69,14 +71,12 @@ async def claim(conn: AsyncConnection, run_id: UUID, req: PublishClaimRequest) -
 
 
 async def result(conn: AsyncConnection, run_id: UUID, req: PublishResultRequest) -> PublishResultResponse:
-    """INSERT OVERWRITE 결과를 기록한다. token 소유자만 보고할 수 있다.
+    """token 소유자가 보고한 `INSERT OVERWRITE` 결과를 기록한다.
 
-    PUBLISH_UNKNOWN은 이후 자동으로 확정할 수 없다. 운영자가 resolve_unknown으로 확정한다.
-
-    PUBLISHING → outcome CAS다. PUBLISHED면 published_at을, 실패·불명이면 error_stage=PUBLISH와 오류 코드·
-    메시지를 남긴다. FAILED_PUBLISH만 completed_at을 기록한다(끝난 상태). PUBLISH_UNKNOWN은 아직 끝난 것이
-    아니므로 completed_at을 두지 않는다. 결과에 맞는 이벤트(_RESULT_EVENTS)를 남긴다.
-    이미 같은 outcome이면 changed=False로 성공 응답한다(멱등).
+    `PUBLISHING`에서 요청한 결과로 CAS 전이한다. 성공이면 `published_at`을, 실패 또는 결과 불명이면
+    오류 정보를 기록한다. 종료 상태인 `FAILED_PUBLISH`에만 `completed_at`을 기록한다.
+    `PUBLISH_UNKNOWN`은 운영자가 확정해야 하므로 활성 상태와 `completed_at=NULL`을 유지한다.
+    이미 같은 결과가 저장되어 있으면 멱등 재요청으로 보고 `changed=false`를 반환한다.
 
     Raises:
         NotFound: RUN_NOT_FOUND.
@@ -116,13 +116,15 @@ async def result(conn: AsyncConnection, run_id: UUID, req: PublishResultRequest)
 
 async def resolve_unknown(conn: AsyncConnection, run_id: UUID, req: PublishUnknownResolveRequest,
                           operator: str) -> PublishResultResponse:
-    """운영자가 Hive 이력과 target 지표를 확인한 뒤 PUBLISH_UNKNOWN을 확정한다.
+    """운영자가 확인한 게시 결과로 `PUBLISH_UNKNOWN`을 확정한다.
 
-    PUBLISH_UNKNOWN → PUBLISHED(published_at 기록, 오류 필드 초기화, 이후 target 검증으로 SUCCESS까지
-    진행) 또는
-    FAILED_PUBLISH(completed_at, error_code=PUBLISH_UNKNOWN_RESOLVED, error_message=사유) CAS다.
-    PUBLISH_UNKNOWN_RESOLVED(WARN) 이벤트에 결정과 operator 역할을 남긴다. 이미 같은 상태면 changed=False.
-    publish token은 확인하지 않는다(운영자 권한으로 호출).
+    운영자는 Hive 이력과 target 지표를 먼저 확인해야 한다. 확인 결과에 따라 다음 중 하나로 전이한다.
+
+    - `PUBLISHED`: 게시 시각을 기록하고 이전 오류를 지운 뒤 target 검증을 계속한다.
+    - `FAILED_PUBLISH`: 종료 시각과 확인 사유를 기록한다.
+
+    결정과 operator 역할은 `PUBLISH_UNKNOWN_RESOLVED` 이벤트에 남긴다. 운영자 권한으로 확정하므로
+    publish token은 확인하지 않는다. 이미 같은 상태면 `changed=false`를 반환한다.
 
     Raises:
         NotFound: RUN_NOT_FOUND.
@@ -134,9 +136,8 @@ async def resolve_unknown(conn: AsyncConnection, run_id: UUID, req: PublishUnkno
         return PublishResultResponse(run_status=to, changed=False)
     if run.status != RunStatus.PUBLISH_UNKNOWN:
         raise Conflict("RUN_STATUS_MISMATCH", runStatus=run.status)
-    # PUBLISHED로 확정하면 PUBLISH_UNKNOWN 때 남긴 오류(PUBLISH_STALE 등)를 지운다. 이후 SUCCESS가 된
-    # run에 오류 코드가 남아 실패처럼 보이지 않게 하기 위해서다. 경위는 PUBLISH_UNKNOWN과
-    # PUBLISH_UNKNOWN_RESOLVED 이벤트에 남는다.
+    # 성공으로 확정한 run이 실패처럼 보이지 않도록 `PUBLISH_STALE` 등의 오류 필드를 지운다. 판단
+    # 과정은 `PUBLISH_UNKNOWN`과 `PUBLISH_UNKNOWN_RESOLVED` 이벤트에 보존된다.
     sets: dict[str, object] = ({"published_at": runs.NOW, "error_stage": None, "error_code": None,
                                 "error_message": None} if to == RunStatus.PUBLISHED
                                else {"completed_at": runs.NOW, "error_code": "PUBLISH_UNKNOWN_RESOLVED",

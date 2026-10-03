@@ -1,8 +1,8 @@
-"""manifest 등록과 불변식 검증.
+"""추출 manifest를 등록하고 데이터 분할 불변식을 검증한다.
 
-NiFi PG-10(Run Coordinator)이 Oracle SCN을 고정하고 분할 키 범위로 파티션을 나눈 결과(manifest)를 받는다.
-불변식을 통과해야만 파티션을 등록하고 run을 CREATED → EXTRACTING으로 바꾼다. 위반이면 run을
-FAILED_MANIFEST로 확정해 잘못된 분할로 추출이 시작되지 않게 한다.
+NiFi PG-10 Run Coordinator가 Oracle SCN을 고정하고 분할 키 범위로 나눈 결과를 받는다. 모든 불변식을
+통과해야 파티션을 등록하고 run을 `CREATED → EXTRACTING`으로 전이한다. 위반하면
+`FAILED_MANIFEST`로 종료하여 잘못된 범위로 추출이 시작되는 것을 막는다.
 """
 
 from dataclasses import dataclass, field
@@ -22,10 +22,11 @@ log = structlog.get_logger(__name__)
 
 @dataclass
 class ManifestOutcome:
-    """불변식 위반은 FAILED_MANIFEST를 commit한 뒤 422로 응답해야 하므로 예외 대신 결과로 돌려준다.
+    """manifest 등록 결과와 불변식 위반 목록.
 
-    예외를 내면 트랜잭션이 rollback되어 FAILED_MANIFEST 기록도 사라진다. 그래서 정상이면 response를,
-    위반이면 violations를 채워 돌려주고, 라우터가 commit 뒤에 422 MANIFEST_INVALID로 바꾼다.
+    불변식 위반도 `FAILED_MANIFEST`로 commit해야 하므로 트랜잭션 안에서는 예외를 내지 않는다.
+    정상이면 `response`를, 위반이면 `violations`를 채운다. 라우터는 commit이 끝난 뒤 위반 결과를
+    422 `MANIFEST_INVALID` 응답으로 바꾼다.
     """
 
     response: ManifestResponse | None = None
@@ -38,16 +39,16 @@ def _dec(v: str | None) -> Decimal | None:
 
 
 def check_invariants(req: ManifestRequest, allow_empty_source: bool) -> list[str]:
-    """manifest 불변식. 위반 사유 목록을 돌려준다.
+    """manifest의 불변식을 검사하고 위반 사유를 반환한다.
 
-    DB를 보지 않는 순수 함수다. 빈 목록이면 통과다. 검사 항목:
-    - partition_id 중복 없음, 파티션 수 = plannedPartitionCount, 예상 건수 합 = sourceCount
-    - sourceCount = 0은 allowEmptySource일 때만 허용
-    - NULL 파티션: 최대 1개, id는 "NULL"이고 경계가 없으며 건수 = sourceNullSplitCount.
-      NULL 키 행이 있는데 NULL 파티션이 없으면 위반
-    - 범위 파티션: lower <= upper, 하한 순으로 정렬했을 때 앞 파티션의 상한 = 다음 파티션의 하한
-      (빈틈·겹침 없음), upperInclusive는 마지막 파티션만 true(나머지는 반개구간 [lo, hi)),
-      첫 하한·마지막 상한 = source min/max
+    DB를 조회하지 않는 순수 함수이며, 빈 목록이면 통과다. 다음 항목을 검사한다.
+
+    - 파티션 ID가 고유하고 계획한 파티션 수와 일치하는가
+    - 파티션별 예상 건수 합계가 원천 건수와 일치하는가
+    - 원천 0건이 `allowEmptySource`로 명시적으로 허용되었는가
+    - NULL 파티션이 하나 이하이고 경계 및 건수가 올바른가
+    - 범위 파티션 사이에 빈틈이나 겹침이 없고 원천의 최솟값·최댓값을 모두 포함하는가
+    - 마지막 범위만 상한을 포함하는가(나머지는 반개구간 `[lower, upper)`인가)
     """
     v: list[str] = []
     parts = req.partitions
@@ -109,17 +110,18 @@ def _dispatchable(rows: list[partitions.PartitionRow]) -> list[ManifestPartition
 
 
 async def register_manifest(conn: AsyncConnection, run_id: UUID, req: ManifestRequest) -> ManifestOutcome:
-    """SCN·source 지표 저장, 불변식 검증, 파티션 일괄 등록, CREATED → EXTRACTING을 한 트랜잭션으로.
+    """manifest 검증과 등록을 한 트랜잭션으로 처리한다.
 
-    0건 파티션은 바로 SUCCESS로 넣고 Worker 대상(dispatchPartitions)에서 뺀다. 모든 파티션이
-    0건이면(allowEmptySource) 이 자리에서 run 완료까지 판정하고 검증 호출을 예약한다.
+    SCN과 원천 지표를 저장하고 파티션을 일괄 등록한 뒤 `CREATED → EXTRACTING`으로 전이한다.
+    예상 건수가 0인 파티션은 즉시 `SUCCESS`로 등록하고 worker 전달 대상에서 제외한다. 모든 파티션이
+    0건이면 이 함수에서 추출 완료까지 판정하고 검증 호출을 예약한다.
 
-    run 행을 잠근 뒤 처리한다. 결과별 동작:
-    - run이 CREATED가 아님: 같은 파티션 id 집합·sourceCount로 이미 등록됐으면 응답 유실 후 재요청으로 보고
-      같은 응답을 돌려준다(validation_scheduled는 항상 False). 다르면 Conflict(RUN_STATUS_MISMATCH).
-    - 불변식 위반: run CREATED → FAILED_MANIFEST, MANIFEST_INVALID 이벤트, violations를 담은 결과.
-    - 통과: load_partition 일괄 등록, run CREATED → EXTRACTING(SCN·source 지표 저장), SOURCE 지표 기록,
-      MANIFEST_CREATED 이벤트. 모든 파티션이 0건이면 EXTRACTED_VALIDATED + VALIDATE_RUN dispatch 예약.
+    run 행을 잠근 뒤 다음과 같이 처리한다.
+
+    - 같은 manifest의 재요청: 이전과 같은 응답을 반환한다.
+    - 다른 manifest가 이미 등록된 run: `RUN_STATUS_MISMATCH`로 거부한다.
+    - 불변식 위반: `FAILED_MANIFEST`와 `MANIFEST_INVALID` 이벤트를 기록한다.
+    - 검증 통과: 파티션, SOURCE 지표, `MANIFEST_CREATED` 이벤트를 기록한다.
 
     Raises:
         NotFound: RUN_NOT_FOUND.

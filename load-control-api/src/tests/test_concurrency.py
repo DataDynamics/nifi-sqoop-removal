@@ -13,6 +13,12 @@ from tests.helpers import claim, report, start_run
 @pytest.mark.parametrize("partitions,chunks", [(8, 1), (6, 3), (16, 2)])
 async def test_concurrent_completion_schedules_validation_once(
         client: httpx.AsyncClient, db: Db, partitions: int, chunks: int) -> None:
+    """모든 파티션의 chunk 보고가 동시에 몰려도 검증 호출은 정확히 한 번만 예약된다.
+
+    파티션 수·chunk 수 조합마다 3번 반복해 경합을 키운다. run은 EXTRACTED_VALIDATED,
+    extracted_count는 전체 행 수이고 dispatch 행은 하나뿐이어야 한다.
+    """
+    # 경합은 타이밍에 따라 드러나므로 같은 조합을 여러 번 반복한다.
     for _ in range(3):
         rows_per_chunk = 5
         run = await start_run(client, [rows_per_chunk * chunks] * partitions)
@@ -20,6 +26,7 @@ async def test_concurrent_completion_schedules_validation_once(
         results = await asyncio.gather(*(
             report(client, run, pid, tok, idx, chunks, rows_per_chunk)
             for pid, tok in tokens.items() for idx in range(chunks)))
+        # 모든 chunk 보고 중 완료를 판정한 요청 하나만 validationScheduled=True여야 한다.
         assert all(r.status_code == 200 for r in results), [r.text for r in results if r.status_code != 200]
         scheduled = [r for r in results if r.json()["validationScheduled"]]
         assert len(scheduled) == 1
@@ -32,6 +39,7 @@ async def test_concurrent_completion_schedules_validation_once(
 
 
 async def test_concurrent_claims_single_owner(client: httpx.AsyncClient) -> None:
+    """같은 파티션에 12개 worker가 동시에 claim해도 한 worker만 소유자가 된다(CAS)."""
     run = await start_run(client, [10, 10])
     results = await asyncio.gather(*(
         client.post(f"/v1/runs/{run.run_id}/partitions/0000/claim",

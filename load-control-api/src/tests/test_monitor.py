@@ -1,3 +1,5 @@
+"""모니터(TUI)용 조회 API를 검증한다: 요약·경보, 검증 지표·이벤트 목록, run 목록 진행률."""
+
 import uuid
 
 import httpx
@@ -8,9 +10,16 @@ from tests.helpers import complete_run, create_run, to_staging_validated
 
 async def test_summary_counts_and_alerts(client: httpx.AsyncClient, operator: httpx.AsyncClient,
                                          db: Db) -> None:
+    """요약 API가 상태별 run 수, 최근 실패, dispatch 수, 경보를 모아 보여 준다.
+
+    실패·PUBLISH_UNKNOWN·DEAD dispatch·heartbeat 정체를 SQL로 만들어 두고,
+    경보 종류와 대상 run, ERROR 경보가 WARN보다 먼저 정렬되는지,
+    DEAD 경보에만 dispatchId가 붙는지 확인한다. nifi 토큰으로도 조회할 수 있다.
+    """
     active = await create_run(client)                       # CREATED
     staged = await to_staging_validated(client)             # STAGING_VALIDATED
     failed = await create_run(client)
+    # 아래 SQL은 API로 만들기 번거로운 경보 대상 상태(실패, PUBLISH_UNKNOWN, DEAD, 정체)를 직접 만든다.
     await db.execute("UPDATE nifi_ops.load_run SET status = 'FAILED_EXTRACT', error_code = 'ORA-00942', "
                      "completed_at = clock_timestamp() WHERE run_id = :id", id=uuid.UUID(failed.run_id))
     unknown = await create_run(client)
@@ -30,6 +39,7 @@ async def test_summary_counts_and_alerts(client: httpx.AsyncClient, operator: ht
                                   "EXTRACTED_VALIDATED": 1}
     assert body["recentRuns"] == {"FAILED_EXTRACT": 1} and body["recentWindowHours"] == 24
     assert body["dispatches"] == {"PENDING": 0, "SENT": 0, "DEAD": 1}
+    # 정상 진행 중인 run(active, staged)은 경보에 나오지 않아야 한다.
     kinds = {(a["kind"], a["runId"]) for a in body["alerts"]}
     assert kinds == {("PUBLISH_UNKNOWN", unknown.run_id), ("DISPATCH_DEAD", dead_run.run_id),
                      ("RUN_FAILED", failed.run_id), ("RUN_STALE", stale.run_id)}
@@ -43,6 +53,10 @@ async def test_summary_counts_and_alerts(client: httpx.AsyncClient, operator: ht
 
 
 async def test_validations_and_events(client: httpx.AsyncClient, db: Db) -> None:
+    """검증 지표는 stage·지표명 순으로, 이벤트는 시간 순으로 돌려준다.
+
+    limit을 주면 가장 최근 이벤트 N개를 돌려주고, 없는 run은 404다.
+    """
     run = await to_staging_validated(client)
     r = await client.get(f"/v1/runs/{run.run_id}/validations")
     metrics = r.json()["metrics"]
@@ -59,6 +73,7 @@ async def test_validations_and_events(client: httpx.AsyncClient, db: Db) -> None
 
 
 async def test_run_list_has_progress(client: httpx.AsyncClient) -> None:
+    """run 목록 항목에 파티션 진행률(기대·성공·실패 수)과 heartbeat가 담긴다."""
     run, _ = await complete_run(client, [3, 0, 4])
     item = (await client.get("/v1/runs")).json()[0]
     assert item["runId"] == run.run_id

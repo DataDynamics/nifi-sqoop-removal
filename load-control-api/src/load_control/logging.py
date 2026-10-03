@@ -36,13 +36,16 @@ from load_control.config import LoggingSettings
 from load_control.log_messages import MESSAGES
 
 REQUEST_ID_HEADER = "X-Request-Id"
+# 받은 X-Request-Id를 그대로 쓸 수 있는 형식. 로그 주입(개행·공백)과 과도한 길이를 막는다.
 _SAFE_REQUEST_ID = re.compile(r"^[A-Za-z0-9._\-]{1,100}$")
 # 수신·응답 로그를 남기지 않는 경로(헬스체크, 메트릭 수집은 너무 잦다)
 _QUIET_ENDPOINTS = frozenset({"/healthz", "/readyz", "/metrics"})
+# 경로에서 runId(UUID 36자)·partitionId(4자리 번호 또는 NULL)를 꺼내 로그 컨텍스트에 묶는다.
 _RUN_ID_IN_PATH = re.compile(r"/runs/([0-9a-fA-F-]{36})")
 _PARTITION_IN_PATH = re.compile(r"/partitions/([0-9A-Za-z]{1,10})")
 # text 형식에서 앞쪽 고정 칸으로 쓰는 키
 _HEAD_KEYS = ("timestamp", "level", "logger", "event", "message", "exception")
+# text 형식에서 key=value 목록의 맨 끝에 원문 그대로 붙이는 본문 키
 _BODY_KEYS = ("requestBody", "responseBody", "body")
 
 
@@ -57,6 +60,7 @@ class _Fields(dict[str, Any]):
     """메시지 템플릿에 없는 필드는 `-`로 채운다."""
 
     def __missing__(self, key: str) -> str:
+        """str.format_map이 없는 키를 찾을 때 KeyError 대신 `-`를 돌려준다."""
         return "-"
 
 
@@ -84,6 +88,11 @@ _SHARED_PROCESSORS: list[structlog.types.Processor] = [
 
 
 def _text_value(value: Any) -> str:
+    """text 형식의 key=value에서 value 표기.
+
+    문자열은 빈 값이거나 공백·따옴표·`=`가 있으면 JSON 문자열(따옴표·이스케이프)로, 아니면 그대로 쓴다.
+    그래야 한 줄 안에서 key=value 경계가 모호해지지 않는다. dict·list·tuple은 공백 없는 JSON으로 쓴다.
+    """
     if isinstance(value, str):
         return json.dumps(value, ensure_ascii=False) if (not value or re.search(r"[\s\"=]", value)) else value
     if isinstance(value, (dict, list, tuple)):
@@ -110,6 +119,11 @@ def render_text(_: Any, __: str, event_dict: MutableMapping[str, Any]) -> str:
 
 
 def _formatter(fmt: str) -> structlog.stdlib.ProcessorFormatter:
+    """출력 형식(text, json, console)에 맞는 stdlib handler용 formatter를 만든다.
+
+    foreign_pre_chain으로 stdlib 로그(uvicorn, SQLAlchemy 등)에도 structlog와 같은 전처리
+    (컨텍스트, 시각, 한글 메시지)를 적용한다. 예외는 json이면 구조화된 traceback, text면 문자열로 붙인다.
+    """
     tail: list[structlog.types.Processor]
     renderer: structlog.types.Processor
     if fmt == "json":
@@ -174,6 +188,7 @@ def configure_logging(cfg: LoggingSettings, service: str = "server") -> None:
 
 
 def _clip(raw: bytes, limit: int) -> str | None:
+    """로그에 넣을 본문. 비었거나 limit이 0이면 None, limit 글자를 넘으면 자르고 남은 글자 수를 적는다."""
     if not raw or limit <= 0:
         return None
     text = raw.decode("utf-8", errors="replace")
@@ -191,6 +206,7 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
 
     def __init__(self, app: ASGIApp, access_log: bool = True, access_body: bool = True,
                  access_body_max: int = 2000) -> None:
+        """설정(logging.access_log, access_body, access_body_max)을 받는다. main.create_app이 등록한다."""
         super().__init__(app)
         self.access_log = access_log
         self.access_body = access_body
@@ -199,13 +215,21 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
 
     async def dispatch(self, request: Request,
                        call_next: Callable[[Request], Awaitable[Response]]) -> Response:
-        """요청 하나를 처리하며 컨텍스트를 묶고, 수신·응답 로그와 메트릭을 남긴다."""
+        """요청 하나를 처리하며 컨텍스트를 묶고, 수신·응답 로그와 메트릭을 남긴다.
+
+        - 요청 본문은 POST·PUT·PATCH에서만 읽는다. Starlette가 읽은 본문을 캐시하므로
+          라우터도 다시 읽을 수 있다.
+        - 응답 본문을 로그에 넣을 때는 스트림을 모두 읽은 뒤 같은 내용으로 Response를 다시 만든다.
+        - 메트릭과 응답 로그는 finally에서 남기므로 처리 중 예외가 나도 status 500으로 기록된다.
+        - 요청이 끝나면 contextvar를 비워 다음 요청에 값이 새지 않게 한다.
+        """
         incoming = request.headers.get(REQUEST_ID_HEADER, "")
         request_id = incoming if _SAFE_REQUEST_ID.match(incoming) else str(uuid.uuid4())
         request.state.request_id = request_id
         path = request.url.path
         run_match = _RUN_ID_IN_PATH.search(path)
         part_match = _PARTITION_IN_PATH.search(path)
+        # 이전 요청이 남긴 값을 지우고 이 요청의 추적 키를 묶는다(이후 모든 로그에 붙는다).
         structlog.contextvars.clear_contextvars()
         structlog.contextvars.bind_contextvars(
             requestId=request_id, runId=run_match.group(1) if run_match else None,
@@ -221,7 +245,7 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
                           client=request.client.host if request.client else None,
                           xRunId=request.headers.get("X-Run-Id"), requestBody=request_body)
         started = time.perf_counter()
-        status = 500
+        status = 500  # call_next가 예외로 끝나면 이 값으로 메트릭·로그를 남긴다
         response_body = None
         try:
             response = await call_next(request)

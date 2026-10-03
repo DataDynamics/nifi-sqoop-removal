@@ -20,14 +20,18 @@ log = structlog.get_logger("load_control.server")
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    """명령행 인자."""
+    """명령행 인자. `--config`만 받는다(없으면 LCA_CONFIG 또는 ./config/config.yaml)."""
     parser = argparse.ArgumentParser(description="Load Control API server")
     parser.add_argument("--config", help=f"config.yaml 경로(기본: ${CONFIG_ENV} 또는 ./config/config.yaml)")
     return parser.parse_args(argv)
 
 
 def uvicorn_options(settings: Settings) -> dict[str, object]:
-    """config.yaml의 server 섹션을 uvicorn.run 인자로 바꾼다."""
+    """config.yaml의 server 섹션을 uvicorn.run 인자로 바꾼다.
+
+    TLS는 ssl_certfile이 있을 때만 켠다. ssl_client_cert_required면 클라이언트 인증서를 필수로(mTLS),
+    아니면 요구하지 않는다. 설정 조합은 ServerSettings 검증에서 이미 확인했다.
+    """
     s = settings.server
     options: dict[str, object] = {
         "host": s.host,
@@ -51,7 +55,11 @@ def uvicorn_options(settings: Settings) -> dict[str, object]:
 
 
 def main(argv: list[str] | None = None) -> None:
-    """설정을 읽고 uvicorn을 실행한다."""
+    """설정을 읽고 uvicorn을 실행한다.
+
+    uvicorn은 앱 객체가 아니라 factory 경로("load_control.main:create_app")를 받는다. workers > 1일 때
+    자식 프로세스마다 앱을 새로 만들어야 하기 때문이다. 이 함수는 uvicorn이 끝날 때까지 돌아오지 않는다.
+    """
     args = parse_args(argv)
     if args.config:
         # workers > 1이면 자식 프로세스가 환경변수로 같은 파일을 찾는다.

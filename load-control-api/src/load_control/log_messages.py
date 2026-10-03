@@ -6,6 +6,8 @@ grep·수집 규칙은 코드로, 사람은 메시지로 읽는다. `{필드}`�
 표에 없는 이벤트(SQLAlchemy, uvicorn 등 외부 로그)는 원래 메시지를 그대로 쓴다.
 """
 
+# 이벤트 코드 → 한글 메시지 템플릿. 새 이벤트 코드를 쓰면 여기에도 추가한다
+# (없어도 로그는 남지만 사람이 읽을 message가 붙지 않는다).
 MESSAGES: dict[str, str] = {
     # 프로세스
     "server_starting": "API 서버 시작 중: {host}:{port}, 프로세스 {workers}개",

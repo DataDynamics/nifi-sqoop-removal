@@ -1,3 +1,9 @@
+"""STAGING 검증 → publish → TARGET 검증 → SUCCESS로 이어지는 후반 흐름을 검증한다.
+
+publish는 publish token으로 한 번만 시작할 수 있고, 결과를 모르는 경우(PUBLISH_UNKNOWN)는
+자동으로 확정하지 않는다.
+"""
+
 import asyncio
 import uuid
 
@@ -8,6 +14,11 @@ from tests.helpers import complete_run, create_run, metrics, to_published, to_st
 
 
 async def test_full_lifecycle_to_success(client: httpx.AsyncClient, db: Db) -> None:
+    """PUBLISHED run에 TARGET 지표 PASS를 보고하면 SUCCESS로 끝난다.
+
+    success 호출은 멱등이고, staging·target 건수, publish token, 완료 시각,
+    이벤트 순서가 모두 남는다. 최종 상태라 같은 업무키로 새 run을 만들 수 있다.
+    """
     run, token = await to_published(client)
     r = await client.post(f"/v1/runs/{run.run_id}/validations", json={
         "stage": "TARGET", "queryVersion": "v1", "metrics": metrics(("TARGET_COUNT", "7", "PASS"))})
@@ -35,6 +46,10 @@ async def test_full_lifecycle_to_success(client: httpx.AsyncClient, db: Db) -> N
 
 
 async def test_stage_validated_requires_all_pass(client: httpx.AsyncClient, db: Db) -> None:
+    """STAGING 지표가 없거나 하나라도 FAIL이면 stage-validated가 거부된다.
+
+    거부 사유를 돌려주고, NiFi가 run을 실패로 보고한 뒤에는 publish claim도 안 된다.
+    """
     run, dispatch_id = await complete_run(client)
     await client.post(f"/v1/runs/{run.run_id}/validation/start", json={"dispatchId": dispatch_id})
     r = await client.post(f"/v1/runs/{run.run_id}/stage-validated")
@@ -64,6 +79,11 @@ async def test_failed_metric_rerun_overrides(client: httpx.AsyncClient) -> None:
 
 
 async def test_validations_require_matching_status(client: httpx.AsyncClient) -> None:
+    """지표 stage는 run 상태와 맞아야 한다.
+
+    STAGING_VALIDATED에서 TARGET 지표는 409이고, SOURCE 지표는
+    manifest로만 등록하므로 API로 보내면 422다.
+    """
     run = await to_staging_validated(client)
     r = await client.post(f"/v1/runs/{run.run_id}/validations",
                           json={"stage": "TARGET", "metrics": metrics(("TARGET_COUNT", "7", "PASS"))})
@@ -74,6 +94,7 @@ async def test_validations_require_matching_status(client: httpx.AsyncClient) ->
 
 
 async def test_publish_claim_rules(client: httpx.AsyncClient) -> None:
+    """publish claim은 첫 token만 성공하고, 같은 token 재시도는 성공, 다른 token은 실패한다."""
     run = await to_staging_validated(client)
     url = f"/v1/runs/{run.run_id}/publish/claim"
     token = str(uuid.uuid4())
@@ -84,6 +105,7 @@ async def test_publish_claim_rules(client: httpx.AsyncClient) -> None:
 
 
 async def test_concurrent_publish_claims(client: httpx.AsyncClient) -> None:
+    """publish claim 10개가 동시에 와도 하나만 성공한다."""
     run = await to_staging_validated(client)
     results = await asyncio.gather(*(
         client.post(f"/v1/runs/{run.run_id}/publish/claim", json={"publishToken": str(uuid.uuid4())})
@@ -92,6 +114,10 @@ async def test_concurrent_publish_claims(client: httpx.AsyncClient) -> None:
 
 
 async def test_publish_result_rules(client: httpx.AsyncClient) -> None:
+    """publish 결과는 claim한 token으로만 보고할 수 있고 멱등이다.
+
+    PUBLISH_UNKNOWN이 된 뒤 늦게 온 PUBLISHED 보고는 409로 거부한다.
+    """
     run = await to_staging_validated(client)
     token = str(uuid.uuid4())
     await client.post(f"/v1/runs/{run.run_id}/publish/claim", json={"publishToken": token})
@@ -106,6 +132,7 @@ async def test_publish_result_rules(client: httpx.AsyncClient) -> None:
 
 
 async def test_failed_publish(client: httpx.AsyncClient, db: Db) -> None:
+    """publish 실패 보고는 run을 FAILED_PUBLISH로 끝내고 오류 코드와 완료 시각을 남긴다."""
     run = await to_staging_validated(client)
     token = str(uuid.uuid4())
     await client.post(f"/v1/runs/{run.run_id}/publish/claim", json={"publishToken": token})
@@ -118,6 +145,10 @@ async def test_failed_publish(client: httpx.AsyncClient, db: Db) -> None:
 
 
 async def test_success_requires_target_pass(client: httpx.AsyncClient) -> None:
+    """TARGET 지표가 없거나 FAIL이면 SUCCESS가 되지 않는다.
+
+    이때 NiFi는 run을 FAILED_TARGET_VALIDATION으로 실패 보고한다.
+    """
     run, _ = await to_published(client)
     r = await client.post(f"/v1/runs/{run.run_id}/success", json={"targetCount": "7"})
     assert r.json()["reasons"] == ["NO_METRICS"]
@@ -131,6 +162,7 @@ async def test_success_requires_target_pass(client: httpx.AsyncClient) -> None:
 
 
 async def test_success_before_published(client: httpx.AsyncClient) -> None:
+    """PUBLISHED 전에는 success가 거부되고 현재 상태가 사유로 돌아온다."""
     run = await to_staging_validated(client)
     r = await client.post(f"/v1/runs/{run.run_id}/success", json={})
     assert r.json() == {"success": False, "runStatus": "STAGING_VALIDATED",

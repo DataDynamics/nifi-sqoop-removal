@@ -1,3 +1,7 @@
+"""로깅 설정(파일·json·text 형식, 로거별 레벨), access log, 비밀값 마스킹,
+uvicorn 실행 옵션과 server·logging 설정 검증을 다룬다.
+"""
+
 import json
 import logging
 import re
@@ -19,6 +23,7 @@ from tests.conftest import NIFI_TOKEN, override
 
 
 def read_json_lines(path: Path) -> list[dict[str, Any]]:
+    """모든 핸들러를 flush한 뒤 json 로그 파일을 줄 단위 dict 목록으로 읽는다."""
     for h in logging.getLogger().handlers:
         h.flush()
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
@@ -26,11 +31,17 @@ def read_json_lines(path: Path) -> list[dict[str, Any]]:
 
 @pytest.fixture(autouse=True)
 def restore_logging() -> Iterator[None]:
+    """각 테스트가 바꾼 전역 로깅 설정을 테스트 뒤 기본(WARNING, console)으로 되돌린다."""
     yield
     configure_logging(LoggingSettings(level="WARNING", format="console"))
 
 
 def test_file_output_and_logger_levels(tmp_path: Path) -> None:
+    """json 파일 출력과 로거별 레벨이 적용된다.
+
+    structlog와 stdlib 로그가 같은 json 형식으로 한 파일에 쌓이고,
+    로거별 레벨 미만 로그는 버려진다. 한글 키·값도 그대로 남는다.
+    """
     log_file = tmp_path / "logs" / "lca.log"
     levels = {"sqlalchemy.engine": "WARNING", "load_control.noisy": "ERROR"}
     configure_logging(LoggingSettings(level="INFO", stdout=False, file={"path": log_file, "format": "json"},  # type: ignore[arg-type]
@@ -49,6 +60,7 @@ def test_file_output_and_logger_levels(tmp_path: Path) -> None:
 
 
 def test_reconfigure_does_not_duplicate_handlers(tmp_path: Path) -> None:
+    """로깅을 두 번 설정해도 핸들러가 늘지 않는다(stdout + file 두 개)."""
     cfg = LoggingSettings(stdout=True, file={"path": tmp_path / "a.log"})  # type: ignore[arg-type]
     configure_logging(cfg)
     configure_logging(cfg)
@@ -56,6 +68,7 @@ def test_reconfigure_does_not_duplicate_handlers(tmp_path: Path) -> None:
 
 
 def test_exception_is_logged_as_structured_traceback(tmp_path: Path) -> None:
+    """exception 로그는 예외 정보를 구조화된 목록으로 남긴다."""
     log_file = tmp_path / "e.log"
     configure_logging(LoggingSettings(stdout=False, file={"path": log_file, "format": "json"}))  # type: ignore[arg-type]
     try:
@@ -68,6 +81,12 @@ def test_exception_is_logged_as_structured_traceback(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize("access_log", [True, False])
 async def test_access_log(tmp_path: Path, settings: Settings, engine: Any, access_log: bool) -> None:
+    """access_log 설정에 따라 API 요청·응답 로그를 남기거나 끈다.
+
+    켜면 /healthz 같은 조용한 경로는 빼고 api_request·api_response 두 줄을 남긴다.
+    응답 로그에는 endpoint 템플릿, 상태 코드, 역할, 요청 ID, runId, 응답 본문이 붙고,
+    4xx는 warning 레벨이다. 끄더라도 서비스 로그(api_started 등)는 남는다.
+    """
     log_file = tmp_path / "access.log"
     s = override(settings, logging={"level": "INFO", "stdout": False, "access_log": access_log,
                                     "file": {"path": log_file, "format": "json"}})
@@ -98,6 +117,7 @@ async def test_access_log(tmp_path: Path, settings: Settings, engine: Any, acces
 
 
 async def test_secrets_not_logged_on_startup(tmp_path: Path, settings: Settings) -> None:
+    """기동 로그에는 DB 호스트·이름만 남기고 URL의 비밀번호는 남기지 않는다."""
     log_file = tmp_path / "s.log"
     s = override(settings, logging={"level": "INFO", "stdout": False,
                                     "file": {"path": log_file, "format": "json"}},
@@ -112,6 +132,11 @@ async def test_secrets_not_logged_on_startup(tmp_path: Path, settings: Settings)
 
 
 def test_text_format_timestamp_and_korean_message(tmp_path: Path) -> None:
+    """text 형식은 밀리초 타임스탬프·레벨·로거 뒤에 한글 메시지를 붙인다.
+
+    메시지가 정의된 이벤트는 "한글 설명 (event)"로, 정의되지 않은 이벤트는
+    이벤트 이름 그대로 남긴다. 공백이 있는 값은 따옴표로 감싼다.
+    """
     log_file = tmp_path / "t.log"
     configure_logging(LoggingSettings(level="INFO", stdout=False,
                                       file={"path": log_file}))  # type: ignore[arg-type]
@@ -129,6 +154,7 @@ def test_text_format_timestamp_and_korean_message(tmp_path: Path) -> None:
 
 
 def test_file_path_service_placeholder(tmp_path: Path) -> None:
+    """로그 파일 경로의 {service}는 실행 중인 서비스 이름(server|worker)으로 바뀐다."""
     cfg = LoggingSettings(stdout=False, file={"path": tmp_path / "{service}.log"})  # type: ignore[arg-type]
     configure_logging(cfg, service="worker")
     structlog.get_logger("load_control.worker").info("worker_started")
@@ -139,6 +165,11 @@ def test_file_path_service_placeholder(tmp_path: Path) -> None:
 
 
 async def test_access_log_request_body(tmp_path: Path, settings: Settings, engine: Any) -> None:
+    """access log에 요청·응답 본문을 남기되 access_body_max에서 자른다.
+
+    본문을 읽어 로그에 남겨도 애플리케이션은 같은 본문을 받는다. 같은 요청의
+    서비스 로그에도 같은 requestId가 붙고, Authorization 헤더는 남기지 않는다.
+    """
     log_file = tmp_path / "b.log"
     s = override(settings, logging={"level": "INFO", "stdout": False, "access_body_max": 40,
                                     "file": {"path": log_file, "format": "json"}})
@@ -161,6 +192,11 @@ async def test_access_log_request_body(tmp_path: Path, settings: Settings, engin
 
 
 def test_uvicorn_options(settings: Settings) -> None:
+    """server 설정이 uvicorn 실행 옵션으로 옮겨진다.
+
+    로깅은 앱이 직접 하므로 uvicorn의 log_config·access_log는 끈다.
+    TLS 파일을 주면 ssl 옵션이 붙고, 클라이언트 인증서 요구는 CERT_REQUIRED가 된다.
+    """
     s = override(settings, server={"host": "127.0.0.1", "port": 9000, "workers": 3, "root_path": "/lca"})
     opts = uvicorn_options(s)
     assert opts["host"] == "127.0.0.1" and opts["port"] == 9000 and opts["workers"] == 3
@@ -180,5 +216,6 @@ def test_uvicorn_options(settings: Settings) -> None:
     {"logging": {"loggers": {"x": "VERBOSE"}}},
 ])
 def test_invalid_server_logging_settings(settings: Settings, section: dict[str, dict[str, Any]]) -> None:
+    """TLS 짝이 맞지 않거나 범위를 벗어난 server·logging 설정은 거부한다."""
     with pytest.raises(ValidationError):
         override(settings, **section)

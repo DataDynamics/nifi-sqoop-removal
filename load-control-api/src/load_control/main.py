@@ -36,7 +36,20 @@ def _error(request: Request, status: int, code: str, message: str,
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
-    """앱을 만든다. settings가 없으면 config.yaml을 읽는다(테스트는 직접 넘긴다)."""
+    """앱을 만든다. settings가 없으면 config.yaml을 읽는다(테스트는 직접 넘긴다).
+
+    하는 일: 로깅 구성, DB 엔진 수명 관리(lifespan), 요청 컨텍스트 미들웨어 등록, 공통 예외 처리기 등록,
+    라우터 등록. settings는 app.state.settings에, 엔진은 시작 시 app.state.engine에 둔다.
+    라우터와 의존성(security, routers.deps)은 이 두 값을 request.app.state에서 꺼내 쓴다.
+
+    예외 → HTTP 응답:
+    - ApiError: 하위 클래스의 status(404/409/422)와 code
+    - RequestValidationError: FastAPI 기본 422 응답(본문 형식은 FastAPI 기본값)
+    - IntegrityError: unique 위반 409, 외래키 위반 422, 그 밖 422
+    - 그 밖의 DBAPIError: 503(NiFi가 재시도한다)
+    인증 실패(security의 HTTPException 401/403)는 여기서 처리하지 않으므로 FastAPI 기본 형식
+    `{"detail": ...}`으로 응답한다.
+    """
     settings = settings or get_settings()
     configure_logging(settings.logging)
 
@@ -62,13 +75,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                   root_path=settings.server.root_path,
                   description="Sqoop 대체 적재의 상태 원장 기록과 완료 판정(load-control-api-design.md).")
     app.state.settings = settings
+    # X-Request-Id·runId 컨텍스트, 수신·응답 로그, 요청 메트릭. 예외 처리기가 만든 오류 응답도 이 안을 지난다.
     app.add_middleware(RequestContextMiddleware, access_log=settings.logging.access_log,
                        access_body=settings.logging.access_body,
                        access_body_max=settings.logging.access_body_max)
 
     @app.exception_handler(ApiError)
     async def api_error(request: Request, exc: ApiError) -> JSONResponse:
-        """의도한 업무 오류(404/409/422). 정상 경합도 많으므로 INFO로만 남긴다."""
+        """의도한 업무 오류(404/409/422). 정상 경합도 많으므로 INFO로만 남긴다.
+
+        트랜잭션은 in_tx가 이미 rollback했다. 응답은 {code, message, requestId, details?}.
+        """
         log.info("api_error", status=exc.status, code=exc.code, details=exc.details or None)
         return _error(request, exc.status, exc.code, exc.message, exc.details)
 
@@ -81,7 +98,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.exception_handler(IntegrityError)
     async def integrity_error(request: Request, exc: IntegrityError) -> JSONResponse:
-        """DB 제약 위반. 서비스 계층에서 따로 처리하지 않은 경우만 여기로 온다."""
+        """DB 제약 위반. 서비스 계층에서 따로 처리하지 않은 경우만 여기로 온다.
+
+        unique 위반은 동시 요청 경합일 수 있어 409, 외래키 위반은 없는 run·파티션을 참조한 입력 오류로
+        보고 422로 응답한다. 제약 이름(asyncpg가 줄 때만)을 details.constraint에 넣는다.
+        """
         state, constraint = sqlstate(exc), constraint_name(exc)
         if state == UNIQUE_VIOLATION:
             log.warning("unique_violation", constraint=constraint)
@@ -96,7 +117,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.exception_handler(DBAPIError)
     async def db_error(request: Request, exc: DBAPIError) -> JSONResponse:
-        """연결 장애·일시 오류: 503으로 응답해 NiFi InvokeHTTP가 Retry로 보내게 한다."""
+        """연결 장애·일시 오류: 503으로 응답해 NiFi InvokeHTTP가 Retry로 보내게 한다.
+
+        IntegrityError는 위 처리기가 먼저 받는다(더 구체적인 예외 클래스가 우선). deadlock·serialization
+        실패는 in_tx가 재실행한 뒤에도 실패한 경우만 여기로 온다. 원인 확인용으로 traceback을 남긴다.
+        """
         log.error("db_error", sqlstate=sqlstate(exc), error=type(exc.orig).__name__,
                   connection=isinstance(exc, OperationalError | InterfaceError), exc_info=exc)
         return _error(request, 503, "DATABASE_UNAVAILABLE", "database error, retry later")

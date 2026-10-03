@@ -1,4 +1,9 @@
-"""manifest 등록과 불변식 검증."""
+"""manifest 등록과 불변식 검증.
+
+NiFi PG-10(Run Coordinator)이 Oracle SCN을 고정하고 분할 키 범위로 파티션을 나눈 결과(manifest)를 받는다.
+불변식을 통과해야만 파티션을 등록하고 run을 CREATED → EXTRACTING으로 바꾼다. 위반이면 run을
+FAILED_MANIFEST로 확정해 잘못된 분할로 추출이 시작되지 않게 한다.
+"""
 
 from dataclasses import dataclass, field
 from decimal import Decimal
@@ -17,18 +22,33 @@ log = structlog.get_logger(__name__)
 
 @dataclass
 class ManifestOutcome:
-    """불변식 위반은 FAILED_MANIFEST를 commit한 뒤 422로 응답해야 하므로 예외 대신 결과로 돌려준다."""
+    """불변식 위반은 FAILED_MANIFEST를 commit한 뒤 422로 응답해야 하므로 예외 대신 결과로 돌려준다.
+
+    예외를 내면 트랜잭션이 rollback되어 FAILED_MANIFEST 기록도 사라진다. 그래서 정상이면 response를,
+    위반이면 violations를 채워 돌려주고, 라우터가 commit 뒤에 422 MANIFEST_INVALID로 바꾼다.
+    """
 
     response: ManifestResponse | None = None
     violations: list[str] = field(default_factory=list)
 
 
 def _dec(v: str | None) -> Decimal | None:
+    """문자열로 받은 NUMBER 값(SCN, 경계값)을 Decimal로 바꾼다. float를 거치지 않아 정밀도를 잃지 않는다."""
     return Decimal(v) if v is not None else None
 
 
 def check_invariants(req: ManifestRequest, allow_empty_source: bool) -> list[str]:
-    """manifest 불변식. 위반 사유 목록을 돌려준다."""
+    """manifest 불변식. 위반 사유 목록을 돌려준다.
+
+    DB를 보지 않는 순수 함수다. 빈 목록이면 통과다. 검사 항목:
+    - partition_id 중복 없음, 파티션 수 = plannedPartitionCount, 예상 건수 합 = sourceCount
+    - sourceCount = 0은 allowEmptySource일 때만 허용
+    - NULL 파티션: 최대 1개, id는 "NULL"이고 경계가 없으며 건수 = sourceNullSplitCount.
+      NULL 키 행이 있는데 NULL 파티션이 없으면 위반
+    - 범위 파티션: lower <= upper, 하한 순으로 정렬했을 때 앞 파티션의 상한 = 다음 파티션의 하한
+      (빈틈·겹침 없음), upperInclusive는 마지막 파티션만 true(나머지는 반개구간 [lo, hi)),
+      첫 하한·마지막 상한 = source min/max
+    """
     v: list[str] = []
     parts = req.partitions
     ids = [p.partition_id for p in parts]
@@ -62,6 +82,7 @@ def check_invariants(req: ManifestRequest, allow_empty_source: bool) -> list[str
             v.append(f"INVALID_BOUNDS {p.partition_id}")
             continue
         bounded.append((lo, hi, p))
+    # 하한 순으로 정렬한다. 하한이 같으면 partition_id로 순서를 고정해 위반 메시지가 매번 같게 한다.
     bounded.sort(key=lambda t: (t[0], t[2].partition_id))
     for i, (_lo, hi, p) in enumerate(bounded):
         last = i == len(bounded) - 1
@@ -78,6 +99,7 @@ def check_invariants(req: ManifestRequest, allow_empty_source: bool) -> list[str
 
 
 def _dispatchable(rows: list[partitions.PartitionRow]) -> list[ManifestPartition]:
+    """등록된 파티션 중 Worker에 보낼 것(예상 건수 > 0)을 응답 형식으로 돌려준다(재요청 응답용)."""
     return [ManifestPartition(
         partition_id=p.partition_id,
         lower_bound=str(p.lower_bound) if p.lower_bound is not None else None,
@@ -91,6 +113,17 @@ async def register_manifest(conn: AsyncConnection, run_id: UUID, req: ManifestRe
 
     0건 파티션은 바로 SUCCESS로 넣고 Worker 대상(dispatchPartitions)에서 뺀다. 모든 파티션이
     0건이면(allowEmptySource) 이 자리에서 run 완료까지 판정하고 검증 호출을 예약한다.
+
+    run 행을 잠근 뒤 처리한다. 결과별 동작:
+    - run이 CREATED가 아님: 같은 파티션 id 집합·sourceCount로 이미 등록됐으면 응답 유실 후 재요청으로 보고
+      같은 응답을 돌려준다(validation_scheduled는 항상 False). 다르면 Conflict(RUN_STATUS_MISMATCH).
+    - 불변식 위반: run CREATED → FAILED_MANIFEST, MANIFEST_INVALID 이벤트, violations를 담은 결과.
+    - 통과: load_partition 일괄 등록, run CREATED → EXTRACTING(SCN·source 지표 저장), SOURCE 지표 기록,
+      MANIFEST_CREATED 이벤트. 모든 파티션이 0건이면 EXTRACTED_VALIDATED + VALIDATE_RUN dispatch 예약.
+
+    Raises:
+        NotFound: RUN_NOT_FOUND.
+        Conflict: RUN_STATUS_MISMATCH. 이미 다른 manifest로 진행 중이거나 끝난 run.
     """
     run = await runs.lock(conn, run_id)
     if run is None:
@@ -112,6 +145,7 @@ async def register_manifest(conn: AsyncConnection, run_id: UUID, req: ManifestRe
             empty_partition_count=sum(1 for p in existing if p.expected_row_count == 0),
             validation_scheduled=False))
 
+    # allowEmptySource는 run 생성 시 parameters(jsonb)에 저장해 둔 값이다.
     allow_empty = bool(run.parameters.get("allowEmptySource", False))
     violations = check_invariants(req, allow_empty)
     if violations:
@@ -135,6 +169,8 @@ async def register_manifest(conn: AsyncConnection, run_id: UUID, req: ManifestRe
         source_null_split_count=req.source_null_split_count,
         source_min_split=_dec(req.source_min_split), source_max_split=_dec(req.source_max_split),
         expected_partition_count=len(req.partitions), empty_partition_count=empty)
+    # SOURCE 지표는 NiFi가 manifest와 함께 보낸 값을 판정 없이 PASS로 기록한다. 검증 flow는 /validation/start
+    # 응답의 sourceMetrics로 이 값을 받는다.
     await validations.upsert_many(
         conn, run_id, "SOURCE", req.source_metrics_version,
         [{"metric_name": "SOURCE_COUNT", "actual_value": str(req.source_count), "result": "PASS"}]

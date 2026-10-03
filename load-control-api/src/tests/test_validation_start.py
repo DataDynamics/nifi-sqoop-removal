@@ -1,3 +1,8 @@
+"""NiFi 검증 flow의 시작 호출(/validation/start)을 검증한다.
+
+시작 호출은 VALIDATE_RUN dispatch의 ACK 역할을 하고, 한 번만 started=True가 된다.
+"""
+
 import asyncio
 import uuid
 
@@ -8,6 +13,11 @@ from tests.helpers import complete_run, start_run
 
 
 async def test_start_validation(client: httpx.AsyncClient, db: Db) -> None:
+    """검증 시작은 run을 STAGE_VALIDATING으로 바꾸고 검증에 필요한 run 정보를 돌려준다.
+
+    dispatch는 ACKED가 되고, 두 번째 호출은 started=False와 빈 정보만 돌려준다
+    (NiFi는 이를 보고 중복 실행을 멈춘다).
+    """
     run, dispatch_id = await complete_run(client, [3, 4])
     r = await client.post(f"/v1/runs/{run.run_id}/validation/start",
                           json={"dispatchId": dispatch_id, "node": "nifi-01"})
@@ -31,6 +41,7 @@ async def test_start_validation(client: httpx.AsyncClient, db: Db) -> None:
 
 
 async def test_start_requires_matching_dispatch(client: httpx.AsyncClient) -> None:
+    """다른 run의 dispatch나 없는 dispatch ID로는 시작할 수 없다(409)."""
     run, _ = await complete_run(client)
     _, other_dispatch = await complete_run(client)
     r = await client.post(f"/v1/runs/{run.run_id}/validation/start", json={"dispatchId": other_dispatch})
@@ -40,12 +51,14 @@ async def test_start_requires_matching_dispatch(client: httpx.AsyncClient) -> No
 
 
 async def test_start_before_extract_complete(client: httpx.AsyncClient) -> None:
+    """추출이 끝나기 전(EXTRACTING)에는 검증을 시작할 수 없다(409)."""
     run = await start_run(client, [3])
     r = await client.post(f"/v1/runs/{run.run_id}/validation/start", json={"dispatchId": str(uuid.uuid4())})
     assert r.status_code == 409
 
 
 async def test_concurrent_starts_single_winner(client: httpx.AsyncClient) -> None:
+    """검증 시작 8개가 동시에 와도 하나만 started=True다."""
     run, dispatch_id = await complete_run(client)
     results = await asyncio.gather(*(
         client.post(f"/v1/runs/{run.run_id}/validation/start", json={"dispatchId": dispatch_id})

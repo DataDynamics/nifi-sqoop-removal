@@ -1,4 +1,7 @@
-"""운영자 작업: dispatch 재전송."""
+"""운영자 작업: dispatch 재전송.
+
+TUI 모니터 등 운영자 도구가 부른다. 자동 복구(sweeper)로 풀리지 않는 DEAD dispatch를 사람이 되살린다.
+"""
 
 from uuid import UUID
 
@@ -13,7 +16,16 @@ log = structlog.get_logger(__name__)
 
 
 async def resend_dispatch(conn: AsyncConnection, run_id: UUID, dispatch_id: UUID) -> DispatchResendResponse:
-    """DEAD(또는 ACK 없는 SENT) dispatch를 PENDING으로 되돌려 다시 보내게 한다."""
+    """DEAD(또는 ACK 없는 SENT) dispatch를 PENDING으로 되돌려 다시 보내게 한다.
+
+    잠금 순서는 load_run → load_dispatch다. 경로의 run에 속한 dispatch인지 확인한 뒤 attempt_count를 0으로
+    초기화해 PENDING으로 되돌리고 dispatcher를 깨운다(NOTIFY는 commit 후 전달). DISPATCH_RESENT(WARN)
+    이벤트에 이전 상태를 남긴다.
+
+    Raises:
+        NotFound: RUN_NOT_FOUND, 또는 dispatch가 없거나 다른 run 소속이면 DISPATCH_NOT_FOUND.
+        Conflict: DISPATCH_STATUS_MISMATCH. 이미 PENDING이거나 ACKED라 되돌릴 것이 없다.
+    """
     run = await runs.lock(conn, run_id)
     if run is None:
         raise NotFound("RUN_NOT_FOUND")

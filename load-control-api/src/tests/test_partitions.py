@@ -1,3 +1,5 @@
+"""파티션 claim, chunk 보고, 파티션 실패 보고와 그에 따른 run 완료 판정을 검증한다."""
+
 import uuid
 
 import httpx
@@ -7,6 +9,10 @@ from tests.helpers import chunk_body, claim, report, start_run
 
 
 async def test_claim_rules(client: httpx.AsyncClient, db: Db) -> None:
+    """claim은 한 token만 소유할 수 있고, 같은 token의 재시도는 같은 결과를 돌려준다.
+
+    다른 token은 claimed=False이고, 재시도는 시도 횟수를 늘리지 않는다.
+    """
     run = await start_run(client, [10, 20])
     url = f"/v1/runs/{run.run_id}/partitions/0000/claim"
     token = await claim(client, run, "0000")
@@ -23,6 +29,7 @@ async def test_claim_rules(client: httpx.AsyncClient, db: Db) -> None:
 
 
 async def test_claim_unknown_partition_and_bad_path(client: httpx.AsyncClient) -> None:
+    """없는 파티션 claim은 404, 형식이 틀린 파티션 ID는 422다."""
     run = await start_run(client, [10, 20])
     body = {"claimToken": str(uuid.uuid4()), "workerNode": "n"}
     assert (await client.post(f"/v1/runs/{run.run_id}/partitions/0009/claim", json=body)).status_code == 404
@@ -30,6 +37,12 @@ async def test_claim_unknown_partition_and_bad_path(client: httpx.AsyncClient) -
 
 
 async def test_full_flow_completes_run_once(client: httpx.AsyncClient, db: Db) -> None:
+    """모든 파티션이 끝나면 run이 EXTRACTED_VALIDATED가 되고 검증 호출이 한 번 예약된다.
+
+    chunk가 모두 도착해야 파티션이 SUCCESS가 되고, 빈 파티션까지 포함해
+    성공 파티션 수와 추출 행 수가 맞아야 한다. 마지막 chunk를 다시 보고해도
+    dispatch는 늘지 않는다.
+    """
     run = await start_run(client, [10, 7, 0])
     t0 = await claim(client, run, "0000")
     t1 = await claim(client, run, "0001")
@@ -69,6 +82,7 @@ async def test_full_flow_completes_run_once(client: httpx.AsyncClient, db: Db) -
 
 
 async def test_duplicate_chunk_is_idempotent(client: httpx.AsyncClient, db: Db) -> None:
+    """같은 chunk를 여러 번 보고해도 load_file 행은 하나이고 수신 chunk 수도 늘지 않는다."""
     run = await start_run(client, [10, 10])
     t = await claim(client, run, "0000")
     for _ in range(3):
@@ -78,6 +92,7 @@ async def test_duplicate_chunk_is_idempotent(client: httpx.AsyncClient, db: Db) 
 
 
 async def test_conflicting_chunk_after_success(client: httpx.AsyncClient, db: Db) -> None:
+    """같은 chunk 번호에 다른 행 수를 보고하면 CHUNK_CONFLICT(409)이고 기존 기록은 그대로다."""
     run = await start_run(client, [10, 10])
     t = await claim(client, run, "0000")
     assert (await report(client, run, "0000", t, 0, 1, 10)).json()["partitionStatus"] == "SUCCESS"
@@ -87,6 +102,7 @@ async def test_conflicting_chunk_after_success(client: httpx.AsyncClient, db: Db
 
 
 async def test_claim_mismatch(client: httpx.AsyncClient) -> None:
+    """claim token이 다른 chunk 보고는 CLAIM_MISMATCH(409)로 거부한다."""
     run = await start_run(client, [10, 10])
     await claim(client, run, "0000")
     r = await report(client, run, "0000", str(uuid.uuid4()), 0, 1, 10)
@@ -94,6 +110,7 @@ async def test_claim_mismatch(client: httpx.AsyncClient) -> None:
 
 
 async def test_row_count_mismatch_fails_run(client: httpx.AsyncClient, db: Db) -> None:
+    """파티션 실제 행 수가 기대 행 수와 다르면 파티션과 run이 실패하고 검증 호출은 없다."""
     run = await start_run(client, [10, 10])
     t = await claim(client, run, "0000")
     r = await report(client, run, "0000", t, 0, 1, 9)
@@ -105,6 +122,7 @@ async def test_row_count_mismatch_fails_run(client: httpx.AsyncClient, db: Db) -
 
 
 async def test_inconsistent_chunk_count_fails_partition(client: httpx.AsyncClient) -> None:
+    """같은 파티션의 chunk마다 chunkCount가 다르면 파티션이 실패한다."""
     run = await start_run(client, [10, 10])
     t = await claim(client, run, "0000")
     await report(client, run, "0000", t, 0, 3, 4)
@@ -113,6 +131,10 @@ async def test_inconsistent_chunk_count_fails_partition(client: httpx.AsyncClien
 
 
 async def test_reports_after_run_failure_are_recorded_and_ignored(client: httpx.AsyncClient, db: Db) -> None:
+    """run이 실패한 뒤 도착한 chunk 보고는 파일만 기록하고 상태는 바꾸지 않는다.
+
+    검증 호출은 예약되지 않고, 남은 파티션도 더는 claim할 수 없다.
+    """
     run = await start_run(client, [10, 10])
     t0 = await claim(client, run, "0000")
     t1 = await claim(client, run, "0001")
@@ -133,6 +155,10 @@ async def test_reports_after_run_failure_are_recorded_and_ignored(client: httpx.
 
 
 async def test_snapshot_error_marks_snapshot_expired(client: httpx.AsyncClient) -> None:
+    """ORA-01555(snapshot too old)는 run을 FAILED_SNAPSHOT_EXPIRED로 만든다.
+
+    같은 실패 보고를 다시 보내면 changed=False다.
+    """
     run = await start_run(client, [10, 10])
     t = await claim(client, run, "0000")
     body = {"claimToken": t, "errorStage": "ORACLE_EXTRACT", "errorClass": "NON_RETRYABLE",
@@ -144,6 +170,9 @@ async def test_snapshot_error_marks_snapshot_expired(client: httpx.AsyncClient) 
 
 
 async def test_chunk_validation(client: httpx.AsyncClient) -> None:
+    """chunk 경로가 run 경로 밖이거나 경로 탈출(..)을 포함하거나,
+    chunkIndex가 chunkCount 범위를 벗어나면 거부한다.
+    """
     run = await start_run(client, [10, 10])
     t = await claim(client, run, "0000")
     url = f"/v1/runs/{run.run_id}/partitions/0000/chunks"
@@ -157,6 +186,7 @@ async def test_chunk_validation(client: httpx.AsyncClient) -> None:
 
 
 async def test_same_hdfs_path_for_two_chunks_conflicts(client: httpx.AsyncClient) -> None:
+    """서로 다른 chunk가 같은 HDFS 경로를 보고하면 UNIQUE_VIOLATION(409)이다."""
     run = await start_run(client, [10, 10])
     t = await claim(client, run, "0000")
     url = f"/v1/runs/{run.run_id}/partitions/0000/chunks"

@@ -39,11 +39,18 @@ TOP_NAME = NAMES.get("process_group", f"JOB_{JOB_KEY}")
 PC_COMMON = NAMES.get("common_context", "PC_SQOOP_REPLACEMENT_COMMON")
 PC_JOB = NAMES.get("job_context", f"PC_JOB_{JOB_KEY}")
 RECEIVER_NAME = NAMES.get("control_receiver", "PG-05 Control Receiver")  # root에 하나, 모든 Job이 공유
+# 새 구성요소를 만들 때 쓰는 revision. 생성 요청은 version 0으로 보내고, 수정할 때는 GET으로 받은 revision을 쓴다.
 REV = {"version": 0, "clientId": "poc-builder-v4"}
 
 
 def call(method, path, body=None):
-    req = urllib.request.Request(API + path, method=method,
+    """NiFi REST API를 호출하고 응답 JSON을 돌려준다.
+
+    path는 /nifi-api 뒤의 경로다(API에 /nifi-api까지 포함해 받는다). body가 있으면 JSON으로 보낸다.
+    응답 본문이 비어 있으면(DELETE 등) None을 돌려준다. HTTP 오류는 상태 코드와 본문 앞 2000자를 담아
+    SystemExit로 빌드를 멈춘다. 빌드는 중간 상태를 되돌리지 않으므로 실패하면 teardown_flow.py로 지우고 다시 한다.
+    """
+    req =urllib.request.Request(API + path, method=method,
                                  data=None if body is None else json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json"})
     try:
@@ -54,12 +61,19 @@ def call(method, path, body=None):
         raise SystemExit(f"{method} {path} -> {e.code}: {e.read().decode()[:2000]}")
 
 
+# 이 NiFi에 설치된 Processor·Controller Service 타입을 짧은 클래스 이름(예: InvokeHTTP)으로 찾도록 색인한다.
+# 같은 짧은 이름이 여러 NAR에 있으면 나중에 나온 것이 남는다.
 TYPES = {t["type"].split(".")[-1]: t for t in
          call("GET", "/flow/processor-types")["processorTypes"]
          + call("GET", "/flow/controller-service-types")["controllerServiceTypes"]}
 
 
 def bundle(short):
+    """짧은 타입 이름으로 (bundle, 전체 클래스 이름)을 돌려준다.
+
+    생성 요청에는 bundle(group·artifact·version)과 전체 클래스 이름이 모두 필요하다. 타입이 없으면 빌드를 멈춘다.
+    ClouderaHiveConnectionPool, PutClouderaHiveQL은 Cloudera CFM에만 있으므로 Apache NiFi에서는 여기서 실패한다.
+    """
     if short not in TYPES:
         raise SystemExit(f"{short} not found in this NiFi (Hive components need Cloudera CFM)")
     return TYPES[short]["bundle"], TYPES[short]["type"]
@@ -67,12 +81,24 @@ def bundle(short):
 
 # ---------------------------------------------------------------- Parameter Context
 def drop_param_ctx(name):
+    """이름이 name인 Parameter Context를 지운다(없으면 아무것도 하지 않는다).
+
+    Job Context(PC_JOB)를 config 값으로 새로 만들기 전에 이전 것을 지우는 데 쓴다. 다른 PG가 아직
+    이 Context를 쓰고 있으면 NiFi가 삭제를 거부하고 call()이 빌드를 멈춘다.
+    """
     for pc in call("GET", "/flow/parameter-contexts")["parameterContexts"]:
         if pc["component"]["name"] == name:
             call("DELETE", f"/parameter-contexts/{pc['id']}?version={pc['revision']['version']}&clientId=poc-builder-v4")
 
 
 def param_ctx(name, params, inherited=None):
+    """Parameter Context를 만들고 id를 돌려준다.
+
+    params는 {Parameter 이름: 값}이다. 이름이 PASSWORD 또는 AUTHORIZATION으로 끝나면 sensitive로 만든다
+    (sensitive Parameter는 sensitive property에서만 참조할 수 있고 UI·API에서 값이 보이지 않는다).
+    inherited가 있으면 그 Context를 상속한다(Job Context가 공통 Context를 상속). 상속 목록은
+    inheritedParameterContexts에 id와 component.id를 모두 넣어야 받아들여진다.
+    """
     comp = {"name": name, "parameters": [
         {"parameter": {"name": k, "value": v, "sensitive": k.endswith(("PASSWORD", "AUTHORIZATION"))}}
         for k, v in params.items()]}
@@ -81,16 +107,27 @@ def param_ctx(name, params, inherited=None):
     return call("POST", "/parameter-contexts", {"revision": REV, "component": comp})["id"]
 
 
+# 같은 이름의 Job PG가 있으면 덮어쓰지 않고 멈춘다. 재배포는 teardown_flow.py로 지운 뒤 한다.
 root = call("GET", "/flow/process-groups/root")["processGroupFlow"]["id"]
 for g in call("GET", f"/flow/process-groups/{root}")["processGroupFlow"]["flow"]["processGroups"]:
     if g["component"]["name"] == TOP_NAME:
         raise SystemExit(f"{TOP_NAME} already exists ({g['id']}); delete it first")
 
 def ensure_common(params):
-    """공통 Context는 root PG-05와 다른 Job이 함께 쓰므로 지우지 않는다. 있으면 값만 이 config로 맞춘다."""
+    """공통 Parameter Context(PC_COMMON)를 준비하고 id를 돌려준다.
+
+    공통 Context는 root PG-05와 다른 Job이 함께 쓰므로 지우지 않는다. 있으면 값만 이 config로 맞추고,
+    없으면 새로 만든다.
+
+    값 변경은 PUT이 아니라 비동기 update-request(POST .../update-requests)로 한다. NiFi는 이 요청을 처리하면서
+    이 Context를 참조하는 Processor·Controller Service를 멈췄다가 다시 시작한다. 요청이 끝날 때까지 1초마다
+    상태를 조회하고, 끝나면 요청을 DELETE로 정리한 뒤 failureReason이 있으면 빌드를 멈춘다.
+    요청에 넣은 Parameter만 추가·변경되며, config에 없는 기존 Parameter는 그대로 남는다.
+    """
     for pc in call("GET", "/flow/parameter-contexts")["parameterContexts"]:
         if pc["component"]["name"] != PC_COMMON:
             continue
+        # update-request에는 현재 revision이 필요하므로 최신 상태를 다시 읽는다.
         cur = call("GET", f"/parameter-contexts/{pc['id']}")
         req = call("POST", f"/parameter-contexts/{pc['id']}/update-requests", {
             "revision": cur["revision"], "id": pc["id"], "component": {"id": pc["id"], "parameters": [
@@ -106,13 +143,19 @@ def ensure_common(params):
     return param_ctx(PC_COMMON, params)
 
 
+# Job Context는 이 Job만 쓰므로 지우고 config 값으로 새로 만든다. 공통 Context를 상속하므로 Job PG 안에서는
+# 공통 Parameter(CONTROL.API.URL, JDBC 등)와 Job Parameter(JOB.KEY, SRC.* 등)를 모두 #{...}로 참조할 수 있다.
 drop_param_ctx(PC_JOB)
 common = ensure_common(CFG["common_params"])
 job = param_ctx(PC_JOB, CFG["job_params"], inherited=common)
 
 
 def new_pg(parent, name, x, y, comments="", ctx=None):
-    """자식 PG는 Parameter Context를 상속하지 않으므로 매번 지정한다."""
+    """parent 안에 Process Group을 만들고 Parameter Context를 지정한 뒤 id를 돌려준다.
+
+    자식 PG는 부모 PG의 Parameter Context를 상속하지 않으므로 매번 지정한다. ctx를 주지 않으면 Job Context를
+    쓰고, root 공통 PG-05는 공통 Context(ctx=common)를 쓴다. 생성 직후 받은 revision으로 PUT해서 Context를 붙인다.
+    """
     ent = call("POST", f"/process-groups/{parent}/process-groups",
                {"revision": REV, "component": {"name": name, "position": {"x": x, "y": y}, "comments": comments}})
     call("PUT", f"/process-groups/{ent['id']}", {"revision": ent["revision"], "component": {
@@ -123,10 +166,16 @@ def new_pg(parent, name, x, y, comments="", ctx=None):
 TOP = new_pg(root, TOP_NAME, 1000, 300, "Sqoop 대체 적재 Job: Oracle 원천, 자식 PG + Port 구조")
 
 # ---------------------------------------------------------------- Controller Services (TOP에 두고 자식 PG가 공유)
-services = {}
+services = {}   # 이름 -> 생성 응답 entity. 빌드 끝에서 모두 ENABLED로 바꾼다.
 
 
 def cs(name, short, props, group=None):
+    """Controller Service를 만들고 id를 돌려준다.
+
+    기본으로 Job PG(TOP)에 만들어 자식 PG가 모두 같은 서비스(연결 풀, Record Writer)를 쓴다. PG-05의
+    StandardHttpContextMap처럼 다른 PG에 둘 서비스는 group으로 지정한다. 만든 서비스는 DISABLED 상태이며,
+    빌드 끝에서 services 전체를 ENABLED로 바꾼다.
+    """
     b, t = bundle(short)
     ent = call("POST", f"/process-groups/{group or TOP}/controller-services",
                {"revision": REV, "component": {"type": t, "bundle": b, "name": name, "properties": props}})
@@ -135,6 +184,11 @@ def cs(name, short, props, group=None):
 
 
 def hikari(prefix, driver_class, validation_query, max_conns="10"):
+    """HikariCPConnectionPool 속성을 만든다.
+
+    URL·드라이버 경로·사용자·비밀번호는 <prefix>.JDBC.* Parameter를 참조한다(예: ORACLE.JDBC.URL).
+    max_conns에는 숫자 문자열이나 Parameter 참조(#{ORACLE.POOL.MAX})를 줄 수 있다.
+    """
     return {"hikaricp-connection-url": f"#{{{prefix}.JDBC.URL}}",
             "hikaricp-driver-classname": driver_class,
             "hikaricp-driver-locations": f"#{{{prefix}.JDBC.DRIVER.PATH}}",
@@ -148,6 +202,8 @@ def hikari(prefix, driver_class, validation_query, max_conns="10"):
 META = cs("CS_DBCP_META", "HikariCPConnectionPool", hikari("META", "org.postgresql.Driver", "SELECT 1"))
 SRC = cs("CS_DBCP_ORACLE", "HikariCPConnectionPool",
          hikari("ORACLE", "oracle.jdbc.OracleDriver", "SELECT 1 FROM DUAL", "#{ORACLE.POOL.MAX}"))
+# JARR: SQL 결과를 JSON 배열 하나로 쓴다(SCN·manifest·지표 결과를 EvaluateJsonPath·Jolt로 읽는다).
+# PARQ: 추출 데이터를 Snappy 압축 Parquet로 쓴다(PG-20 chunk 파일).
 JARR = cs("CS_JSON_WRITER_ARRAY", "JsonRecordSetWriter", {"output-grouping": "output-array"})
 PARQ = cs("CS_PARQUET_WRITER", "ParquetRecordSetWriter", {"compression-type": "SNAPPY"})
 # Hive. 지표 조회 SQL의 결과 컬럼 이름이 table alias 없이 오도록 HIVE.JDBC.URL에
@@ -251,16 +307,27 @@ COMMENTS = {
 }
 
 # ---------------------------------------------------------------- 구성요소 생성 helper
+# 구성요소를 먼저 모두 만들고 연결은 나중에 한꺼번에 만든다. 그래서 c()는 연결을 conns에 쌓아 두기만 하고,
+# 빌드 후반에 procs·ports에서 id를 찾아 실제 Connection을 만든다.
 procs = {}   # key -> (entity, group id)
 ports = {}   # (group id, name, "in"/"out") -> port id
 conns = []   # (group, src, rels, dst, extra)
-COLW, ROWH = 420, 190
+COLW, ROWH = 420, 190   # 캔버스 배치 격자(열 너비, 행 높이). col·row 인자에 곱해 위치를 정한다.
 
 
 def p(g, key, name, short, props=None, col=0, row=0, tasks=1, sched="0 sec", sensitive=(), retry=None,
       primary=False):
-    """retry=(relationships, count): Processor 내장 재시도. 소진되면 해당 relationship 연결로 간다.
-    primary=True: 클러스터에서 Primary Node에서만 실행(단일 노드에서는 영향 없음)."""
+    """그룹 g에 Processor를 만들고 key로 procs에 등록한다. key를 돌려준다.
+
+    key: COMMENTS의 키이자 연결(c)에서 Processor를 가리키는 이름(예: "P12"). name: 캔버스에 보이는 이름.
+    short: 짧은 타입 이름(bundle 참고). props: Processor 속성. col·row: 격자 위치.
+    tasks: Concurrent Tasks. sched: Run Schedule(타이머).
+    sensitive: sensitive로 등록할 동적 속성 이름(예: InvokeHTTP의 Authorization 헤더).
+    retry=(relationships, count): Processor 내장 재시도. FlowFile을 penalize하며(최대 1분 backoff) count번
+    다시 시도하고, 소진되면 해당 relationship 연결로 간다.
+    primary=True: 클러스터에서 Primary Node에서만 실행(단일 노드에서는 영향 없음).
+    Penalty·Yield는 5초로 고정한다. 자동 종료(auto-terminate) relationship은 빌드 후반에 한꺼번에 정한다.
+    """
     b, t = bundle(short)
     config = {"properties": props or {}, "concurrentlySchedulableTaskCount": tasks,
               "schedulingPeriod": sched, "penaltyDuration": "5 sec", "yieldDuration": "5 sec",
@@ -286,7 +353,11 @@ def label(g, text, x, y, width, height):
 
 
 def port(g, name, kind, col, row):
-    path = "input-ports" if kind == "in" else "output-ports"
+    """그룹 g에 Input Port(kind="in") 또는 Output Port(kind="out")를 만들고 ports에 등록한다. id를 돌려준다.
+
+    자식 PG 사이 연결(links)과 PG 안 연결(c의 ("in"|"out", name))이 (g, name, kind)로 이 Port를 찾는다.
+    """
+    path ="input-ports" if kind == "in" else "output-ports"
     ent = call("POST", f"/process-groups/{g}/{path}",
                {"revision": REV, "component": {"name": name, "position": {"x": col * COLW, "y": row * ROWH}}})
     ports[(g, name, kind)] = ent["id"]
@@ -294,26 +365,58 @@ def port(g, name, kind, col, row):
 
 
 def c(g, src, rels, dst, **extra):
-    """같은 PG 안의 연결. src/dst는 processor key 또는 ("in"|"out", port name)."""
+    """같은 PG 안의 연결을 conns에 예약한다(실제 생성은 빌드 후반).
+
+    src/dst는 processor key 또는 ("in"|"out", port name)이다. rels는 연결할 relationship 하나 또는 목록이다.
+    src가 Input Port면 relationship이 없으므로 []를 준다. extra는 Connection 속성(예: loadBalanceStrategy)이다.
+    여기 연결하지 않은 relationship은 빌드 후반에 auto-terminate된다.
+    """
     conns.append((g, src, rels if isinstance(rels, list) else [rels], dst, extra))
 
 
 def ua(g, key, name, attrs, col, row):
+    """UpdateAttribute Processor를 만든다. attrs는 {attribute 이름: 값(EL·Parameter 가능)}이다.
+
+    같은 UpdateAttribute 안의 식은 모두 들어온 FlowFile의 attribute로 평가된다. 그래서 여기서 만든 값을
+    같은 Processor의 다른 식에서 참조할 수 없고, 필요하면 다음 Processor에서 쓴다.
+    """
     return p(g, key, name, "UpdateAttribute", attrs, col, row)
 
 
 def route(g, key, name, routes, col, row):
+    """RouteOnAttribute Processor를 "Route to Property name" 전략으로 만든다.
+
+    routes는 {relationship 이름: boolean EL}이다. 어느 식도 참이 아니면 unmatched로 간다. unmatched를
+    연결하지 않으면 auto-terminate되어 조용히 끝난다(claim 거절, 중복 dispatch 같은 정상 종료).
+    """
     return p(g, key, name, "RouteOnAttribute", {"Routing Strategy": "Route to Property name", **routes}, col, row)
 
 
 def body(g, key, name, value, col, row):
-    """FlowFile content를 value로 바꾼다(API 요청 본문, _SUCCESS marker 등)."""
+    """ReplaceText(Always Replace, Entire text)로 FlowFile content를 value로 바꾼다.
+
+    API 요청 본문 JSON, HiveQL 문장, _SUCCESS marker(빈 문자열) 등을 만드는 데 쓴다. value 안의
+    ${attr} EL과 #{Param}은 실행 시 치환된다. JSON 문자열 값에 넣는 attribute는 필요하면 escapeJson()을 쓴다.
+    """
     return p(g, key, name, "ReplaceText", {"Replacement Strategy": "Always Replace", "Evaluation Mode": "Entire text",
                                            "Replacement Value": value}, col, row)
 
 
 def invoke(g, key, name, path, col, row, attr_response=True, tasks=1, method="POST"):
-    """Load Control API 호출. Retry(5xx)·Failure(연결 오류)는 내장 재시도 후 errors로 간다."""
+    """Load Control API를 호출하는 InvokeHTTP Processor를 만들고 오류 relationship을 errors Port에 연결한다.
+
+    URL은 #{CONTROL.API.URL}+path, 요청 본문은 FlowFile content(앞의 body()가 만든 JSON)다.
+    헤더: Authorization(#{CONTROL.API.AUTHORIZATION}, sensitive), X-Request-Id(호출마다 새 UUID),
+    X-Run-Id(load.run.id). InvokeHTTP는 동적 속성을 요청 헤더로 보낸다.
+
+    attr_response=True면 응답 본문(최대 16KB)을 api.response attribute에 넣고, content는 요청 본문 그대로
+    Original relationship으로 내보낸다. 다음 단계는 ${api.response:jsonPath(...)}로 응답을 읽는다.
+    attr_response=False면 응답 본문이 Response relationship의 새 FlowFile content가 된다
+    (manifest 등록 응답, 정리 대상 목록처럼 SplitJson으로 나눌 큰 응답).
+
+    No Retry(4xx)는 바로, Retry(5xx)·Failure(연결 오류)는 내장 재시도 5회 후 errors로 간다. PG-90은
+    invokehttp.status.code, invokehttp.java.exception.class, api.response로 오류 코드를 정한다.
+    """
     props = {
         "HTTP Method": method, "HTTP URL": f"#{{CONTROL.API.URL}}{path}",
         "Request Content-Type": "application/json", "Connection Timeout": "5 secs",
@@ -329,12 +432,24 @@ def invoke(g, key, name, path, col, row, attr_response=True, tasks=1, method="PO
 
 
 def esql(g, key, name, pool, sql, col, row, writer=JARR, extra=None, tasks=1, retry=None):
+    """ExecuteSQLRecord Processor를 만든다.
+
+    pool의 연결로 sql을 실행하고 결과를 writer(기본 JSON 배열, 추출은 Parquet)로 content에 쓴다.
+    sql 안의 ${attr}·#{Param}은 실행 시 치환된다. 실패하면 executesql.error.message attribute가 남고
+    failure로 간다(PG-90이 ORA-xxxxx 코드를 여기서 뽑는다). extra로 fetch size, max rows 등 속성을 더한다.
+    """
     props = {"Database Connection Pooling Service": pool, "SQL Query": sql, "esqlrecord-record-writer": writer}
     props.update(extra or {})
     return p(g, key, name, "ExecuteSQLRecord", props, col, row, tasks=tasks, retry=retry)
 
 
 def put_hdfs(g, key, name, col, row, tasks=1):
+    """PutHDFS Processor를 만들고 failure를 errors Port에 연결한다.
+
+    content를 load.hdfs.path 디렉터리에 filename attribute 이름으로 쓴다. writeAndRename은 임시 파일에 다
+    쓴 뒤 이름을 바꾸므로 읽는 쪽이 쓰다 만 파일을 보지 않는다. 같은 이름이 있으면 덮어쓴다(replace).
+    failure는 내장 재시도 3회 후 errors로 간다.
+    """
     p(g, key, name, "PutHDFS", {
         "Hadoop Configuration Resources": "#{HADOOP.CONF.FILES}", "Directory": "${load.hdfs.path}",
         "Conflict Resolution Strategy": "replace", "writing-strategy": "writeAndRename",
@@ -344,12 +459,18 @@ def put_hdfs(g, key, name, col, row, tasks=1):
 
 
 def hive_ql(g, key, name, col, row, retry=None):
-    """content의 HiveQL 한 문장을 실행한다(PutClouderaHiveQL). 오류 attribute를 남기지 않는다."""
+    """content의 HiveQL 한 문장을 실행하는 PutClouderaHiveQL Processor를 만든다(CS_HIVE3_DBCP 사용).
+
+    batch size 1로 FlowFile 하나씩 실행하고 rollback-on-failure는 끈다(실패 FlowFile을 failure·retry로 보낸다).
+    ExecuteSQLRecord와 달리 오류 attribute를 남기지 않으므로 PG-90은 load.stage로만 실패 단계를 안다.
+    연결은 호출한 쪽이 정한다.
+    """
     return p(g, key, name, "PutClouderaHiveQL", {
         "hive3-dbcp-service": HIVE, "hive-batch-size": "1", "hive3-query-timeout": "#{HIVE.QUERY.TIMEOUT}",
         "rollback-on-failure": "false"}, col, row, retry=retry)
 
 
+# SQL 조립용 조각. NUM은 EL matches()에 넣는 정수 정규식(따옴표 포함)이다.
 NUM = "'^-?[0-9]+$'"
 SRC_TABLE = "#{SRC.OWNER}.#{SRC.TABLE}"
 SPLIT = "#{SRC.SPLIT.COLUMN}"
@@ -435,6 +556,9 @@ PG-70 Cleanup(1시간 주기),  모든 PG →(errors)→ PG-90
 상세: nifi-sqoop-removal-guide.md, poc/V4-MANUAL.md""", 0, -250, 1100, 170)
 
 # ===== PG-00 Trigger
+# 00 GenerateFlowFile(하루 1회, Primary)이 빈 JSON FlowFile을 만들고, 01이 load.job.key·load.business.key를
+# Parameter에서 attribute로 옮기며 load.stage=RUN_CREATE로 표시한다. 02가 업무일자 형식을 검사해
+# valid면 start-run(→ PG-10), unmatched면 errors(→ PG-90, run이 없으므로 이벤트만 남는다)로 보낸다.
 port(G00, "start-run", "out", 3, 0)
 port(G00, "errors", "out", 3, 1)
 p(G00, "P00", "00_Generate_Trigger", "GenerateFlowFile",
@@ -450,6 +574,11 @@ c(G00, "P00", "success", "P01"); c(G00, "P01", "success", "P02")
 c(G00, "P02", "valid", ("out", "start-run")); c(G00, "P02", "unmatched", ("out", "errors"))
 
 # ===== PG-10 Run Coordinator
+# 11 run 생성 본문 → 12 POST /runs → 13 응답에서 load.run.id, load.hdfs.path, load.stage.table을 꺼내고
+# load.stage=MANIFEST로 표시 → 14·15 Oracle SCN 고정(load.snapshot.scn) → 16 원천 지표+파티션 manifest SQL
+# → 17 Jolt로 manifest 요청 본문 → 18 POST /runs/{id}/manifest(응답이 content) → 19 dispatchPartitions 분할
+# → 20 partition.* attribute 추출 → partitions(→ PG-20, Round Robin).
+# 각 단계의 failure·unmatched는 errors로 간다. load.stage=MANIFEST 이후 실패는 PG-90이 run 실패로 보고한다.
 port(G10, "start-run", "in", 0, 0)
 port(G10, "partitions", "out", 4, 2)
 port(G10, "errors", "out", 4, 1)
@@ -457,6 +586,7 @@ body(G10, "P11", "11_Build_Run_Body",
      '{"jobKey":"${load.job.key}","businessKey":"${load.business.key}","hdfsRoot":"#{HDFS.STAGE.ROOT}",'
      '"stageTablePrefix":"#{HIVE.STAGE.TABLE.PREFIX}","allowEmptySource":#{ALLOW.EMPTY.SOURCE}}', 1, 0)
 invoke(G10, "P12", "12_Create_Run", "/runs", 2, 0)
+# api.response는 12의 run 생성 응답이다. 이후 모든 API 호출 URL과 X-Run-Id가 load.run.id를 쓴다.
 ua(G10, "P13", "13_Set_Run_Attrs", {
     "load.run.id": "${api.response:jsonPath('$.runId')}",
     "load.hdfs.path": "${api.response:jsonPath('$.hdfsRunPath')}",
@@ -511,6 +641,8 @@ SELECT LPAD(c.pid, 4, '0') AS PARTITION_ID,
        TO_CHAR(m.max_ts, 'YYYY-MM-DD HH24:MI:SS') AS MAX_TS
   FROM c CROSS JOIN m
  ORDER BY c.pid"""
+# 위 SQL의 @...@ 자리표시자를 Parameter 참조·EL로 바꾼다. 결과 SQL은 실행 시 NiFi가 #{...}·${...}를 치환한다.
+# 파티션 경계: [mn, mx]를 N등분해 [lo, hi) 구간을 만들고 마지막 파티션만 hi를 포함(incl=1)해 mx를 빠뜨리지 않는다.
 MANIFEST_SQL = (MANIFEST_SQL.replace("@TABLE@", SRC_TABLE).replace("@SPLIT@", SPLIT)
                 .replace("@N@", N).replace("@SCN@", SCN))
 esql(G10, "P16", "16_Query_Source_Manifest", SRC, MANIFEST_SQL, 2, 1,
@@ -532,6 +664,7 @@ JOLT_MANIFEST = json.dumps([
 ], indent=1)
 p(G10, "P17", "17_Build_Manifest_Body", "JoltTransformJSON", {
     "Jolt Transform": "jolt-transform-chain", "Jolt Specification": JOLT_MANIFEST}, 3, 1)
+# 응답(dispatchPartitions 목록)이 16KB를 넘을 수 있으므로 attribute가 아니라 Response content로 받는다.
 invoke(G10, "P18", "18_Register_Manifest", "/runs/${load.run.id}/manifest", 0, 2, attr_response=False)
 p(G10, "P19", "19_Split_Dispatch_Partitions", "SplitJson", {"JsonPath Expression": "$.dispatchPartitions"}, 1, 2)
 p(G10, "P20", "20_Extract_Partition_Attrs", "EvaluateJsonPath", {
@@ -550,14 +683,21 @@ c(G10, "P19", "split", "P20"); c(G10, "P19", "failure", ("out", "errors"))
 c(G10, "P20", "matched", ("out", "partitions")); c(G10, "P20", ["unmatched", "failure"], ("out", "errors"))
 
 # ===== PG-20 Extract Worker. 입력은 PG-10 manifest와 PG-05 reissue 두 곳
+# 들어오는 FlowFile은 load.run.id, load.snapshot.scn, partition.*(id·lower·upper·upper.inclusive 등)
+# attribute를 갖는다. 30 claim token → 31·32 POST .../claim → 33 소유·숫자 형식 확인 → 34 AS OF SCN 조회
+# (EXTRACT.ROWS.PER.FILE 행마다 Parquet chunk FlowFile 하나, fragment.index/count/identifier가 붙는다)
+# → 35 파일 이름 → 36 PutHDFS → 37 chunk 보고 본문 → 38 POST .../chunks.
+# 실패는 errors로 간다. PG-90은 api.response의 claimed가 true일 때(32 응답이 남아 있을 때) 파티션 실패를 보고한다.
 port(G20, "partitions", "in", 0, 0)
 port(G20, "errors", "out", 4, 2)
 # UpdateAttribute는 들어온 attribute 기준으로 평가하므로 token 생성과 사용(31 본문)을 다른 Processor에 둔다.
 ua(G20, "P30", "30_Set_Claim_Token", {"partition.claim.token": "${UUID()}", "load.stage": "EXTRACT"}, 1, 0)
 body(G20, "P31", "31_Build_Claim_Body",
      '{"claimToken":"${partition.claim.token}","workerNode":"${hostname(true):escapeJson()}"}', 2, 0)
+# claim 응답은 api.response에 남는다. PG-90은 이후 실패 때 이 값의 claimed로 파티션 실패 보고 여부를 정한다.
 invoke(G20, "P32", "32_Claim_Partition", "/runs/${load.run.id}/partitions/${partition.id}/claim", 3, 0, tasks=2)
 # claim 거절(다른 worker 소유)은 정상 경합이므로 조용히 끝낸다(unmatched auto-terminate).
+# 경계·SCN은 34의 SQL에 따옴표 없이 직접 들어가므로 정수 형식이 아니면 owner로 보내지 않는다.
 route(G20, "P33", "33_Is_Owner", {
     "owner": f"${{api.response:jsonPath('$.claimed'):equals('true'):and(${{partition.lower:matches({NUM})}})"
              f":and(${{partition.upper:matches({NUM})}}):and(${{load.snapshot.scn:matches({NUM})}})}}"}, 4, 0)
@@ -565,6 +705,8 @@ route(G20, "P33", "33_Is_Owner", {
 # 반복하지 않도록 바로 실패 보고하고 새 run으로 재실행한다.
 # 정밀도 없는 NUMBER 컬럼은 Default Decimal Precision/Scale로 기록된다. 기본값(10, 0)이면 소수점 이하가 잘리거나
 # 큰 값이 깨질 수 있으므로 Parameter로 지정하고, 가능하면 SRC.COLUMNS에서 CAST(col AS NUMBER(p,s))로 명시한다.
+# 상한 비교 연산자는 partition.upper.inclusive가 'true'면 <=, 아니면 <다(마지막 파티션만 상한 포함).
+# esql-output-batch-size=0이면 모든 chunk를 쿼리가 끝난 뒤 한꺼번에 내보낸다(fragment.count가 채워진다).
 esql(G20, "P34", "34_Execute_Partition_Query", SRC,
      f"SELECT #{{SRC.COLUMNS}}\n  FROM {SRC_TABLE} AS OF SCN ${{load.snapshot.scn}}\n WHERE #{{SRC.BASE.WHERE}}\n"
      f"   AND {SPLIT} >= ${{partition.lower}}\n"
@@ -624,6 +766,7 @@ if RECEIVER_NEW:
         "partition.lower": "$.lowerBound", "partition.upper": "$.upperBound",
         "partition.upper.inclusive": "$.upperInclusive", "partition.is.null": "$.isNullPartition",
         "partition.expected.rows": "$.expectedRowCount", "load.snapshot.scn": "$.snapshotScn"}, 3, 0)
+    # route가 비어 있는 채로 만든다. register_job이 validate.<JOB>·reissue.<JOB> 동적 속성을 추가한다.
     route(G05, "R10", "10_Route_By_Job_Action", {}, 4, 0)
     c(G05, "R05", "success", "R06"); c(G05, "R06", "valid", "R08"); c(G05, "R06", "unmatched", "R07")
     c(G05, "R08", "success", "R09"); c(G05, "R09", "matched", "R10")
@@ -633,6 +776,11 @@ port(TOP, "validate-in", "in", -1, 1)
 port(TOP, "reissue-in", "in", -1, 3)
 
 # ===== PG-40 Staging Validation
+# PG-05가 보낸 FlowFile(load.run.id, load.dispatch.id)로 시작한다. 40 load.stage=VALIDATION_START
+# → 41·42 POST .../validation/start(dispatch ACK) → 43 started 확인 → 44 응답에서 run 정보·원천 기대값을
+# attribute로 꺼내고 load.stage=STAGE_VALIDATION → 45·46 _SUCCESS marker → 47·48 Hive external staging 테이블
+# → 49 지표 SQL → 4A·4B POST .../validations → 4C·4D POST .../stage-validated → 4E staging-valid(→ PG-50).
+# 실패는 errors로 가며, STAGE_VALIDATION 단계면 PG-90이 run을 FAILED_STAGE_VALIDATION으로 보고한다.
 port(G40, "validate", "in", 0, 0)
 port(G40, "errors", "out", 5, 1)
 port(G40, "staging-valid", "out", 5, 3)
@@ -663,16 +811,29 @@ STAGE_TBL = "#{HIVE.STAGE.DB}.${load.stage.table:matches('^[A-Za-z0-9_]{1,128}$'
 
 
 def num_attr(a):
+    """attribute a를 SQL 숫자로 넣는 EL을 만든다. 정수 형식이 아니면 NULL이 들어가 비교가 FAIL이 된다."""
     return "${" + a + ":matches('^-?[0-9]+$'):ifElse(${" + a + "},'NULL')}"
 
 
 def str_attr(a):
+    """attribute a를 SQL 문자열 리터럴 안에 넣는 EL을 만든다.
+
+    숫자·영문·':', '.', ' ', '_', '-' 외 문자를 지워 따옴표로 문자열을 끝내는 SQL 주입을 막는다.
+    금액 합계, 'YYYY-MM-DD HH24:MI:SS' timestamp 값은 그대로 남는다.
+    """
     return "${" + a + ":replaceAll('[^0-9A-Za-z:. _-]', '')}"
 
 
 def metrics_sql(table_where, count_name):
-    """지표마다 (metric_name, expected_value, actual_value, result) 한 행.
-    MIN_TS/MAX_TS는 원천 TO_CHAR와 같은 형식의 문자열로 비교한다. AMOUNT_SUM은 DECIMAL(38,2)로 맞춰 비교한다."""
+    """Hive 지표 검증 SQL을 만든다. 지표마다 (metric_name, expected_value, actual_value, result) 한 행.
+
+    table_where: FROM 뒤에 올 테이블(필요하면 WHERE 포함). staging은 stage table 전체, target은
+    TARGET.BUSINESS.WHERE로 좁힌 업무 범위다. count_name: 건수 지표 이름(STAGE_COUNT 또는 TARGET_COUNT).
+    지표: 건수(원천 건수·추출 건수와 모두 같아야 PASS), split 컬럼 NULL 수(0), PK 중복 수(0), AMOUNT_SUM,
+    MIN_TS, MAX_TS. 기대값은 44가 /validation/start 응답에서 꺼낸 attribute(load.source.count 등)다.
+    MIN_TS/MAX_TS는 원천 TO_CHAR와 같은 형식의 문자열로 비교한다. AMOUNT_SUM은 DECIMAL(38,2)로 맞춰 비교한다.
+    NiFi는 판정 결과를 API에 기록만 하고, 최종 판정은 API가 저장된 지표로 다시 한다.
+    """
     return f"""WITH s AS (
   SELECT COUNT(*) AS cnt,
          COALESCE(SUM(CASE WHEN #{{SRC.SPLIT.COLUMN}} IS NULL THEN 1 ELSE 0 END), 0) AS null_cnt,
@@ -700,7 +861,11 @@ SELECT 'MAX_TS', '{str_attr('validation.source.MAX_TS')}', max_ts, IF(max_ts = '
 
 
 def jolt_metrics(stage):
-    """ExecuteSQLRecord 결과 배열 → /validations 요청. Hive 결과 컬럼은 소문자다."""
+    """ExecuteSQLRecord 결과 배열을 /validations 요청 본문으로 바꾸는 Jolt chain spec(JSON 문자열)을 만든다.
+
+    shift로 각 행을 metrics[i].{metricName, expectedValue, actualValue, result}로 옮기고, default로
+    stage(STAGING 또는 TARGET)와 queryVersion=v1을 더한다. Hive 결과 컬럼은 소문자다.
+    """
     return json.dumps([
         {"operation": "shift", "spec": {"*": {
             "metric_name": "metrics[&1].metricName", "expected_value": "metrics[&1].expectedValue",
@@ -734,6 +899,10 @@ c(G40, "V4D", "Original", "V4E")
 c(G40, "V4E", "validated", ("out", "staging-valid")); c(G40, "V4E", "unmatched", ("out", "errors"))
 
 # ===== PG-50 Publish. 결과는 57이 직접 보고하므로 PG-90은 이벤트만 남긴다.
+# 50 publish.token 생성, load.stage=PUBLISH → 51·52 POST .../publish/claim → 53 claimed 확인
+# → 54 INSERT OVERWRITE SQL(target·partition·컬럼은 Parameter, FlowFile 값은 형식 검사한 stage table 이름만)
+# → 55 실행 → success면 56(PUBLISHED), failure·retry면 56U(PUBLISH_UNKNOWN) → 57 POST .../publish/result
+# → 58 runStatus=PUBLISHED면 published(→ PG-60). 그 밖은 errors(이벤트만).
 port(G50, "staging-valid", "in", 0, 0)
 port(G50, "errors", "out", 5, 1)
 port(G50, "published", "out", 5, 2)
@@ -764,6 +933,9 @@ c(G50, "B57", "Original", "B58")
 c(G50, "B58", "published", ("out", "published")); c(G50, "B58", "unmatched", ("out", "errors"))
 
 # ===== PG-60 Target Validation
+# 60 load.stage=TARGET_VALIDATION → 61 target 업무 범위 지표 SQL(metrics_sql, 기대값은 PG-40에서 받은 attribute가
+# 그대로 따라온다) → 62·63 POST .../validations(stage=TARGET) → 64·65 POST .../success → 66 success 확인.
+# 실패는 errors로 가며 PG-90이 run을 FAILED_TARGET_VALIDATION으로 보고한다. success의 성공 경로는 끝(auto-terminate).
 port(G60, "published", "in", 0, 0)
 port(G60, "errors", "out", 5, 1)
 ua(G60, "T60", "60_Set_Target_Stage", {"load.stage": "TARGET_VALIDATION"}, 1, 0)
@@ -783,6 +955,10 @@ c(G60, "T63", "Original", "T64"); c(G60, "T64", "success", "T65"); c(G60, "T64",
 c(G60, "T65", "Original", "T66"); c(G60, "T66", "unmatched", ("out", "errors"))
 
 # ===== PG-70 Cleanup. 대상 판정은 API, NiFi는 지우고 기록만 한다.
+# 70 1시간 주기 트리거(Primary) → 71 load.stage=CLEANUP, 비교용 prefix attribute → 72 GET /cleanup/candidates
+# (응답이 content) → 73 runs 분할 → 74 run별 attribute → 75 경로·table 이름 안전 검사 → 76·77 DROP TABLE
+# → 78 DeleteHDFS(재귀) → 79·7A POST /runs/{id}/cleanup. 실패는 errors(이벤트만)로 가고 다음 주기에 다시 한다.
+# 입력 Port가 없다(자체 트리거).
 port(G70, "errors", "out", 5, 1)
 p(G70, "C70", "70_Generate_Cleanup_Trigger", "GenerateFlowFile",
   {"generate-ff-custom-text": "{}", "Unique FlowFiles": "false"}, 0, 0, sched="1 hour", primary=True)
@@ -799,6 +975,9 @@ p(G70, "C74", "74_Extract_Run_Attrs", "EvaluateJsonPath", {
     "load.stage.table": "$.stageTable", "load.business.key": "$.businessKey",
     "cleanup.run.status": "$.status"}, 4, 0)
 # DeleteHDFS는 glob도 받으므로 지울 경로를 API 응답 그대로 믿지 않고 이 Job의 run 경로 형식과 정확히 비교한다.
+# - run ID는 소문자 UUID여야 한다.
+# - 경로는 prefix의 연속된 '/'를 하나로 줄인 값 + run ID와 정확히 같아야 한다(HDFS.STAGE.ROOT 끝의 '/' 대비).
+# - table 이름은 소문자·숫자·_이고 HIVE.STAGE.TABLE.PREFIX(소문자로 바꾼 값)로 시작해야 한다.
 route(G70, "C75", "75_Check_Cleanup_Target", {
     "safe": "${load.run.id:matches('^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')"
             ":and(${load.hdfs.path:equals(${cleanup.path.prefix:replaceAll('/+', '/'):append(${load.run.id})})})"
@@ -823,6 +1002,10 @@ c(G70, "C78", "success", "C79"); c(G70, "C78", "failure", ("out", "errors"))
 c(G70, "C79", "success", "C7A"); c(G70, "C79", "failure", ("out", "errors"))
 
 # ===== PG-90 Error and Event. 모든 PG의 errors가 여기로 온다.
+# 90 오류 정규화(error.stage·code·level·event·class·message, load.fail.expected·status) → 91 분기
+# → report_run: 92 본문 → 93 POST /runs/{id}/fail / report_partition: 94 본문 → 95 POST .../partitions/{pid}/fail
+# / unmatched: 보고 없이 → 96 nifi_ops.load_event INSERT → 97 nifi-app.log 구조화 로그.
+# 실패 보고·이벤트 기록 자체가 실패해도 다음 단계로 넘겨(모든 relationship 연결) 로그는 반드시 남긴다.
 port(G90, "errors", "in", 0, 0)
 # 같은 UpdateAttribute 안에서는 방금 만든 값을 참조할 수 없으므로 식마다 원천 attribute를 직접 쓴다.
 # - 4xx/5xx 응답: invokehttp.status.code (2xx 값은 앞 단계 성공 흔적이므로 무시)
@@ -871,10 +1054,13 @@ route(G90, "E91", "91_Route_Failure_Report", {
     # claim에 성공한 파티션의 추출·기록 실패는 파티션 실패로 보고한다.
     "report_partition": "${load.stage:in('EXTRACT','CHUNK_WRITE'):and(${api.response:jsonPath('$.claimed'):equals('true')})}"},
       2, 0)
+# 오류 메시지를 1500자로 자르고 JSON 문자열로 escape한다(92·94 본문, 97 로그).
 MSG_JSON = "${error.message:replaceAll('(?s)^(.{0,1500}).*$','$1'):escapeJson()}"
 body(G90, "E92", "92_Build_Run_Fail_Body",
      '{"expectedStatus":"${load.fail.expected}","failStatus":"${load.fail.status}","errorStage":"${error.stage}",'
      '"errorCode":"${error.code}","message":"' + MSG_JSON + '"}', 3, 0)
+# 93·95는 invoke()를 쓰지 않는다. 실패를 errors Port로 보내면 PG-90으로 되돌아오는 순환이 생기므로
+# 모든 결과를 96 이벤트 기록으로 넘기고, 응답 본문도 attribute로 받지 않는다.
 p(G90, "E93", "93_Report_Run_Fail", "InvokeHTTP", {
     "HTTP Method": "POST", "HTTP URL": "#{CONTROL.API.URL}/runs/${load.run.id}/fail",
     "Request Content-Type": "application/json", "Connection Timeout": "5 secs",
@@ -890,6 +1076,7 @@ p(G90, "E95", "95_Report_Partition_Fail", "InvokeHTTP", {
     "Socket Read Timeout": "#{CONTROL.API.TIMEOUT}", "Authorization": "#{CONTROL.API.AUTHORIZATION}",
     "X-Request-Id": "${UUID()}", "X-Run-Id": "${load.run.id}"}, 4, 1, sensitive=("Authorization",),
   retry=(["Retry", "Failure"], 5))
+# PutSQL 문자열 리터럴용 메시지: 작은따옴표를 두 개로 escape하고 줄바꿈을 공백으로 바꾼 뒤 1500자로 자른다.
 SQL_MSG = "${error.message:replaceAll(\"'\",\"''\"):replaceAll('[\\r\\n]+',' '):replaceAll('(?s)^(.{0,1500}).*$','$1')}"
 p(G90, "E96", "96_Insert_Load_Event", "PutSQL", {
     "JDBC Connection Pool": META, "Support Fragmented Transactions": "false", "Batch Size": "1",
@@ -926,6 +1113,7 @@ links = [
 
 
 def endpoint(g, ref):
+    """c()의 src/dst 참조를 Connection의 source/destination 객체({id, groupId, type})로 바꾼다."""
     if isinstance(ref, tuple):
         kind, name = ref
         return {"id": ports[(g, name, kind)], "groupId": g, "type": "INPUT_PORT" if kind == "in" else "OUTPUT_PORT"}
@@ -933,6 +1121,8 @@ def endpoint(g, ref):
     return {"id": ent["component"]["id"], "groupId": pg_id, "type": "PROCESSOR"}
 
 
+# 예약해 둔 PG 내부 연결을 만든다. back pressure는 모두 10000개·1GB다.
+# Port에서 나가는 연결에는 relationship이 없으므로 selectedRelationships를 넣지 않는다.
 for g, src, rels, dst, extra in conns:
     comp = {"source": endpoint(g, src), "destination": endpoint(g, dst),
             "backPressureObjectThreshold": 10000, "backPressureDataSizeThreshold": "1 GB", **extra}
@@ -940,6 +1130,7 @@ for g, src, rels, dst, extra in conns:
         comp["selectedRelationships"] = rels
     call("POST", f"/process-groups/{g}/connections", {"revision": REV, "component": comp})
 
+# 자식 PG 사이 연결(Output Port → Input Port)은 두 PG의 부모인 TOP에 만든다.
 for sg, sname, dg, dname, extra in links:
     comp = {"source": {"id": ports[(sg, sname, "out")], "groupId": sg, "type": "OUTPUT_PORT"},
             "destination": {"id": ports[(dg, dname, "in")], "groupId": dg, "type": "INPUT_PORT"},
@@ -955,6 +1146,8 @@ for name, dg, dname, extra in (("validate-in", G40, "validate", {}),
     call("POST", f"/process-groups/{TOP}/connections", {"revision": REV, "component": comp})
 
 # 연결되지 않은 relationship은 auto-terminate(정상 종료 지점: claim 거절, 중복 dispatch, 마지막 단계 success 등)
+# Processor가 실제로 가진 relationship 목록은 생성 후 GET으로 받아야 하므로 Processor마다 다시 읽고,
+# 연결에 쓴 relationship을 뺀 나머지를 autoTerminatedRelationships로 지정한다.
 used = {}
 for g, src, rels, _, _ in conns:
     if not isinstance(src, tuple):
@@ -965,6 +1158,7 @@ for key, (ent, _) in procs.items():
     call("PUT", f"/processors/{ent['component']['id']}", {"revision": cur["revision"], "component": {
         "id": ent["component"]["id"], "config": {"autoTerminatedRelationships": sorted(rels - used.get(key, set()))}}})
 
+# Controller Service를 켠다. Processor는 시작하지 않는다(Job PG 시작은 운영자가 한다).
 for name, ent in services.items():
     cur = call("GET", f"/controller-services/{ent['id']}")
     call("PUT", f"/controller-services/{ent['id']}/run-status", {"revision": cur["revision"], "state": "ENABLED"})
@@ -977,7 +1171,12 @@ call("PUT", f"/processors/{trig}/run-status", {"revision": cur["revision"], "sta
 
 
 def stop_pg(pg):
-    """PG를 멈추고 실행 중인 thread가 끝날 때까지 기다린다(속성·연결을 바꾸기 전)."""
+    """PG를 멈추고 실행 중인 thread가 끝날 때까지 기다린다(속성·연결을 바꾸기 전).
+
+    NiFi는 실행 중인 Processor의 속성을 바꾸거나 그 Processor에 연결을 붙이는 요청을 거부하므로 먼저 멈춘다.
+    PG 안 모든 Processor가 RUNNING이 아니고 active thread가 0이 될 때까지 1초 간격으로 최대 60초 기다리고,
+    그래도 멈추지 않으면 빌드를 멈춘다.
+    """
     call("PUT", f"/flow/process-groups/{pg}", {"id": pg, "state": "STOPPED"})
     for _ in range(60):
         procs_ = call("GET", f"/process-groups/{pg}/processors")["processors"]
@@ -989,17 +1188,35 @@ def stop_pg(pg):
 
 
 def receiver_proc(name_prefix):
+    """PG-05에서 이름이 name_prefix로 시작하는 Processor entity(최신 revision 포함)를 돌려준다.
+
+    PG-05가 이미 있던 경우 procs에 없으므로 이름 접두사(05_, 10_)로 찾는다.
+    """
     return next(x for x in call("GET", f"/process-groups/{G05}/processors")["processors"]
                 if x["component"]["name"].startswith(name_prefix))
 
 
 def register_job():
-    """root PG-05에 이 Job의 route·Output Port·연결을 추가하고 Allowed Paths를 갱신한다. PG-05를 잠깐 멈춘다."""
+    """root PG-05에 이 Job의 route·Output Port·연결을 추가하고 Allowed Paths를 갱신한다. PG-05를 잠깐 멈춘다.
+
+    순서:
+    1. PG-05를 멈춘다(실행 중인 Processor는 속성 변경·연결 추가가 거부된다).
+    2. 10_Route_By_Job_Action에 validate.<JOB>, reissue.<JOB> 동적 속성(요청 URI 비교 EL)을 추가한다.
+       RouteOnAttribute는 동적 속성마다 같은 이름의 relationship을 만든다.
+    3. 10의 속성에서 등록된 Job 목록을 다시 읽어 05_Listen_Control의 Allowed Paths 정규식을 모든 Job으로 갱신한다.
+    4. 동작마다 PG-05 Output Port(<action>-<JOB>)를 만들고, 10 → Output Port 연결(PG-05 안)과
+       Output Port → Job PG Input Port(validate-in·reissue-in) 연결(root)을 만든다.
+       Port 위치는 Job 목록 순서로 정해 Job끼리 겹치지 않게 한다.
+    5. 10의 relationship 중 연결되지 않은 것(unmatched 등)을 auto-terminate로 지정한다.
+    6. PG-05를 다시 RUNNING으로 바꾼다.
+    등록된 Job 목록(정렬)을 돌려준다.
+    """
     stop_pg(G05)
     r10 = receiver_proc("10_")
     call("PUT", f"/processors/{r10['id']}", {"revision": r10["revision"], "component": {"id": r10["id"], "config": {
         "properties": {f"validate.{JOB_KEY}": f"${{http.request.uri:equals('/validate/{JOB_KEY}')}}",
                        f"reissue.{JOB_KEY}": f"${{http.request.uri:equals('/reissue/{JOB_KEY}')}}"}}}})
+    # 다른 Job이 등록한 route까지 포함한 전체 목록을 속성 이름(validate.<JOB>/reissue.<JOB>)에서 얻는다.
     r10 = call("GET", f"/processors/{r10['id']}")
     jobs = sorted({k.split(".", 1)[1] for k in r10["component"]["config"]["properties"]
                    if k.startswith(("validate.", "reissue."))})
@@ -1032,6 +1249,7 @@ def register_job():
 
 registered = register_job()
 
+# 만든 구성요소 id를 JSON으로 출력한다(Trigger enable·Run Once, 모니터링에 쓴다).
 print(json.dumps({"process_group": TOP, "trigger": trig, "receiver": G05, "receiver_jobs": registered,
                   "groups": {"PG-00": G00, "PG-10": G10, "PG-20": G20, "PG-40": G40, "PG-50": G50,
                              "PG-60": G60, "PG-70": G70, "PG-90": G90},

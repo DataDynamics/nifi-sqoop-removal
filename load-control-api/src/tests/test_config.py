@@ -1,3 +1,5 @@
+"""YAML 설정 파일과 LCA_ 환경변수로 Settings를 읽는 규칙을 검증한다."""
+
 from datetime import timedelta
 from pathlib import Path
 
@@ -22,12 +24,14 @@ logging:
 
 
 def write(tmp_path: Path, content: str) -> Path:
+    """tmp_path에 config.yaml을 쓰고 그 경로를 돌려준다."""
     p = tmp_path / "config.yaml"
     p.write_text(content, encoding="utf-8")
     return p
 
 
 def test_example_config_is_valid() -> None:
+    """배포본에 함께 나가는 config.example.yaml이 검증을 통과하고 주요 값이 기대대로다."""
     s = Settings.load(EXAMPLE)
     assert s.database.pool_size == 10
     assert s.recovery.stale == timedelta(minutes=90)
@@ -37,6 +41,10 @@ def test_example_config_is_valid() -> None:
 
 
 def test_load_minimal_with_defaults(tmp_path: Path) -> None:
+    """최소 설정만 있어도 나머지는 기본값으로 채워진다.
+
+    기간 값은 ISO 8601 문자열과 초 단위 정수를 모두 받는다.
+    """
     s = Settings.load(write(tmp_path, MINIMAL))
     assert s.database.url == "postgresql+asyncpg://u@h:5432/db"
     assert s.recovery.stale == timedelta(hours=2)          # ISO 8601
@@ -48,6 +56,7 @@ def test_load_minimal_with_defaults(tmp_path: Path) -> None:
 
 
 def test_env_overrides_yaml(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """LCA_<섹션>__<키> 환경변수가 YAML 값을 덮어쓰고, 지정하지 않은 값은 YAML 그대로다."""
     monkeypatch.setenv("LCA_DATABASE__URL", "postgresql+asyncpg://secret@h/db")
     monkeypatch.setenv("LCA_DISPATCH__BATCH", "7")
     s = Settings.load(write(tmp_path, MINIMAL))
@@ -57,11 +66,13 @@ def test_env_overrides_yaml(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> 
 
 
 def test_lca_config_env_selects_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """경로를 주지 않으면 LCA_CONFIG 환경변수가 가리키는 파일을 읽는다."""
     monkeypatch.setenv("LCA_CONFIG", str(write(tmp_path, MINIMAL)))
     assert Settings.load().recovery.mode == "REISSUE"
 
 
 def test_missing_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """설정 파일이 없으면 경로를 담은 FileNotFoundError로 바로 실패한다."""
     monkeypatch.setenv("LCA_CONFIG", str(tmp_path / "nope.yaml"))
     with pytest.raises(FileNotFoundError, match=r"nope\.yaml"):
         Settings.load()
@@ -75,6 +86,7 @@ def test_missing_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     "recovery:\n  mode: FAIL\n",  # database.url 없음
 ])
 def test_invalid_configs_rejected(tmp_path: Path, content: str) -> None:
+    """모르는 섹션·키, 허용되지 않는 값, 서로 모순되는 값, 필수값 누락은 모두 거부한다."""
     with pytest.raises(ValidationError):
         Settings.load(write(tmp_path, content))
 

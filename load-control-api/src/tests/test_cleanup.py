@@ -1,3 +1,9 @@
+"""정리(cleanup) 대상 조회와 정리 완료 보고를 검증한다.
+
+끝난 run은 결과별 보존 기간(성공 3일, 실패 14일)이 지나야 대상이 되고,
+PUBLISH_UNKNOWN은 운영자가 확정하기 전까지 대상이 아니다.
+"""
+
 import uuid
 
 import httpx
@@ -14,6 +20,11 @@ async def _finish(db: Db, run_id: str, status: str, days_ago: float) -> None:
 
 
 async def test_candidates_follow_retention(client: httpx.AsyncClient, db: Db) -> None:
+    """보존 기간이 지난 끝난 run만 오래된 순으로 정리 대상에 나온다.
+
+    보존 기간 안의 run, 진행 중 run, PUBLISH_UNKNOWN은 빠지고,
+    jobKey·limit 필터와 잘못된 jobKey 형식(422)도 확인한다.
+    """
     old_success = await create_run(client)
     new_success = await create_run(client)
     old_failed = await create_run(client)
@@ -25,6 +36,7 @@ async def test_candidates_follow_retention(client: httpx.AsyncClient, db: Db) ->
     await _finish(db, old_failed.run_id, "FAILED_EXTRACT", 15)  # 보존 14일 지남
     await _finish(db, mid_failed.run_id, "TIMED_OUT", 5)
     await _finish(db, unknown.run_id, "PUBLISH_UNKNOWN", 30)  # 운영자 확정 전에는 대상 아님
+    # 끝나지 않은 run은 시작한 지 오래돼도 정리 대상이 아니어야 한다.
     await db.execute("UPDATE nifi_ops.load_run SET started_at = started_at - interval '30 days' "
                      "WHERE run_id = :run_id", run_id=uuid.UUID(active.run_id))
 
@@ -42,6 +54,11 @@ async def test_candidates_follow_retention(client: httpx.AsyncClient, db: Db) ->
 
 
 async def test_report_cleanup(client: httpx.AsyncClient, operator: httpx.AsyncClient, db: Db) -> None:
+    """정리 완료 보고는 cleaned_at과 RUN_CLEANED 이벤트를 남기고 멱등이다.
+
+    NiFi 재시도와 운영자 수동 기록은 changed=False로 받아들이며,
+    정리된 run은 다시 대상에 나오지 않는다.
+    """
     run = await create_run(client)
     await _finish(db, run.run_id, "FAILED_STAGE_VALIDATION", 20)
     url = f"/v1/runs/{run.run_id}/cleanup"
@@ -59,6 +76,10 @@ async def test_report_cleanup(client: httpx.AsyncClient, operator: httpx.AsyncCl
 
 
 async def test_report_cleanup_rejects_not_due(client: httpx.AsyncClient, db: Db) -> None:
+    """정리 시점이 아닌 run(진행 중, 보존 기간 안)의 보고는 409로 거부한다.
+
+    없는 run은 404, 경로 탈출(..)이 있는 deletedPath는 422다.
+    """
     run, _ = await to_published(client)  # 진행 중(PUBLISHED)
     r = await client.post(f"/v1/runs/{run.run_id}/cleanup", json={})
     assert r.status_code == 409 and r.json()["code"] == "CLEANUP_NOT_DUE"

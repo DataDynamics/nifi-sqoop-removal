@@ -1,4 +1,7 @@
-"""모니터(TUI)용 조회. 상태를 바꾸지 않는다."""
+"""모니터(TUI)용 조회. 상태를 바꾸지 않는다.
+
+repositories.monitor의 읽기 전용 SQL 결과를 응답 스키마로 바꾼다. 잠금을 잡지 않는다.
+"""
 
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
@@ -17,11 +20,17 @@ from load_control.schemas.monitor import (
     ValidationList,
 )
 
+# "최근" 집계(끝난 run 수, 최근 실패·정리 실패 경보)의 기간
 RECENT_WINDOW = timedelta(hours=24)
 
 
 async def summary(conn: AsyncConnection, settings: Settings, *, alert_limit: int) -> MonitorSummary:
-    """진행 중·최근 run 수, dispatch 현황, 정리 대상 수, 경보."""
+    """진행 중·최근 run 수, dispatch 현황, 정리 대상 수, 경보.
+
+    경보의 stale 기준은 recovery 설정(validation_stale, stale)을 sweeper와 같게 쓴다. 정리 대상 수는
+    cleanup.max_batch개까지만 세므로 실제 대상이 더 많아도 그 값에서 멈춘다. 경보 메시지는 앞뒤 공백을
+    떼고 500자로 자른다. server_time은 API 서버 시각(UTC)이다.
+    """
     alerts = await monitor.alerts(conn, window=RECENT_WINDOW,
                                   validation_stale=settings.recovery.validation_stale,
                                   stale=settings.recovery.stale, limit=alert_limit)
@@ -40,18 +49,19 @@ async def summary(conn: AsyncConnection, settings: Settings, *, alert_limit: int
 
 
 async def _require_run(conn: AsyncConnection, run_id: UUID) -> None:
+    """run이 없으면 NotFound(RUN_NOT_FOUND)를 낸다. 빈 목록과 없는 run을 구분하기 위해서다."""
     if await runs.get(conn, run_id) is None:
         raise NotFound("RUN_NOT_FOUND")
 
 
 async def validations(conn: AsyncConnection, run_id: UUID) -> ValidationList:
-    """run의 SOURCE·STAGING·TARGET 지표."""
+    """run의 SOURCE·STAGING·TARGET 지표. run이 없으면 NotFound(RUN_NOT_FOUND)."""
     await _require_run(conn, run_id)
     return ValidationList(metrics=[ValidationItem(**m) for m in await monitor.validations(conn, run_id)])
 
 
 async def events(conn: AsyncConnection, run_id: UUID, *, limit: int) -> EventList:
-    """run의 이벤트 타임라인(오래된 순, 최근 limit개)."""
+    """run의 이벤트 타임라인(오래된 순, 최근 limit개). run이 없으면 NotFound(RUN_NOT_FOUND)."""
     await _require_run(conn, run_id)
     return EventList(events=[EventItem(
         event_time=e["event_time"], level=e["event_level"], name=e["event_name"],

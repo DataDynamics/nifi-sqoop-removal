@@ -15,7 +15,10 @@ async def healthz() -> dict[str, str]:
 
 @router.get("/readyz")
 async def readyz(request: Request, response: Response) -> dict[str, str]:
-    """DB에 SELECT 1이 되면 200, 아니면 503. LB가 트래픽을 보낼지 판단한다."""
+    """DB에 SELECT 1이 되면 200, 아니면 503. LB가 트래픽을 보낼지 판단한다.
+
+    예외 종류와 관계없이 503 {"status": "unavailable"}을 돌려준다(오류 원인은 로그에 남지 않는다).
+    """
     try:
         async with request.app.state.engine.connect() as conn:
             await conn.execute(text("SELECT 1"))
@@ -27,5 +30,8 @@ async def readyz(request: Request, response: Response) -> dict[str, str]:
 
 @router.get("/metrics")
 async def prometheus_metrics() -> Response:
-    """Prometheus 메트릭(이 프로세스 기준)."""
+    """Prometheus 메트릭(이 프로세스 기준).
+
+    server.workers가 1보다 크면 요청을 받은 프로세스의 값만 보인다(metrics.py 참고).
+    """
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)

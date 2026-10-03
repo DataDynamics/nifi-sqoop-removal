@@ -11,6 +11,7 @@ WIDTH = 1000
 
 @dataclass
 class Run:
+    """생성된 run의 식별자와 HDFS 적재 경로."""
     run_id: str
     hdfs_run_path: str
 
@@ -30,6 +31,11 @@ def partitions_for(counts: list[int], *, null_count: int | None = None) -> list[
 
 
 def manifest_body(counts: list[int], *, null_count: int | None = None, **overrides: Any) -> dict[str, Any]:
+    """partitions_for로 만든 파티션 목록과 일관된 manifest 요청 본문을 만든다.
+
+    sourceCount·min/max split·파티션 수가 파티션 목록과 맞게 계산되므로 그대로 보내면
+    검증을 통과한다. overrides로 특정 필드를 바꿔 실패 사례를 만든다.
+    """
     parts = partitions_for(counts, null_count=null_count)
     body: dict[str, Any] = {
         "snapshotScn": "1234567890",
@@ -47,6 +53,10 @@ def manifest_body(counts: list[int], *, null_count: int | None = None, **overrid
 
 async def create_run(client: httpx.AsyncClient, business_key: str | None = None,
                      allow_empty: bool = False) -> Run:
+    """POST /v1/runs로 CREATED 상태 run을 만든다.
+
+    business_key를 주지 않으면 매번 다른 값을 써서 active run 중복 충돌을 피한다.
+    """
     r = await client.post("/v1/runs", json={
         "jobKey": "ORACLE_INSP_DTL_DAILY",
         "businessKey": business_key or f"2026-09-28-{uuid.uuid4().hex[:8]}",
@@ -60,6 +70,7 @@ async def create_run(client: httpx.AsyncClient, business_key: str | None = None,
 
 
 async def start_run(client: httpx.AsyncClient, counts: list[int], **kwargs: Any) -> Run:
+    """run을 만들고 manifest를 등록해 EXTRACTING 상태로 만든다."""
     run = await create_run(client)
     r = await client.post(f"/v1/runs/{run.run_id}/manifest", json=manifest_body(counts, **kwargs))
     assert r.status_code == 200, r.text
@@ -67,6 +78,7 @@ async def start_run(client: httpx.AsyncClient, counts: list[int], **kwargs: Any)
 
 
 async def claim(client: httpx.AsyncClient, run: Run, pid: str, token: str | None = None) -> str:
+    """파티션을 claim하고 성공했는지 확인한 뒤 claim token을 돌려준다."""
     token = token or str(uuid.uuid4())
     r = await client.post(f"/v1/runs/{run.run_id}/partitions/{pid}/claim",
                           json={"claimToken": token, "workerNode": "nifi-01"})
@@ -77,6 +89,7 @@ async def claim(client: httpx.AsyncClient, run: Run, pid: str, token: str | None
 
 def chunk_body(run: Run, pid: str, token: str, index: int, count: int, rows: int) -> dict[str, Any]:
     # NiFi AttributesToJSON처럼 모든 값을 문자열로 보낸다.
+    """chunk 보고 본문을 만든다. HDFS 경로는 run 경로 아래 파티션·chunk별로 고유하다."""
     return {"claimToken": token, "chunkIndex": str(index), "chunkCount": str(count),
             "fragmentIdentifier": f"frag-{pid}",
             "hdfsPath": f"{run.hdfs_run_path}/part-{pid}-{index:06d}.parquet",
@@ -85,6 +98,7 @@ def chunk_body(run: Run, pid: str, token: str, index: int, count: int, rows: int
 
 async def report(client: httpx.AsyncClient, run: Run, pid: str, token: str, index: int, count: int,
                  rows: int) -> httpx.Response:
+    """chunk 하나를 보고하고 응답을 그대로 돌려준다(상태 코드 확인은 호출자가 한다)."""
     return await client.post(f"/v1/runs/{run.run_id}/partitions/{pid}/chunks",
                              json=chunk_body(run, pid, token, index, count, rows))
 
@@ -106,11 +120,18 @@ async def complete_run(client: httpx.AsyncClient, counts: list[int] | None = Non
 
 
 def metrics(*items: tuple[str, str, str]) -> list[dict[str, str]]:
+    """(지표명, 기대값, PASS|FAIL) 튜플로 검증 지표 목록을 만든다.
+
+    PASS면 실제값을 기대값과 같게, FAIL이면 "x"로 둔다.
+    """
     return [{"metricName": n, "expectedValue": e, "actualValue": e if r == "PASS" else "x", "result": r}
             for n, e, r in items]
 
 
 async def to_staging_validated(client: httpx.AsyncClient) -> Run:
+    """추출 완료 → 검증 시작 → STAGING 지표 PASS 보고 → stage-validated까지 진행해
+    STAGING_VALIDATED 상태 run을 돌려준다.
+    """
     run, dispatch_id = await complete_run(client, [3, 4])
     r = await client.post(f"/v1/runs/{run.run_id}/validation/start", json={"dispatchId": dispatch_id})
     assert r.json()["started"] is True, r.text
@@ -123,6 +144,7 @@ async def to_staging_validated(client: httpx.AsyncClient) -> Run:
 
 
 async def to_published(client: httpx.AsyncClient) -> tuple[Run, str]:
+    """STAGING_VALIDATED run을 publish claim 후 PUBLISHED로 보고해 (run, publish token)을 돌려준다."""
     run = await to_staging_validated(client)
     token = str(uuid.uuid4())
     r = await client.post(f"/v1/runs/{run.run_id}/publish/claim", json={"publishToken": token})

@@ -542,13 +542,28 @@ LISTEN 전용 연결, migration/운영 연결을 합산한다.
 ```yaml
 auth:
   token_digests:
-    nifi: ["<sha256-hex>"]
-    operator: ["<sha256-hex>"]
+    nifi: ["<nifi-token-sha256-hex>"]
+    operator: ["<operator-token-sha256-hex>"]
 ```
 
-- `nifi`: Flow 호출과 읽기 API
-- `operator`: dispatch 재전송, `PUBLISH_UNKNOWN` 확정 등 운영 작업
-- 교체 기간에는 이전·신규 digest를 함께 둔다.
+#### role의 의미와 권한 경계
+
+`token_digests`의 key가 role이고, 각 목록은 그 role로 허용할 token의 SHA-256
+digest들이다. API는 요청으로 받은 token 원문을 매번 SHA-256으로 변환해 허용된
+role 목록과 비교한다. token이 없으면 `401 UNAUTHENTICATED`, token은 있지만 해당 API의
+role에 없으면 `403 FORBIDDEN`을 반환한다.
+
+| role | 사용 주체 | 허용 범위 |
+|---|---|---|
+| `nifi` | NiFi PG-10·20·40·50·60·70·90 | run/manifest 생성, partition/chunk 보고, 검증·게시 결과, 실패·cleanup 보고, 조회 |
+| `operator` | TUI, 운영자 curl/운영 도구 | 조회·monitor·cleanup, dispatch 재전송, `PUBLISH_UNKNOWN` 수동 확정 |
+
+같은 digest를 `nifi`와 `operator`에 모두 넣으면 하나의 token이 두 권한을 모두 갖는다.
+기능적으로는 동작하지만 NiFi token이 유출되면 수동 확정 권한까지 얻게 되므로
+운영에서는 반드시 두 token을 다르게 생성한다. 현재 구현의 감사 기록은 `operator`
+role까지만 식별하고 개인을 구분하지는 않는다. 여러 운영자의 개인별 추적이 필요하면
+앞단 프록시의 SSO/OIDC 또는 개인별 token 기능을 별도로 적용해야 한다.
+
 - 원문 token은 API 설정의 `monitor` 또는 NiFi sensitive parameter에만 둔다.
 - 여섯 Job은 공통 Parameter Context를 사용하므로 `nifi` token 하나를 공유한다. Job별 발급은 필요 없다.
 - `operator` token은 `nifi` token과 다르게 생성해 운영자 전용 권한을 분리한다.
@@ -594,6 +609,18 @@ NiFi 빌더 JSON의 공통 Parameter:
 `Bearer ` 접두사를 빼거나 API에 원문을 넣으면 인증되지 않는다. 반대로 API의 `token_digests`를 비우면
 인증이 해제되는 것이 아니라 보호된 API가 모두 401/403을 반환한다.
 
+#### token 만료와 수명 관리
+
+현재 구현은 JWT가 아닌 임의의 난수 원문을 사용하는 정적 opaque token 방식이다.
+`AuthSettings`에는 digest 목록만 있고 `expires_at`이나 JWT `exp`를 검증하는 로직이 없다.
+따라서 token은 해당 digest를 설정에서 제거하고 API server를 재시작할 때까지 유효하다.
+
+NiFi 서비스 token에 자동 만료를 강제하면 교체 실패 시 전체 적재가 멈출 수 있으므로
+현재 범위에서는 요청 시간 기준 자동 만료를 필수로 두지 않는다. 다만 만료가 없다고 같은
+token을 영구적으로 쓰는 것은 아니다. 충분히 긴 난수, 망 제한, 조직 정책에 따른 정기
+교체, 유출 의심 시 즉시 폐기를 함께 적용한다. `operator` token은 상태를 수동으로
+변경할 수 있으므로 `nifi` token보다 접근 대상을 더 엄격하게 제한한다.
+
 통신 방향별 인증은 다음과 같다.
 
 | 통신 | 현재 인증 |
@@ -603,9 +630,19 @@ NiFi 빌더 JSON의 공통 Parameter:
 | Load Control worker → NiFi PG-05 | 현재 Bearer token 없음; 내부망·방화벽으로 제한 |
 | 사용자 → NiFi UI/REST API | NiFi 자체 보안 설정이며 위 API token과 무관 |
 
-token 교체 시에는 API에 기존·신규 digest를 함께 등록하고, 공통 Parameter Context의
-`CONTROL.API.AUTHORIZATION`을 한 번 변경한 뒤 기존 digest를 제거한다. 공통 Context 변경은 모든 Job에
-영향을 줄 수 있으므로 실행 중 run이 없는 시간에 수행한다.
+#### 무중단 token 교체
+
+1. 새 원문 token을 생성하고 digest를 계산한다.
+2. 기존 digest를 지우지 않은 채 같은 role 목록에 신규 digest를 추가한다.
+3. API server를 순차 재시작한다. 설정은 시작 시 로드되므로 파일만 수정해서는 반영되지 않는다.
+4. `nifi` token은 공통 Parameter Context의 `CONTROL.API.AUTHORIZATION`을 `Bearer <신규 token>`으로
+   변경한다. `operator` token은 TUI `monitor.operator_token`과 운영 도구의 비밀을 변경한다.
+5. 신규 token으로 API 조회와 필수 운영 기능을 검증한다.
+6. 이전 digest를 제거하고 API server를 다시 순차 재시작한다.
+
+공통 Parameter Context 변경은 모든 Job에 영향을 줄 수 있으므로 실행 중 run이 없는 시간에
+수행한다. 현재 NiFi→API 통신은 HTTP이므로 token이 평문 패킷에 포함된다. API 포트를
+NiFi 노드와 승인된 관리망에서만 열고, 가능하면 앞단 LB/프록시에서 TLS를 종료한다.
 
 ### 8.4 `nifi`
 

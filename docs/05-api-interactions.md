@@ -35,6 +35,11 @@ server와 worker를 여러 개 실행해도 DB의 lock, lease, advisory lock으�
 - `X-Request-Id`: NiFi가 보내거나 API가 생성, 응답에도 반환
 - `X-Run-Id`: NiFi가 전달하는 로그 상관관계 키
 
+`nifi`는 NiFi Flow 자동화용 서비스 role이고, `operator`는 사람이 수행하는 복구·확정
+작업용 role이다. 같은 token digest를 두 role에 등록하면 두 권한을 모두 갖게 되므로
+운영에서는 반드시 별도 token을 사용한다. token 미제공은 401, 해당 role 권한이 없는
+token은 403을 받는다.
+
 | 범위 | 허용 role |
 |---|---|
 | run/partition/validation/publish 상태 변경 | `nifi` |
@@ -42,6 +47,11 @@ server와 worker를 여러 개 실행해도 DB의 lock, lease, advisory lock으�
 | cleanup 후보/완료 기록 | `nifi`, `operator` |
 | dispatch resend, publish unknown resolve | `operator` |
 | health/ready/metrics | 인증 없음; 내부망 제한 필요 |
+
+현재 Bearer token은 JWT가 아닌 정적 opaque token이며 자동 만료하지 않는다. 설정에서
+digest를 제거하고 API server를 재시작해야 폐기된다. 만료 없음은 영구 사용을 의미하지
+않으며, 정기 교체와 유출 시 즉시 폐기를 운영 절차로 보장한다. role 설정, 원문·digest
+배치 위치, 무중단 교체 절차는 [설정 레퍼런스 8.3](./02-configuration.md#83-auth)을 따른다.
 
 ## 4. 엔드포인트 맵
 

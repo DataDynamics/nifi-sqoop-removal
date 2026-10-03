@@ -52,6 +52,7 @@ flowchart LR
 ```text
 .
 ├── README.md                      이 문서
+├── docs/                          전체 적용·설정·검증·운영 매뉴얼
 ├── nifi-sqoop-removal-guide.md    NiFi Flow 설계(PG별 역할, Parameter, 오류 처리)
 ├── load-control-api-design.md     Load Control API 설계(상태, 완료 판정, 엔드포인트)
 ├── sqoop.md                       기존 Sqoop 동작과 전환 시 지켜야 할 점
@@ -68,10 +69,13 @@ flowchart LR
 
 ## 시작하기
 
-1. Load Control API 설치·실행: [load-control-api/README.md](./load-control-api/README.md)
-2. NiFi Flow 생성·실행: [poc/V4-MANUAL.md](./poc/V4-MANUAL.md)
-3. 상태 보기: API 서버에서 `load-control-api/bin/monitor.sh`(터미널 대시보드)
-4. 설계를 이해하려면: [NiFi Flow 설계](./nifi-sqoop-removal-guide.md) → [API 설계](./load-control-api-design.md)
+처음 적용하는 경우 [전체 적용 매뉴얼](./docs/README.md)부터 읽는다. 아키텍처, 모든 설정값, PG별 동작과
+검증, Load Control API 상호작용, 장애 복구까지 실제 배포 순서로 정리되어 있다.
+
+1. 전체 적용 절차: [docs/README.md](./docs/README.md)
+2. Load Control API 설치·실행: [load-control-api/README.md](./load-control-api/README.md)
+3. NiFi Flow 생성·실행: [poc/V4-MANUAL.md](./poc/V4-MANUAL.md)
+4. 상태 보기: API 서버에서 `load-control-api/bin/monitor.sh`(터미널 대시보드)
 
 ## 현재 상태
 

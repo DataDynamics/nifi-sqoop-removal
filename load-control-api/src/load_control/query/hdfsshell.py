@@ -156,7 +156,8 @@ class HdfsShell:
             self._error(str(exc), EXIT_REFUSED)
         except HdfsError as exc:
             kind = f"{exc.exception}: " if exc.exception else ""
-            self._error(f"{kind}{exc}", EXIT_ERROR)
+            # NameNode 접속 실패(exception 없음, status 0)는 접속 오류 2로 구분한다
+            self._error(f"{kind}{exc}", EXIT_USAGE if not exc.exception and not exc.status else EXIT_ERROR)
         except OSError as exc:
             self._error(str(exc), EXIT_ERROR)
         except KeyboardInterrupt:

@@ -31,6 +31,10 @@ class QueryError(Exception):
     """사용자에게 그대로 보여 줄 오류(드라이버 오류를 정리한 메시지, 찾을 수 없는 테이블 등)."""
 
 
+class ConnectError(QueryError):
+    """접속 실패(주소·계정·네트워크). 종료 코드 2로 문장 실행 오류(1)와 구분한다."""
+
+
 MetaHandler = Callable[[list[str]], ResultSet | str | None]
 
 
@@ -135,6 +139,9 @@ class SqlShell:
         started = time.monotonic()
         try:
             result = self.backend.execute(sql, self.max_rows)
+        except ConnectError as exc:
+            self._error(str(exc), EXIT_USAGE)
+            return False
         except QueryError as exc:
             self._error(str(exc), EXIT_ERROR)
             return False
@@ -252,6 +259,9 @@ class SqlShell:
         errors = self._errors
         try:
             result = entry[1](args)
+        except ConnectError as exc:
+            self._error(str(exc), EXIT_USAGE)
+            return None
         except QueryError as exc:
             self._error(str(exc), EXIT_ERROR)
             return None

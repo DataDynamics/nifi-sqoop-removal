@@ -8,6 +8,7 @@ Hive에는 읽기 전용 트랜잭션이 없으므로 읽기 전용 모드는 st
 """
 
 import fnmatch
+import logging
 import re
 from typing import Any
 
@@ -17,11 +18,15 @@ from thrift.Thrift import TException
 
 from load_control.config import HiveClientSettings
 from load_control.query.output import ResultSet
-from load_control.query.sqlshell import QueryError, SqlBackend
+from load_control.query.sqlshell import ConnectError, QueryError, SqlBackend
 
 _USE = re.compile(r"^\s*USE\s+`?([A-Za-z0-9_]+)`?\s*$", re.IGNORECASE)
 _NAME = re.compile(r"^`?[A-Za-z0-9_*?]+`?(\.`?[A-Za-z0-9_*?]+`?)?$")
 _DRIVER_ERRORS = (ImpalaError, TException, OSError, EOFError)
+
+# thrift·impyla는 연결 실패를 자체 logger로도 남긴다. 같은 내용을 오류 메시지로 보여 주므로 화면에서는 끈다.
+for _name in ("thrift", "impala"):
+    logging.getLogger(_name).setLevel(logging.CRITICAL)
 
 
 def _match(name: str, pattern: str | None) -> bool:
@@ -61,7 +66,7 @@ class HiveBackend(SqlBackend):
                            timeout=self.cfg.connect_timeout)
             cur = conn.cursor()
         except _DRIVER_ERRORS as exc:
-            raise QueryError(f"HiveServer2 연결 실패({self.cfg.host}:{self.cfg.port}): "
+            raise ConnectError(f"HiveServer2 연결 실패({self.cfg.host}:{self.cfg.port}): "
                              f"{error_message(exc)}") from None
         self._conn, self._cur = conn, cur
 

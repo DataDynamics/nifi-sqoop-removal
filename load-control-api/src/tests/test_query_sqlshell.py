@@ -8,6 +8,8 @@ from load_control.query.sqlshell import (
     EXIT_ERROR,
     EXIT_OK,
     EXIT_REFUSED,
+    EXIT_USAGE,
+    ConnectError,
     MetaHandler,
     QueryError,
     SqlBackend,
@@ -29,6 +31,8 @@ class FakeBackend(SqlBackend):
 
     def execute(self, sql: str, max_rows: int) -> ResultSet:
         self.executed.append(sql)
+        if "down" in sql:
+            raise ConnectError("Oracle 연결 실패(h:1521/x): ORA-12541")
         if "fail" in sql:
             raise QueryError("ORA-00942: table or view does not exist")
         if "many" in sql:
@@ -127,3 +131,11 @@ def test_unknown_meta_is_error() -> None:
     sh, _, _, err = shell()
     assert not sh.run_text("\\nope")
     assert "알 수 없는 명령" in err.getvalue()
+
+
+def test_connect_error_exits_2() -> None:
+    """접속 실패는 실행 오류(1)와 구분해 종료 코드 2."""
+    sh, _, _, err = shell()
+    assert not sh.run_text("select down from dual")
+    assert sh.status == EXIT_USAGE
+    assert "연결 실패" in err.getvalue()

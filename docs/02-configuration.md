@@ -709,7 +709,7 @@ worker는 `receiver_url`이 없으면 시작하지 않는다.
 ### 8.8 `clients`
 
 운영 조회 도구(`bin/oracle.sh`, `bin/hive.sh`, `bin/hdfs.sh`)의 접속 정보다. API server·worker는 이
-섹션을 읽지 않는다. 쓰지 않는 도구는 `null`로 둔다. 자세한 내용은 [운영 조회 도구](./09-query-tools.md)에 있다.
+섹션을 읽지 않는다. 쓰지 않는 도구는 `null`로 둔다. 자세한 내용은 [부록 A. 운영 조회 도구 사용법](./appendix-a-query-tools.md)에 있다.
 
 | 키 | 기본 | 설명 |
 |---|---|---|

@@ -109,7 +109,7 @@ CREATED → EXTRACTING → EXTRACTED_VALIDATED → STAGE_VALIDATING
 ### 3.4 독립 SQL 비교
 
 아래 SQL은 API 호스트에서 `bin/oracle.sh -f`, `bin/hive.sh -f`로 실행할 수 있다. HDFS chunk는
-`bin/hdfs.sh ls -h <hdfs_run_path>`로 확인한다([운영 조회 도구](./09-query-tools.md)).
+`bin/hdfs.sh ls -h <hdfs_run_path>`로 확인한다([부록 A. 운영 조회 도구 사용법](./appendix-a-query-tools.md)).
 
 Oracle은 run의 SCN을 사용한다.
 
@@ -216,7 +216,21 @@ grep 'SQOOP_REPLACEMENT' <NIFI_HOME>/logs/nifi-app.log
 API request 한 건은 `requestId`로 수신, 서비스 판정, 응답을 묶어 추적한다. API의 `dispatchId`는 worker
 로그와 PG-05 provenance를 연결한다.
 
-### 6.3 권장 경보
+### 6.3 원천·HDFS·Hive 직접 조회
+
+TUI가 보여 주는 API 기록을 실제 데이터와 맞춰 볼 때는 API 호스트의 조회 도구를 쓴다. 세 도구 모두 기본이
+읽기 전용이다.
+
+```bash
+cd load-control-api
+bin/oracle.sh -c "SELECT COUNT(*) FROM APP.INSP_DTL AS OF SCN <snapshot_scn> WHERE BASE_DT = DATE '<business_key>'"
+bin/hdfs.sh ls -h <hdfs_run_path>
+bin/hive.sh -c "SELECT COUNT(*) FROM stg.<stage_table_name>"
+```
+
+시나리오별 사용 예와 문제 해결은 [부록 A. 운영 조회 도구 사용법](./appendix-a-query-tools.md)에 있다.
+
+### 6.4 권장 경보
 
 | 경보 | 우선도 | 조치 시작점 |
 |---|---|---|

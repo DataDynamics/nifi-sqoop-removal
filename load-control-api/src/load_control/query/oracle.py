@@ -14,7 +14,7 @@ import oracledb
 
 from load_control.config import OracleClientSettings
 from load_control.query.output import ResultSet
-from load_control.query.sqlshell import MetaHandler, QueryError, SqlBackend
+from load_control.query.sqlshell import ConnectError, MetaHandler, QueryError, SqlBackend
 
 # LOB을 LOB 객체가 아닌 str·bytes로 받는다(출력할 때 따로 읽지 않아도 된다).
 oracledb.defaults.fetch_lobs = False
@@ -106,7 +106,7 @@ class OracleBackend(SqlBackend):
             try:
                 conn = oracledb.connect(user=self.cfg.user, password=self.cfg.password, dsn=self.cfg.dsn)
             except oracledb.Error as exc:
-                raise QueryError(f"Oracle 연결 실패({self.cfg.dsn}): {error_message(exc)}") from None
+                raise ConnectError(f"Oracle 연결 실패({self.cfg.dsn}): {error_message(exc)}") from None
             conn.call_timeout = int(self.cfg.call_timeout.total_seconds() * 1000)
             conn.autocommit = False
             if self.cfg.current_schema:

@@ -160,8 +160,8 @@ bin/monitor.sh --mouse                 # 호환성이 확인된 터미널에서�
 ## 조회 도구
 
 적재 결과를 원천·HDFS·Hive에서 직접 확인하는 명령행 도구다. sqlplus, beeline, hadoop 클라이언트 없이
-`config.yaml`의 `clients` 섹션 접속 정보로 실행한다. 설계와 전체 사용법은
-[운영 조회 도구](../docs/09-query-tools.md)에 있다.
+`config.yaml`의 `clients` 섹션 접속 정보로 실행한다. 전체 사용법은
+[부록 A. 운영 조회 도구 사용법](../docs/appendix-a-query-tools.md)에 있다.
 
 ```bash
 bin/oracle.sh                                   # 대화형(\? 도움말, \dt, \d 이름, \scn, \x, \q)

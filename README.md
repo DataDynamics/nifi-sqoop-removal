@@ -4,21 +4,27 @@ Oracle 데이터를 Hive로 적재할 때 쓰던 Sqoop(Kylo `ImportSqoop`)을 �
 
 ## 무엇이 바뀌나
 
-```mermaid
-flowchart LR
-    subgraph AS-IS
-        A1[(Oracle)] --> A2[Sqoop<br/>YARN Mapper 병렬] --> A3[(HDFS)] --> A4[Hive 임시 테이블] --> A5[INSERT OVERWRITE]
-    end
-```
+### AS-IS — Kylo + Sqoop
 
-```mermaid
-flowchart LR
-    O[(Oracle)] -->|같은 SCN으로 병렬 조회| N1[NiFi<br/>추출·HDFS 기록]
-    N1 -->|chunk마다 보고| API[Load Control API<br/>완료 판정]
-    API -->|run당 1회 호출| N2[NiFi<br/>Hive 검증 → 게시 → 검증]
-    N2 -->|결과 보고| API
-    API --- DB[(PostgreSQL<br/>상태 원장)]
-```
+![AS-IS Kylo and Sqoop architecture](./docs/assets/as-is-sqoop-kylo-architecture.png)
+
+Kylo `ImportSqoop`이 Sqoop Client와 YARN Job을 기동하고, `--split-by INDEX_COLUMN`으로
+나눈 범위를 Mapper 1~N이 Oracle에서 JDBC로 병렬 조회한다. Mapper 결과는 HDFS staging에
+저장한 뒤 Hive 임시 테이블을 거쳐 target에 `INSERT OVERWRITE`하며, 완료·장애 판정은
+Sqoop/YARN Job 상태와 로그에 의존한다.
+
+### TO-BE — NiFi + Load Control API
+
+![TO-BE NiFi and Load Control API architecture](./docs/assets/to-be-nifi-load-control-architecture.png)
+
+TO-BE는 실제 데이터를 다루는 Data Plane과 상태·완료를 판정하는 Control Plane을 분리한다.
+NiFi는 PG-10에서 SCN·manifest·예상 건수를 고정하고, PG-20에서 범위별 `AS OF SCN` 조회를
+병렬 실행해 run 전용 HDFS 경로에 Parquet을 쓴다. 추출 완료 후 PG-40·50·60이 staging 검증,
+`INSERT OVERWRITE`, target 재검증을 순서대로 수행한다.
+
+Load Control API Server는 run·partition·chunk·검증 결과를 PostgreSQL `nifi_ops`에 저장하고,
+CAS와 token으로 완료·게시를 run당 한 번만 허용한다. Worker의 dispatcher·sweeper는 transactional
+outbox, ACK timeout, stale 판정을 담당하고 PG-05를 통해 검증 시작과 파티션 재발행을 전달한다.
 
 - **NiFi**는 데이터만 다룬다: Oracle 조회, Parquet 변환, HDFS 기록, Hive SQL 실행.
 - **Load Control API**는 상태만 다룬다: 모든 파티션이 끝났는지 판정하고, 다음 단계를 한 번만 시작시키고, 실패를 기록한다.

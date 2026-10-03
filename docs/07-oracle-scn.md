@@ -5,7 +5,7 @@
 
 ![Oracle SCN consistent snapshot](./assets/oracle-scn-consistent-snapshot.png)
 
-## 1. 제안 요약
+## 1. 요약
 
 NiFi는 파티션을 병렬로 조회하므로 각 SELECT의 실제 시작·종료 시각이 다르다. 아무 조치 없이 현재 데이터를
 읽으면 먼저 시작한 파티션과 나중에 시작한 파티션 사이에 발생한 INSERT·UPDATE·DELETE가 결과에 섞일 수

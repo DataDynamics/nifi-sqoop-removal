@@ -53,15 +53,11 @@ flowchart LR
 .
 ├── README.md                      이 문서
 ├── docs/                          전체 적용·설정·검증·운영 매뉴얼
-├── nifi-sqoop-removal-guide.md    NiFi Flow 설계(PG별 역할, Parameter, 오류 처리)
-├── load-control-api-design.md     Load Control API 설계(상태, 완료 판정, 엔드포인트)
-├── sqoop.md                       기존 Sqoop 동작과 전환 시 지켜야 할 점
 ├── TODO.md                        운영 적용에 남은 일
 ├── poc/
 │   ├── build_flow_v4.py           NiFi Flow를 REST API로 만드는 빌더
 │   ├── teardown_flow.py           빌더가 만든 Job 삭제
 │   ├── config.v4.example.json     빌더 설정 예시
-│   ├── V4-MANUAL.md               설치·실행·운영 매뉴얼
 │   ├── VERIFICATION.md            검증 결과
 │   └── hdfs-hive/                 시험용 HDFS·Hive 컨테이너
 └── load-control-api/              Load Control API(Python FastAPI). 사용법은 그 안의 README
@@ -74,7 +70,7 @@ flowchart LR
 
 1. 전체 적용 절차: [docs/README.md](./docs/README.md)
 2. Load Control API 설치·실행: [load-control-api/README.md](./load-control-api/README.md)
-3. NiFi Flow 생성·실행: [poc/V4-MANUAL.md](./poc/V4-MANUAL.md)
+3. NiFi Flow 생성·실행: [설치 및 적용 절차](./docs/03-installation-and-apply.md)
 4. 상태 보기: API 서버에서 `load-control-api/bin/monitor.sh`(터미널 대시보드)
 
 ## 현재 상태

@@ -80,7 +80,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app = FastAPI(title="Load Control API", version=__version__, lifespan=lifespan,
                   root_path=settings.server.root_path,
-                  description="Sqoop 대체 적재의 상태 원장 기록과 완료 판정(load-control-api-design.md).")
+                  description="Sqoop 대체 적재의 상태 원장 기록과 완료 판정(docs/README.md).")
     app.state.settings = settings
     # X-Request-Id·runId 컨텍스트, 수신·응답 로그, 요청 메트릭. 예외 처리기가 만든 오류 응답도 이 안을 지난다.
     app.add_middleware(RequestContextMiddleware, access_log=settings.logging.access_log,

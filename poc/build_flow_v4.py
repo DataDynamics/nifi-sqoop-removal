@@ -20,7 +20,7 @@
   config의 names로 바꿀 수 있다.
 - Trigger(00_Generate_Trigger)는 DISABLED로 만든다. 실행하려면 enable 후 Run Once 한다.
 
-자세한 사용법은 poc/V4-MANUAL.md, 설계는 nifi-sqoop-removal-guide.md.
+자세한 사용법과 설계는 docs/README.md에서 시작한다.
 """
 import json
 import sys
@@ -553,7 +553,7 @@ PG-00 →(start-run)→ PG-10 →(partitions, Round Robin)→ PG-20 → API가 �
 root PG-05 →(validate-in)→ PG-40 →(staging-valid)→ PG-50 →(published)→ PG-60,  root PG-05 →(reissue-in, Round Robin)→ PG-20
 PG-70 Cleanup(1시간 주기),  모든 PG →(errors)→ PG-90
 원장 기록·완료 판정은 Load Control API가 하고, NiFi는 데이터 처리와 API 호출만 한다.
-상세: nifi-sqoop-removal-guide.md, poc/V4-MANUAL.md""", 0, -250, 1100, 170)
+상세: docs/README.md""", 0, -250, 1100, 170)
 
 # ===== PG-00 Trigger
 # 00 GenerateFlowFile(하루 1회, Primary)이 빈 JSON FlowFile을 만들고, 01이 load.job.key·load.business.key를

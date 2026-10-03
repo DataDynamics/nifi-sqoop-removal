@@ -53,7 +53,7 @@
 - [ ] 대상 Job 목록과 전환 순서(작은 테이블부터)
 - [ ] AS-IS Sqoop과 병행 실행해 건수·합계·최소·최대·샘플 행 비교. 병행 중에는 별도 target에 게시
 - [ ] 되돌림 절차: Kylo `ImportSqoop` Flow 재활성화 기준
-- [ ] 운영 Runbook 확정([매뉴얼](./poc/V4-MANUAL.md) 6~7장 기반)
+- [ ] 운영 Runbook 확정([통합 검증과 운영·복구](./docs/06-validation-and-operations.md) 기반)
 - [ ] 전환 후 Kylo Sqoop Flow 제거
 
 ## 선택 기능

@@ -2,7 +2,7 @@
 
 각 값은 DB의 CHECK 제약(`ck_load_run_status` 등)과 일치해야 한다. 서비스 계층은 상태를 바꿀 때
 항상 CAS(현재 상태가 기대값과 같을 때만 갱신하는 조건부 UPDATE)를 사용한다. 전체 상태 흐름은
-`load-control-api-design.md` 3장을 참고한다.
+`docs/01-architecture.md`의 run 상태 모델을 참고한다.
 """
 
 from enum import StrEnum

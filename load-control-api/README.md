@@ -1,10 +1,12 @@
 # Load Control API
 
-Sqoop 대체 적재(NiFi)의 상태 원장 기록과 완료 판정을 담당하는 FastAPI 서비스다. 설계는 [Load Control API 설계](../load-control-api-design.md), NiFi 쪽은 [NiFi Flow 설계](../nifi-sqoop-removal-guide.md)에 있다.
+Sqoop 대체 적재(NiFi)의 상태 원장 기록과 완료 판정을 담당하는 FastAPI 서비스다. 전체 설계는
+[아키텍처와 전환 설계](../docs/01-architecture.md), API 요청·상태 전이·복구 동작은
+[Load Control API 상호작용](../docs/05-api-interactions.md)에 있다.
 
 처음 설치한다면 "설치" → "설정" → "운영 스크립트" 순서로 보면 된다.
 
-프로세스는 두 개다. **server**는 NiFi·운영자의 HTTP 요청을 받아 상태를 판정·기록하고, **worker**는 요청과 관계없이 돌며 NiFi로 다음 단계 호출을 보내고(dispatcher) 멈춘 작업을 찾는다(sweeper). 나눈 이유와 NiFi·server·worker 사이의 시퀀스 다이어그램은 [설계 2장](../load-control-api-design.md#2-구성)에 있다.
+프로세스는 두 개다. **server**는 NiFi·운영자의 HTTP 요청을 받아 상태를 판정·기록하고, **worker**는 요청과 관계없이 돌며 NiFi로 다음 단계 호출을 보내고(dispatcher) 멈춘 작업을 찾는다(sweeper). 나눈 이유와 NiFi·server·worker 사이의 시퀀스 다이어그램은 [아키텍처](../docs/01-architecture.md#2-데이터-plane과-control-plane)와 [API 상호작용](../docs/05-api-interactions.md#7-outbox와-pg-05-ack)에 있다.
 
 ## 기능
 

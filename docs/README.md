@@ -97,14 +97,12 @@ flowchart TD
 - `PUBLISH_UNKNOWN`, `DEAD` dispatch, stale run에 대한 운영 절차를 시험했다.
 - Oracle 세션, NiFi queue/back pressure, HDFS/Hive 부하가 승인 범위 안이다.
 
-## 5. 원본과 기준
+## 5. 구현 기준과 검증 증적
 
 - 실제 Flow 생성 코드: [`poc/build_flow_v4.py`](../poc/build_flow_v4.py)
 - Flow 설정 예시: [`poc/config.v4.example.json`](../poc/config.v4.example.json)
 - API 설정 예시: [`load-control-api/config/config.example.yaml`](../load-control-api/config/config.example.yaml)
 - API migration: [`load-control-api/src/migrations`](../load-control-api/src/migrations)
-- 기존 상세 설계: [`nifi-sqoop-removal-guide.md`](../nifi-sqoop-removal-guide.md),
-  [`load-control-api-design.md`](../load-control-api-design.md)
 - 검증된 시나리오: [`poc/VERIFICATION.md`](../poc/VERIFICATION.md)
 
 Processor 속성의 최종 기준은 항상 `poc/build_flow_v4.py`다. 문서와 생성된 Flow가 다르면 먼저 사용한

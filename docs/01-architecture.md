@@ -117,6 +117,9 @@ Trigger 00과 Cleanup 70만 Primary Node에서 실행한다. 다른 Processor는
 PG-10이 run 시작 시 SCN을 한 번 조회한다. 원천 지표, 파티션별 예상 건수, PG-20의 실제 데이터 조회가
 모두 `AS OF SCN <snapshot_scn>`을 사용한다.
 
+SCN의 개념, Oracle Undo가 과거 block을 재구성하는 방식, snapshot 오류와 6개 테이블 간 동일 시점의
+보장 경계는 [Oracle SCN 상세 기술](./07-oracle-scn.md)을 참고한다.
+
 ```sql
 WHERE split_column >= lower_bound
   AND split_column <  upper_bound  -- 마지막 파티션만 <=

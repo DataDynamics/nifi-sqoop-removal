@@ -47,11 +47,12 @@ flowchart LR
 | 순서 | 문서 | 목적 |
 |---:|---|---|
 | 1 | [아키텍처와 전환 설계](./01-architecture.md) | 구성요소, 데이터/제어 흐름, 상태 모델 이해 |
-| 2 | [설정 레퍼런스](./02-configuration.md) | NiFi와 Load Control API의 모든 설정값 결정 |
-| 3 | [설치 및 적용 절차](./03-installation-and-apply.md) | DB·API·NiFi Flow를 순서대로 배포 |
-| 4 | [PG별 동작 원리와 검증](./04-process-groups.md) | PG-00~90의 Processor 흐름과 단계별 확인 |
-| 5 | [Load Control API 상호작용](./05-api-interactions.md) | 요청·응답, 상태 전이, outbox/ACK 이해 |
-| 6 | [통합 검증과 운영·복구](./06-validation-and-operations.md) | 인수 테스트, 모니터링, 장애 대응, 재처리 |
+| 2 | [Oracle SCN 상세 기술](./07-oracle-scn.md) | 동일 시점 병렬 추출, Undo, 보장 범위 이해 |
+| 3 | [설정 레퍼런스](./02-configuration.md) | NiFi와 Load Control API의 모든 설정값 결정 |
+| 4 | [설치 및 적용 절차](./03-installation-and-apply.md) | DB·API·NiFi Flow를 순서대로 배포 |
+| 5 | [PG별 동작 원리와 검증](./04-process-groups.md) | PG-00~90의 Processor 흐름과 단계별 확인 |
+| 6 | [Load Control API 상호작용](./05-api-interactions.md) | 요청·응답, 상태 전이, outbox/ACK 이해 |
+| 7 | [통합 검증과 운영·복구](./06-validation-and-operations.md) | 인수 테스트, 모니터링, 장애 대응, 재처리 |
 
 ## 3. 적용 범위와 전제
 

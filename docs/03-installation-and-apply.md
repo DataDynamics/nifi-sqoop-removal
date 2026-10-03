@@ -36,7 +36,19 @@
 
 ## 2. Oracle 준비
 
-예시는 별도 읽기 계정을 사용하는 경우다. 실제 권한은 DBA 정책에 맞춘다.
+Flow는 PG-10에서 현재 SCN과 원천 manifest를 조회하고, PG-20의 모든 병렬 SELECT가 같은 SCN을
+`AS OF SCN`으로 다시 읽는다. 따라서 일반 SELECT 권한만으로는 충분하지 않다. 아래 준비는 다음 장애를
+배포 전에 발견하기 위한 것이다.
+
+- Oracle 접속 또는 원천 SELECT 권한 부족
+- flashback 권한 부족으로 인한 `AS OF SCN` 실패
+- split column의 NULL·중복·잘못된 범위
+- 업무 조건과 split 범위 조회의 full scan 및 병렬 처리 지연
+
+### 2.1 전용 읽기 계정과 권한
+
+예시는 별도 읽기 계정을 사용하는 경우다. 적재 Flow의 권한을 업무 애플리케이션 계정과 분리하면 감사,
+비밀번호 교체, 권한 회수가 쉬워지고 쓰기 권한을 주지 않아도 된다. 실제 생성과 grant는 DBA 정책에 맞춘다.
 
 ```sql
 CREATE USER NIFI_READER IDENTIFIED BY <password>;
@@ -46,22 +58,74 @@ GRANT FLASHBACK ON APP.INSP_DTL TO NIFI_READER;
 GRANT SELECT ON SYS.V_$DATABASE TO NIFI_READER;
 ```
 
+| 구문 | 필요한 이유 | 사용 위치 |
+|---|---|---|
+| `CREATE USER` | NiFi 전용 최소 권한 계정으로 분리 | Oracle Controller Service 접속 계정 |
+| `CREATE SESSION` | JDBC 연결 생성 | PG-10, PG-20 |
+| 원천 table `SELECT` | manifest 집계와 실제 데이터 추출 | PG-10 16, PG-20 34 |
+| 원천 table `FLASHBACK` | 모든 파티션이 동일 시점을 읽도록 `AS OF SCN` 허용 | PG-10 16, PG-20 34 |
+| `SYS.V_$DATABASE SELECT` | run 시작 시 `CURRENT_SCN` 한 번 조회 | PG-10 14 |
+
+`FLASHBACK` 권한과 충분한 undo 보존은 별개다. 권한이 있어도 실행 중 필요한 과거 블록이 사라지면
+`ORA-01555` 또는 `ORA-08180`으로 실패하므로 최장 run보다 충분한 undo 보존 시간을 확보한다.
+상세 원리와 산정 범위는 [Oracle SCN 상세 기술](./07-oracle-scn.md)을 참고한다.
+
 `V$DATABASE` 권한을 줄 수 없다면 PG-10의 SCN SQL을 다음으로 바꾸고 필요한 패키지 실행 권한을 부여한다.
 
 ```sql
 SELECT TO_CHAR(DBMS_FLASHBACK.GET_SYSTEM_CHANGE_NUMBER) AS SNAPSHOT_SCN FROM DUAL
 ```
 
-대상 업무 범위에 대해 다음을 사전 검사한다.
+이 쿼리도 목적은 같다. run 전체가 사용할 기준 SCN을 한 번 얻기 위한 대체 방법이며, 파티션마다 새 SCN을
+조회하기 위한 것이 아니다. 어느 방법을 사용하든 PG-10 manifest와 모든 PG-20 SELECT는 반환된 하나의 SCN을
+공유해야 한다.
+
+권한 확인은 반드시 Flow에서 사용할 `NIFI_READER` 계정으로 수행한다.
+
+```sql
+SELECT TO_CHAR(CURRENT_SCN) AS SNAPSHOT_SCN FROM V$DATABASE;
+
+SELECT COUNT(*)
+  FROM APP.INSP_DTL AS OF SCN <위에서_조회한_SCN>
+ WHERE BASE_DT = DATE '2026-09-28';
+```
+
+첫 쿼리는 PG-10 14의 SCN 획득 권한, 두 번째 쿼리는 원천 SELECT·FLASHBACK 권한과 기본 `AS OF SCN`
+실행을 검증한다. 이 짧은 확인만으로 최장 run 동안의 undo 보존이 증명되지는 않는다. 두 쿼리 중 하나라도
+실패하면 NiFi Flow를 생성하기 전에 DBA와 권한 또는 undo 정책을 수정한다.
+
+### 2.2 split column 사전 검사
+
+대상 업무 범위에 대해 다음을 사전 검사한다. 예제의 `INSP_DTL_SEQ`는
+`SRC.SPLIT.COLUMN`이며 Sqoop의 `--split-by`와 같은 역할을 한다.
 
 ```sql
 SELECT COUNT(*) AS total_rows,
        COUNT(*) - COUNT(INSP_DTL_SEQ) AS null_split_rows,
+       COUNT(DISTINCT INSP_DTL_SEQ) AS distinct_split_rows,
        MIN(INSP_DTL_SEQ) AS min_split,
        MAX(INSP_DTL_SEQ) AS max_split
   FROM APP.INSP_DTL
  WHERE BASE_DT = DATE '2026-09-28';
 ```
+
+각 결과를 확인하는 이유는 다음과 같다.
+
+| 결과 | 확인 이유 | 기대값·이상 시 조치 |
+|---|---|---|
+| `total_rows` | API가 manifest 전체 건수와 모든 파티션 합계를 비교하는 기준 | 예상 업무 건수와 비교. 0건이면 `ALLOW.EMPTY.SOURCE` 정책 확인 |
+| `null_split_rows` | 현재 빌더는 split NULL 전용 파티션을 만들지 않음 | 반드시 0. 0이 아니면 다른 split column 선택 또는 원천 정제 |
+| `distinct_split_rows` | 자동 생성되는 unique split 값이 실제 업무 범위에서도 유일한지 확인 | unique 전제라면 `total_rows`와 같아야 함 |
+| `min_split`, `max_split` | PG-10이 `PARTITION.COUNT`개의 숫자 범위를 만드는 양 끝값 | NULL이 아니고 예상 범위인지 확인 |
+
+정상적인 unique·NOT NULL split column이라면
+`total_rows = distinct_split_rows`이고 `null_split_rows = 0`이다. 중복이 있어도 범위 SELECT 자체는 가능하지만,
+사용자가 전제한 자동 unique column과 원천 데이터가 다르다는 뜻이므로 그대로 운영하지 않는다.
+
+이 집계는 큰 테이블에서 비용이 클 수 있다. 이미 PK/UNIQUE·NOT NULL 제약으로 보장된다면 데이터 사전의
+제약 조건을 증적으로 사용할 수 있고, 실제 업무 범위의 min/max와 실행 계획은 별도로 확인한다.
+
+### 2.3 인덱스와 실행 계획
 
 업무 조건과 split column을 선두로 하는 인덱스가 권장된다.
 
@@ -69,7 +133,25 @@ SELECT COUNT(*) AS total_rows,
 CREATE INDEX APP.IX_INSP_DTL_BASE_SEQ ON APP.INSP_DTL(BASE_DT, INSP_DTL_SEQ);
 ```
 
-운영 테이블에는 실행 계획과 DML 부하를 검토한 뒤 생성한다.
+필요한 이유는 PG-10과 PG-20의 실제 조건이 다음 두 조건을 함께 사용하기 때문이다.
+
+```sql
+WHERE BASE_DT = :business_date
+  AND INSP_DTL_SEQ >= :lower_bound
+  AND INSP_DTL_SEQ <  :upper_bound
+```
+
+적절한 인덱스가 없으면 PG-10의 파티션별 예상 건수 계산과 PG-20의 각 병렬 SELECT가 같은 원천 범위를
+반복해서 full scan할 수 있다. `(업무 조건 컬럼, split column)` 순서는 먼저 업무일자 범위를 좁힌 뒤
+split 범위를 range scan하도록 돕는다.
+
+`IX_INSP_DTL_BASE_SEQ`는 Flow 설정에 넣는 값이 아니다. Flow에는 인덱스 객체명이 아니라
+`SRC.SPLIT.COLUMN=INSP_DTL_SEQ`를 넣고, Oracle Optimizer가 실행 계획에서 인덱스를 선택한다.
+파티션 테이블이면 local/global 인덱스 정책과 물리 파티션 pruning을 DBA와 함께 검토한다.
+
+운영 테이블에 인덱스를 바로 생성하지 않는다. 여섯 테이블 각각에 대해 통계, 실행 계획, 기존 인덱스 중복,
+DML·저장 공간 부하를 확인한 뒤 필요한 경우에만 생성한다. 최소한 PG-10 manifest SQL과 대표 PG-20 범위
+SQL의 실행 계획에서 의도한 partition pruning 또는 index range scan이 발생하는지 확인한다.
 
 ## 3. HDFS와 Hive 준비
 

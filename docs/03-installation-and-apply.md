@@ -144,6 +144,12 @@ chmod 600 config/config.yaml
 - `recovery.extract_query_timeout`, `recovery.stale`
 - 운영 방식에 맞는 로그와 cleanup 보존 기간
 
+`auth.token_digests.nifi`는 NiFi 로그인 token이 아니다. NiFi가 인증 없이 실행되는 시험 환경에서도
+Load Control API용 난수 token을 별도로 생성한다. 원문은 NiFi 공통 Parameter
+`CONTROL.API.AUTHORIZATION=Bearer <token>`에 넣고, SHA-256 digest만 API `config.yaml`에 넣는다.
+6개 Job은 이 공통 token 하나를 공유한다. 생성과 digest 등록 절차는
+[설정 레퍼런스의 auth 절](./02-configuration.md#83-auth)을 따른다.
+
 ### 4.3 migration과 기동
 
 ```bash

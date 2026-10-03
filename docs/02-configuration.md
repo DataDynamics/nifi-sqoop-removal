@@ -11,6 +11,8 @@
 
 - 실제 설정 파일은 저장소 밖에 두고 권한을 `600`으로 설정한다.
 - 비밀번호와 token은 예시 파일에 직접 쓰지 않는다.
+- `nifi` token은 NiFi 로그인 token이 아니라 Load Control API가 NiFi Flow를 식별하는 별도 공유 비밀값이다.
+  NiFi 자체 인증을 사용하지 않는 환경에서도 생성해야 한다.
 - `CONTROL.API.AUTHORIZATION`에는 `Bearer ` 접두사까지 포함한다.
 - `JOB.KEY`는 `[A-Z0-9_]{1,200}` 형식이어야 한다.
 - 공통 Parameter Context는 모든 Job이 공유한다. 새 Job 빌드 시 `common_params`가 기존 값을 갱신하므로
@@ -532,6 +534,11 @@ LISTEN 전용 연결, migration/운영 연결을 합산한다.
 
 ### 8.3 `auth`
 
+> [!IMPORTANT]
+> 여기서 `nifi` token은 NiFi UI나 NiFi REST API에 로그인할 때 사용하는 token이 아니다. NiFi Flow가
+> Load Control API로 보내는 요청을 인증하기 위해 프로젝트에서 임의로 생성하는 공유 비밀값이다.
+> NiFi가 비보안·무인증 모드여도 이 token은 별도로 설정한다.
+
 ```yaml
 auth:
   token_digests:
@@ -543,6 +550,16 @@ auth:
 - `operator`: dispatch 재전송, `PUBLISH_UNKNOWN` 확정 등 운영 작업
 - 교체 기간에는 이전·신규 digest를 함께 둔다.
 - 원문 token은 API 설정의 `monitor` 또는 NiFi sensitive parameter에만 둔다.
+- 여섯 Job은 공통 Parameter Context를 사용하므로 `nifi` token 하나를 공유한다. Job별 발급은 필요 없다.
+- `operator` token은 `nifi` token과 다르게 생성해 운영자 전용 권한을 분리한다.
+
+원문 token은 충분히 긴 난수로 생성한다. 다음 명령은 256-bit 값을 64자리 hex 문자열로 만든다.
+
+```bash
+openssl rand -hex 32
+```
+
+출력된 값을 비밀 저장소에 보관하고, API 설정에는 원문이 아니라 SHA-256 digest만 넣는다.
 
 digest 생성:
 
@@ -550,6 +567,45 @@ digest 생성:
 cd load-control-api
 PYTHONPATH=src .venv/bin/python -m load_control.security '<token>'
 ```
+
+예를 들어 위에서 만든 원문이 `<generated-nifi-token>`이면 설정 위치는 다음과 같다.
+
+Load Control API `config.yaml`:
+
+```yaml
+auth:
+  token_digests:
+    nifi:
+      - "<sha256-of-generated-nifi-token>"
+    operator:
+      - "<sha256-of-separately-generated-operator-token>"
+```
+
+NiFi 빌더 JSON의 공통 Parameter:
+
+```json
+{
+  "common_params": {
+    "CONTROL.API.AUTHORIZATION": "Bearer <generated-nifi-token>"
+  }
+}
+```
+
+`Bearer ` 접두사를 빼거나 API에 원문을 넣으면 인증되지 않는다. 반대로 API의 `token_digests`를 비우면
+인증이 해제되는 것이 아니라 보호된 API가 모두 401/403을 반환한다.
+
+통신 방향별 인증은 다음과 같다.
+
+| 통신 | 현재 인증 |
+|---|---|
+| NiFi Flow → Load Control API | 공통 `nifi` Bearer token 필수 |
+| 운영자/TUI → Load Control API | `operator` 또는 허용된 조회 token |
+| Load Control worker → NiFi PG-05 | 현재 Bearer token 없음; 내부망·방화벽으로 제한 |
+| 사용자 → NiFi UI/REST API | NiFi 자체 보안 설정이며 위 API token과 무관 |
+
+token 교체 시에는 API에 기존·신규 digest를 함께 등록하고, 공통 Parameter Context의
+`CONTROL.API.AUTHORIZATION`을 한 번 변경한 뒤 기존 digest를 제거한다. 공통 Context 변경은 모든 Job에
+영향을 줄 수 있으므로 실행 중 run이 없는 시간에 수행한다.
 
 ### 8.4 `nifi`
 

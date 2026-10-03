@@ -1,6 +1,6 @@
 # Oracle SCN 기반 병렬 추출 일관성
 
-이 장은 제안서와 기술 검토에서 사용할 수 있도록 Oracle SCN(System Change Number)을 이용한 병렬 추출의
+이 장은 Oracle SCN(System Change Number)을 이용한 병렬 추출의
 목적, 구현 방식, 보장 범위와 운영 조건을 설명한다.
 
 ![Oracle SCN consistent snapshot](./assets/oracle-scn-consistent-snapshot.png)

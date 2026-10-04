@@ -1,7 +1,8 @@
 """bin/hive.sh의 HiveServer2 연결과 실행(impyla, Thrift).
 
-beeline(JVM, Hive 클라이언트 설치) 없이 HS2 Thrift 포트로 접속한다. 인증은 이 환경 기준인 NONE(SASL PLAIN,
-user만 보내고 비밀번호는 검사하지 않음)과 NOSASL만 지원한다.
+beeline(JVM, Hive 클라이언트 설치) 없이 HS2 Thrift 포트로 접속한다. 인증은 hive.server2.authentication이
+NONE·LDAP·CUSTOM(SASL PLAIN, http 전송이면 Basic으로 user·password를 보냄)과 NOSASL인 서버를 지원한다.
+NONE이면 서버가 비밀번호를 검사하지 않는다. KERBEROS와 SSL은 지원하지 않는다.
 
 Hive에는 읽기 전용 트랜잭션이 없으므로 읽기 전용 모드는 statements.write_reason 검사로만 지킨다.
 문장마다 hive.query.timeout.seconds를 confOverlay로 보내 오래 걸리는 조회를 서버가 끊게 한다.
@@ -60,7 +61,7 @@ class HiveBackend(SqlBackend):
             return
         try:
             conn = connect(host=self.cfg.host, port=self.cfg.port, database=self.database,
-                           auth_mechanism="PLAIN" if self.cfg.auth == "NONE" else "NOSASL",
+                           auth_mechanism="NOSASL" if self.cfg.auth == "NOSASL" else "PLAIN",
                            user=self.cfg.user, password=self.cfg.password or "unused",
                            use_http_transport=self.cfg.transport == "http", http_path=self.cfg.http_path,
                            timeout=self.cfg.connect_timeout)

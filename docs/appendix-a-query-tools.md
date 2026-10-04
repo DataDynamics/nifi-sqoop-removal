@@ -27,45 +27,63 @@
 
 ### A.1.2 접속 정보
 
-`config/config.yaml`의 `clients` 섹션에 접속 정보를 적는다. API와 같은 파일을 쓰고, 비밀번호도 평문으로
-적는다(파일 권한 600). 쓰지 않는 도구는 `null`로 두거나 생략한다. 항목별 설명은
-[설정 레퍼런스 8.8](./02-configuration.md)과 `config/config.example.yaml`에 있다.
+접속 정보는 모두 `config/config.yaml`의 `clients` 섹션에 적는다. 도구는 실행할 때마다 이 섹션만 읽으므로
+환경변수나 Hadoop 설정 파일(`core-site.xml`, `hdfs-site.xml`)을 따로 준비하지 않는다. API와 같은 파일을
+쓰고, 비밀번호도 평문으로 적는다(파일 권한 600). 쓰지 않는 도구는 `null`로 두거나 생략한다.
+
+다음은 모든 키를 적은 예다. 기본값과 같은 키는 생략해도 된다.
 
 ```yaml
 clients:
   oracle:
-    dsn: oracle-host:1521/ORCLPDB   # NiFi ORACLE.JDBC.URL에서 jdbc:oracle:thin:@// 뒤 부분
-    user: NIFI_READER               # NiFi 원천 조회 계정(읽기 전용 계정)
+    dsn: oracle-host:1521/ORCLPDB   # host:port/service_name
+    user: NIFI_READER               # 원천 조회 계정(읽기 전용 권한 계정 권장)
     password: CHANGE_ME
     current_schema: APP             # 스키마 없이 쓴 이름을 이 스키마에서 찾는다
+    call_timeout: PT10M             # 문장 하나 최대 실행 시간
+    arraysize: 1000                 # fetch 단위
   hive:
-    host: hs2-host                  # NiFi HIVE.JDBC.URL의 호스트·포트
+    host: hs2-host
     port: 10000
+    database: default               # 처음 USE할 database
     user: nifi
+    password: CHANGE_ME             # auth가 LDAP·CUSTOM이면 필수. NONE이면 서버가 검사하지 않는다
+    auth: NONE                      # 서버의 hive.server2.authentication: NONE, LDAP, CUSTOM, NOSASL
+    transport: binary               # 서버의 hive.server2.transport.mode: binary, http
+    http_path: cliservice           # transport가 http일 때 hive.server2.thrift.http.path
+    connect_timeout: 30             # 연결 대기 초
+    query_timeout: PT30M            # 문장마다 hive.query.timeout.seconds로 보낸다
   hdfs:
-    namenode_urls: [http://nn1:9870, http://nn2:9870]   # dfs.namenode.http-address. HA면 둘 다
-    user: nifi
-    home: /data/nifi/stage          # NiFi HDFS.STAGE.ROOT
+    namenode_urls:                  # NameNode WebHDFS 주소. HA면 둘 다(standby는 건너뛴다)
+      - http://nn1:9870
+      - http://nn2:9870
+    user: nifi                      # simple 인증 user.name
+    home: /data/nifi/stage          # 대화형 시작 디렉터리, 상대 경로의 기준
+    datanode_hosts: {}              # DataNode 이름이 안 풀릴 때 {이름: IP}(A.5.4)
+    timeout_seconds: 30             # HTTP timeout 초
 ```
 
-NiFi 설정값과는 다음과 같이 대응한다.
+| 키 | 필수·기본 | 값을 확인하는 곳 |
+|---|---|---|
+| `oracle.dsn` | 필수 | 원천 DB의 `호스트:포트/service_name`. NiFi `ORACLE.JDBC.URL`의 `jdbc:oracle:thin:@//` 뒤 부분과 같다 |
+| `oracle.user`, `password` | 필수 | 원천 조회 계정 |
+| `oracle.current_schema` | `null` | 원천 테이블 소유 스키마(예: `APP`) |
+| `hive.host`, `port` | 필수, `10000` | HiveServer2 주소. NiFi `HIVE.JDBC.URL`(`jdbc:hive2://호스트:포트/db`)과 같다 |
+| `hive.user`, `password` | `nifi`, `null` | HS2 접속 계정. LDAP·CUSTOM 인증 서버면 그 계정의 비밀번호 |
+| `hive.auth`, `transport`, `http_path` | `NONE`, `binary`, `cliservice` | HS2 `hive-site.xml`의 `hive.server2.authentication`, `hive.server2.transport.mode`, `hive.server2.thrift.http.path`([A.4.4](#a44-인증)) |
+| `hdfs.namenode_urls` | 필수 | NameNode Web UI 주소. `hdfs-site.xml`의 `dfs.namenode.http-address`(HA면 `dfs.namenode.http-address.<nameservice>.<nn>` 전부) |
+| `hdfs.user` | `nifi` | NiFi가 HDFS에 쓰는 사용자 |
+| `hdfs.home` | `/` | NiFi `HDFS.STAGE.ROOT` |
 
-| NiFi Parameter | `clients` 항목 |
-|---|---|
-| `ORACLE.JDBC.URL` = `jdbc:oracle:thin:@//h:1521/SVC` | `oracle.dsn: h:1521/SVC` |
-| `ORACLE.JDBC.USER`, `ORACLE.JDBC.PASSWORD` | `oracle.user`, `oracle.password` |
-| `HIVE.JDBC.URL` = `jdbc:hive2://h:10000/default` | `hive.host: h`, `hive.port: 10000`, `hive.database: default` |
-| `HIVE.JDBC.USER` | `hive.user` |
-| `HADOOP.CONF.FILES`의 `hdfs-site.xml` `dfs.namenode.http-address` | `hdfs.namenode_urls` |
-| `HDFS.STAGE.ROOT` | `hdfs.home` |
+항목별 설명은 [설정 레퍼런스 8.8](./02-configuration.md)과 `config/config.example.yaml`에도 있다.
 
-설정 파일을 고치지 않고 일회성으로 바꿀 때는 명령행 옵션이나 환경변수를 쓴다.
+설정 파일을 고치지 않고 한 번만 다른 대상에 접속할 때는 명령행 옵션을 쓴다. 옵션은 `clients`의 같은
+항목만 덮어쓰고, 나머지는 설정 파일 값을 그대로 쓴다.
 
 ```bash
 bin/oracle.sh --dsn other-host:1521/SVC --user APP_READER -W        # -W: 비밀번호를 물어본다
-bin/hive.sh --host other-hs2 -d stg
+bin/hive.sh --host other-hs2 --user etl_reader -W -d stg
 bin/hdfs.sh --url http://nn2:9870 ls /
-LCA_CLIENTS__ORACLE__PASSWORD='...' bin/oracle.sh                   # 환경변수 덮어쓰기
 ```
 
 ### A.1.3 접속 확인
@@ -284,6 +302,31 @@ $ bin/hive.sh -c '\d+ stg.tmp_insp_dtl_d4a0ede736e14befad2e21973a3bd7d2' | grep 
 걸리는 조회는 서버가 끊는다. 실행 중에 Ctrl-C를 누르면 HS2 operation을 취소한다. 큰 테이블을 조회할 때는
 target 파티션 조건(`base_dt = '...'`)을 꼭 넣는다.
 
+### A.4.4 인증
+
+`clients.hive.auth`는 서버 `hive-site.xml`의 `hive.server2.authentication` 값과 맞춘다.
+
+| 서버 설정 | `auth` | 보내는 것 | `password` |
+|---|---|---|---|
+| `NONE`(HS2 기본) | `NONE` | SASL PLAIN으로 user·password | 검사하지 않는다(아무 값이나 된다) |
+| `LDAP` | `LDAP` | SASL PLAIN으로 user·password | 필수. LDAP 계정 비밀번호 |
+| `CUSTOM` | `CUSTOM` | SASL PLAIN으로 user·password | 필수. 서버의 사용자 정의 인증기가 검사한다 |
+| `NOSASL` | `NOSASL` | SASL 없이 접속 | 쓰지 않는다 |
+| `KERBEROS` | 지원하지 않음 | | |
+
+`transport: http`면 같은 user·password를 HTTP Basic 헤더로 보낸다. `auth`가 `LDAP`·`CUSTOM`인데
+`password`가 비어 있으면 접속하지 않고 종료 코드 2로 끝난다. 비밀번호를 파일에 두고 싶지 않으면
+`password`를 비우고 실행할 때마다 `-W`로 입력한다.
+
+```console
+$ bin/hive.sh -W -c '\conninfo'
+Hive 비밀번호:
+hive etl_reader@hs2-host:10000/default (binary, auth LDAP), 읽기 전용
+```
+
+연결 구간 암호화(`hive.server2.use.SSL`)는 지원하지 않는다. LDAP 비밀번호가 평문으로 네트워크를 지나므로
+SSL이 켜진 HS2에는 접속할 수 없고, SSL이 꺼진 HS2라도 신뢰할 수 있는 내부망에서만 쓴다.
+
 ## A.5 HDFS: bin/hdfs.sh
 
 ### A.5.1 대화형 예
@@ -472,12 +515,14 @@ bin/oracle.sh -F json -c "SELECT * FROM insp_dtl AS OF SCN 2390399 WHERE insp_dt
 | 증상(메시지) | 종료 코드 | 원인과 조치 |
 |---|---:|---|
 | `config.yaml clients.oracle 설정이 없거나 잘못됐습니다(dsn, user, password)` | 2 | `clients` 섹션이 없거나 필수 항목이 빠졌다. A.1.2대로 채우거나 명령행 옵션으로 준다 |
-| `설정을 읽을 수 없습니다: config file not found` | 2 | 설치 디렉터리 밖에서 실행했거나 `LCA_CONFIG`가 틀렸다. `bin/*.sh`로 실행한다 |
+| `설정을 읽을 수 없습니다: config file not found` | 2 | `config/config.yaml`이 없다. `bin/*.sh`로 실행하고, 설치 디렉터리에 설정 파일이 있는지 확인한다 |
 | `Oracle 연결 실패(...): ORA-01017: invalid credential` | 2 | 계정·비밀번호 오류. NiFi `ORACLE.JDBC.USER`·`PASSWORD`와 비교한다 |
 | `Oracle 연결 실패(...): DPY-6005` 또는 `ORA-12514` | 2 | 호스트·포트·service name 오류나 방화벽. `dsn`을 JDBC URL의 `@//` 뒤 부분과 비교한다 |
 | `DPY-3010: connections to this database server version are not supported` | 2 | Oracle 11g 이하. thin 모드가 지원하지 않는다 |
 | `HiveServer2 연결 실패(...): Could not connect to any of [...]` | 2 | HS2 주소·포트 오류나 HS2 중지 |
-| HS2 연결 직후 `TSocket read 0 bytes` | 2 | 인증·전송 방식 불일치. 서버의 `hive.server2.authentication`(NONE·NOSASL)과 `transport.mode`(binary·http)를 `auth`·`transport`에 맞춘다 |
+| HS2 연결 직후 `TSocket read 0 bytes` | 2 | 인증·전송 방식 불일치. 서버의 `hive.server2.authentication`과 `transport.mode`를 `auth`·`transport`에 맞춘다(A.4.4). SSL이 켜진 HS2도 이렇게 실패한다 |
+| `HiveServer2 연결 실패(...): Error validating the login` | 2 | LDAP·CUSTOM 인증 실패. `clients.hive.user`·`password`를 확인한다 |
+| `clients.hive.auth가 LDAP이면 password가 필요합니다` | 2 | `clients.hive.password`를 적거나 `-W`로 입력한다 |
 | `NameNode에 연결할 수 없습니다: ...: standby; ...` | 2 | 모든 NameNode가 standby거나 접속 불가. `namenode_urls`에 active NameNode가 있는지 확인한다 |
 | `DataNode에서 읽지 못했습니다(http://dn...:9864/...)` | 2 | A.5.4의 `datanode_hosts`를 설정한다 |
 | `AccessControlException: Permission denied` | 1 | `clients.hdfs.user` 권한이 부족하다. NiFi와 같은 사용자(`nifi`)를 쓴다 |
@@ -493,7 +538,7 @@ bin/oracle.sh -F json -c "SELECT * FROM insp_dtl AS OF SCN 2390399 WHERE insp_dt
 ```text
 # 공통: -c 문장(반복) -f 파일 -F table|vertical|csv|tsv|json -t --write
 bin/oracle.sh [--dsn D] [--user U] [-W] [--max-rows N] [--timing] [--echo] [--null S]
-bin/hive.sh   [--host H] [--port P] [-d DB] [--user U] [--max-rows N] [--timing] [--echo] [--null S]
+bin/hive.sh   [--host H] [--port P] [-d DB] [--user U] [-W] [--max-rows N] [--timing] [--echo] [--null S]
 bin/hdfs.sh   [--url URL]... [--user U] [명령 [인자...]]
 
 # SQL 메타 명령
@@ -526,7 +571,8 @@ cat [-f]  head [-c N]  tail [-c N]  get [-f]  format  help  exit
 - API server·worker는 `clients` 섹션을 읽지 않는다. 조회 도구가 실패해도 적재에는 영향이 없다.
 - 지원하지 않는 것:
   - Kerberos(Oracle·Hive·HDFS)
-  - Hive LDAP 인증
+  - Hive SSL(`hive.server2.use.SSL`). Hive LDAP·CUSTOM 인증은 지원하지만 시험 환경 HS2가 `NONE`이라
+    실제 LDAP 서버로는 검증하지 않았다
   - Oracle 11g 이하(thin 모드 미지원)
   - HDFS 디렉터리 단위 `get`·`put`
   - Parquet 내용 직접 해석(Hive staging table로 조회한다)

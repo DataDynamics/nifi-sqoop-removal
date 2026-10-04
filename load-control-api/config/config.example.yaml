@@ -103,8 +103,8 @@ clients:                  # 운영 조회 도구(bin/oracle.sh, bin/hive.sh, bin
     port: 10000
     database: default
     user: nifi
-    password: null                  # 인증 없는 HS2(NONE)는 검사하지 않는다
-    auth: NONE                      # NONE(SASL PLAIN, HS2 기본) 또는 NOSASL
+    password: null                  # auth가 LDAP·CUSTOM이면 필수. NONE이면 서버가 검사하지 않는다
+    auth: NONE                      # 서버의 hive.server2.authentication: NONE, LDAP, CUSTOM, NOSASL(KERBEROS 미지원)
     transport: binary               # binary 또는 http(hive.server2.transport.mode)
     http_path: cliservice
     connect_timeout: 30

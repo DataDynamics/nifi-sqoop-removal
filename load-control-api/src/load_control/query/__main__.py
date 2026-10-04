@@ -1,8 +1,7 @@
 """운영 조회 도구 진입점: python -m load_control.query {oracle|hive|hdfs} [옵션] [hdfs 명령...]
 
 bin/oracle.sh, bin/hive.sh, bin/hdfs.sh가 이 모듈을 부른다. 접속 정보는 config.yaml clients 섹션에서
-읽고, 명령행 옵션(--dsn, --host, --url 등)이 같은 항목을 덮어쓴다. 환경변수 LCA_CLIENTS__ORACLE__PASSWORD
-같은 덮어쓰기는 Settings.load가 처리한다.
+읽고, 명령행 옵션(--dsn, --host, --url, -W 등)이 같은 항목을 일회성으로 덮어쓴다.
 
 실행 방식(앞의 것이 우선):
 1. -c 명령, -f 파일: 준 순서대로 실행하고 첫 오류에서 멈춘다(-f -는 표준입력)
@@ -78,6 +77,7 @@ def build_parser() -> argparse.ArgumentParser:
     hive.add_argument("--port", type=int)
     hive.add_argument("-d", "--database")
     hive.add_argument("--user")
+    hive.add_argument("-W", "--password-prompt", action="store_true", help="비밀번호를 물어본다")
 
     hdfs = sub.add_parser("hdfs", help="WebHDFS 명령(clients.hdfs)")
     common(hdfs, False)
@@ -114,9 +114,14 @@ def make_sql_backend(args: argparse.Namespace, settings: Settings) -> SqlBackend
         return OracleBackend(ora, allow_write=args.write)
     from load_control.query.hive import HiveBackend
 
+    password = getpass.getpass("Hive 비밀번호: ") if args.password_prompt else None
     hive = client_settings(HiveClientSettings, settings.clients.hive,
                            {"host": args.host, "port": args.port, "database": args.database,
-                            "user": args.user}, "hive")
+                            "user": args.user, "password": password}, "hive")
+    if hive.auth in ("LDAP", "CUSTOM") and not hive.password:
+        print(f"오류: clients.hive.auth가 {hive.auth}이면 password가 필요합니다(설정하거나 -W)",
+              file=sys.stderr)
+        raise SystemExit(EXIT_USAGE)
     return HiveBackend(hive, allow_write=args.write)
 
 

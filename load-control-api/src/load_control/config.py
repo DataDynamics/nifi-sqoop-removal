@@ -202,9 +202,10 @@ class HiveClientSettings(Section):
     port: int = Field(default=10000, ge=1, le=65535)
     database: str = "default"   # 처음 USE할 database
     user: str = "nifi"
-    password: str | None = None  # 인증 없는 HS2(hive.server2.authentication=NONE)는 아무 값이나 받는다
-    # NONE: HS2 기본 인증 NONE(SASL PLAIN 전송). NOSASL: hive.server2.authentication=NOSASL인 서버
-    auth: Literal["NONE", "NOSASL"] = "NONE"
+    password: str | None = None  # LDAP·CUSTOM이면 필수(없으면 -W로 입력). NONE이면 검사하지 않는다
+    # hive.server2.authentication 값. NONE·LDAP·CUSTOM은 SASL PLAIN(http면 Basic)으로 user·password를
+    # 보내고, NOSASL은 SASL 없이 접속한다. KERBEROS는 지원하지 않는다
+    auth: Literal["NONE", "LDAP", "CUSTOM", "NOSASL"] = "NONE"
     transport: Literal["binary", "http"] = "binary"  # hive.server2.transport.mode
     http_path: str = "cliservice"                    # transport가 http일 때 hive.server2.thrift.http.path
     connect_timeout: float = Field(default=30.0, gt=0)  # 초

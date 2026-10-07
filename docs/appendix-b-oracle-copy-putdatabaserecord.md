@@ -88,6 +88,11 @@ grant select, insert, delete on APP.TMP_TEST_COPY to NIFI_READER;
 
 ### B.2.3 NLS logon trigger
 
+이 설정이 HikariCP 설정에 누락되면 Timestamp Format 변환에서 에러가 발생할 수 있습니다.
+
+* `NIFI_READER`은 NiFi에서 Oracle에 접속하는 사용자로 변경하십시오.
+* `NIFI_TMP_TEST_COPY`은 NiFi HikariCP에서 지정하는 값으로 그 값이 있는 경우에만 `alter session set nls_timestamp_format`을 적용합니다. 따라서 적절한 이름으로 변경하시면 됩니다. 예를 들어 `APPLY_NLS_TIMESTAMP_FORMAT` 으로 변경해서 사용하면 될 것 같습니다.
+
 ```sql
 create or replace trigger SYS.TRG_NIFI_TMP_TEST_NLS after logon on database
 declare

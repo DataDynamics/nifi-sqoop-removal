@@ -60,6 +60,7 @@ flowchart LR
 | 부록 | 문서 | 목적 |
 |---|---|---|
 | A | [운영 조회 도구 사용법](./appendix-a-query-tools.md) | `bin/oracle.sh`·`hive.sh`·`hdfs.sh`로 원천·HDFS·Hive를 직접 조회·대조 |
+| B | [Oracle→Oracle 복제 Flow](./appendix-b-oracle-copy-putdatabaserecord.md) | ExecuteSQLRecord + PutDatabaseRecord로 테이블 복제, timestamp 문자열 적재와 서머타임 갭 회피 |
 
 ## 3. 적용 범위와 전제
 

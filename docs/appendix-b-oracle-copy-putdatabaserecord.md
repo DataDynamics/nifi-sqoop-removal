@@ -4,6 +4,9 @@
 `PutDatabaseRecord`로 적재하는 시험 Flow를 정리합니다. 조회는 `ExecuteSQL`(Avro 출력)로 합니다. timestamp
 컬럼은 조회 SQL에서 `RR/MM/DD HH24:MI:SSXFF` 형식의 문자열로 바꿔 넘깁니다.
 
+![NiFi Flow](./docs/appendix-b-nifi-flow.png)
+
+
 시험 환경(CFM 4.12 / NiFi 2.6, Oracle 23 Free `FREEPDB1`)에서 2026-10-07에 실행했고, 5만 건이
 원본과 완전히 일치했습니다. 예시 값은 시험 환경 기준입니다.
 

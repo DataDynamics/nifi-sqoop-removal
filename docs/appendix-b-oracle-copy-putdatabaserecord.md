@@ -7,13 +7,7 @@
 시험 환경(CFM 4.12 / NiFi 2.6, Oracle 23 Free `FREEPDB1`)에서 2026-10-07에 실행했고, 5만 건이
 원본과 완전히 일치했습니다. 예시 값은 시험 환경 기준입니다.
 
-```mermaid
-flowchart LR
-    S[(APP.TMP_TEST)] -->|"SELECT … TO_CHAR(CREATED_AT, 'RR/MM/DD HH24:MI:SSXFF')"| E[ExecuteSQL<br/>Primary node, 1회 실행]
-    E -->|Avro 1만 건 × 5 FlowFile| P[PutDatabaseRecord<br/>INSERT]
-    P -->|"문자열 → TIMESTAMP<br/>(Oracle 세션 NLS로 변환)"| T[(APP.TMP_TEST_COPY)]
-    P -->|failure / retry| F((Funnel))
-```
+![ExecuteSQL + PutDatabaseRecord Oracle copy flow](./assets/oracle-copy-putdatabaserecord-flow.png)
 
 ## B.1 핵심: timestamp는 NiFi가 아니라 Oracle이 변환
 

@@ -1,7 +1,7 @@
-# 부록 B. Oracle→Oracle 복제 Flow: ExecuteSQLRecord + PutDatabaseRecord
+# 부록 B. Oracle→Oracle 복제 Flow: ExecuteSQL + PutDatabaseRecord
 
 이 부록은 Oracle 테이블을 NiFi에서 SQL로 조회하고, 같은 스키마로 만든 다른 Oracle 테이블에
-`PutDatabaseRecord`로 적재하는 시험 Flow를 정리한다. timestamp 컬럼은 조회 SQL에서
+`PutDatabaseRecord`로 적재하는 시험 Flow를 정리한다. 조회는 `ExecuteSQL`(Avro 출력)로 한다. timestamp 컬럼은 조회 SQL에서
 `RR/MM/DD HH24:MI:SSXFF` 형식의 문자열로 바꿔 넘긴다. 본 매뉴얼의 Sqoop 대체 Flow(PG-00~90)와는
 독립된 PG이고, Load Control API를 쓰지 않는다.
 
@@ -10,21 +10,20 @@
 
 ```mermaid
 flowchart LR
-    S[(APP.TMP_TEST)] -->|"SELECT … TO_CHAR(CREATED_AT, 'RR/MM/DD HH24:MI:SSXFF')"| E[ExecuteSQLRecord<br/>Primary node, 1회 실행]
-    E -->|JSON 1만 건 × 5 FlowFile| P[PutDatabaseRecord<br/>INSERT]
+    S[(APP.TMP_TEST)] -->|"SELECT … TO_CHAR(CREATED_AT, 'RR/MM/DD HH24:MI:SSXFF')"| E[ExecuteSQL<br/>Primary node, 1회 실행]
+    E -->|Avro 1만 건 × 5 FlowFile| P[PutDatabaseRecord<br/>INSERT]
     P -->|"문자열 → TIMESTAMP<br/>(Oracle 세션 NLS로 변환)"| T[(APP.TMP_TEST_COPY)]
     P -->|failure / retry| F((Funnel))
 ```
 
 ## B.1 핵심: timestamp를 NiFi가 아니라 Oracle이 변환한다
 
-`CREATED_AT`을 문자열로 꺼낸 뒤 적재할 때 NiFi Record Reader에서 timestamp 형식으로 다시 해석하면
-안 된다. NiFi는 문자열을 `java.sql.Timestamp`로 바꿀 때 JVM 기본 시간대를 쓰고, CFM 노드의 JVM
+`CREATED_AT`을 문자열로 꺼낸 뒤 적재할 때 NiFi에서 timestamp로 다시 해석하면 안 된다. NiFi는 문자열을 `java.sql.Timestamp`로 바꿀 때 JVM 기본 시간대를 쓰고, CFM 노드의 JVM
 시간대는 `America/New_York`이다. 서머타임이 시작되는 2026-03-08 02:00~03:00은 이 시간대에 존재하지
 않으므로, 그 사이 값은 1시간 뒤로 밀려 저장된다.
 
-처음 시도(Reader 스키마 `CREATED_AT`을 `timestamp-micros`, Timestamp Format
-`yy/MM/dd HH:mm:ss.SSSSSS`로 지정)의 결과는 다음과 같았다. 49,998건은 일치하고 2건이 어긋났다.
+처음 시도(조회는 `ExecuteSQLRecord` + JSON, 적재 Reader 스키마에서 `CREATED_AT`을 `timestamp-micros`,
+Timestamp Format `yy/MM/dd HH:mm:ss.SSSSSS`로 지정)의 결과는 다음과 같았다. 49,998건은 일치하고 2건이 어긋났다.
 
 | ID | 원본 | 적재본 |
 |---:|---|---|
@@ -33,7 +32,8 @@ flowchart LR
 
 그래서 다음과 같이 바꿨다.
 
-1. Reader 스키마에서 `CREATED_AT`을 `string`으로 둔다. NiFi는 값을 해석하지 않고 문자열 그대로 넘긴다.
+1. `CREATED_AT`을 끝까지 문자열로 둔다. `ExecuteSQL`은 `TO_CHAR` 결과(VARCHAR2)를 Avro `string`으로
+   쓰고, `AvroReader`는 이 내장 스키마를 그대로 쓰므로 NiFi는 값을 해석하지 않는다.
 2. `PutDatabaseRecord`가 TIMESTAMP 컬럼에 문자열을 바인딩하면 Oracle이 세션의
    `NLS_TIMESTAMP_FORMAT`으로 암묵 변환한다.
 3. Oracle JDBC thin 드라이버는 세션 NLS를 JVM locale(`en_US` → `DD-MON-RR HH.MI.SSXFF AM`)로 정하고,
@@ -120,41 +120,20 @@ end;
 |---|---|---|
 | `CS_DBCP_ORACLE_RW` | `HikariCPConnectionPool` | URL `#{ORACLE.JDBC.URL}`, Driver `oracle.jdbc.OracleDriver`, Driver Location `#{ORACLE.JDBC.DRIVER.PATH}`, User `#{ORACLE.JDBC.USER}`, Password `#{ORACLE.JDBC.PASSWORD}`, Max Total Connections `4`, Minimum Idle `0`, Validation Query `SELECT 1 FROM DUAL` |
 | | | 동적 속성 `v$session.program` = `NIFI_TMP_TEST_COPY`(B.1의 4) |
-| `CS_JSON_WRITER` | `JsonRecordSetWriter` | Output Grouping `Array`, 스키마는 기본값(Record 스키마 상속) |
-| `CS_JSON_READER` | `JsonTreeReader` | Schema Access Strategy `Use 'Schema Text' Property`, Schema Text 아래, Timestamp Format 비움 |
+| `CS_AVRO_READER` | `AvroReader` | Schema Access Strategy `Use Embedded Avro Schema`(기본값) |
 
-`CS_JSON_READER`의 Schema Text:
+`ExecuteSQL`은 Record Writer 없이 결과를 Avro로 쓰고, 스키마를 Avro 파일 안에 넣는다. 따라서 Reader에
+스키마를 따로 적을 필요가 없다. 컬럼 타입은 `ExecuteSQL`이 JDBC 메타데이터로 정한다.
 
-```json
-{
- "type": "record",
- "name": "TMP_TEST",
- "fields": [
-  {"name": "ID",         "type": ["null", "long"]},
-  {"name": "COL01",      "type": ["null", "string"]},
-  {"name": "COL02",      "type": ["null", "string"]},
-  {"name": "COL03",      "type": ["null", "string"]},
-  {"name": "COL04",      "type": ["null", "string"]},
-  {"name": "COL05",      "type": ["null", "string"]},
-  {"name": "COL06",      "type": ["null", "string"]},
-  {"name": "COL07",      "type": ["null", "string"]},
-  {"name": "COL08",      "type": ["null", "string"]},
-  {"name": "COL09",      "type": ["null", "string"]},
-  {"name": "COL10",      "type": ["null", "string"]},
-  {"name": "CREATED_AT", "type": ["null", "string"]}
- ]
-}
-```
-
-### B.3.2 ExecuteSQLRecord - TMP_TEST
+### B.3.2 ExecuteSQL - TMP_TEST
 
 | 속성 | 값 |
 |---|---|
 | Database Connection Pooling Service | `CS_DBCP_ORACLE_RW` |
 | SQL Query | 아래 |
-| Record Writer | `CS_JSON_WRITER` |
 | Max Rows Per Flow File | `10000` |
 | Fetch Size | `1000` |
+| Use Avro Logical Types | `false`(기본값) |
 | Scheduling | Timer driven `1 day`, Execution `Primary node` |
 | 자동 종료 관계 | `failure` |
 
@@ -171,7 +150,7 @@ SELECT ID, COL01, COL02, COL03, COL04, COL05, COL06, COL07, COL08, COL09, COL10,
 
 | 속성 | 값 |
 |---|---|
-| Record Reader | `CS_JSON_READER` |
+| Record Reader | `CS_AVRO_READER` |
 | Database Type | `Oracle 12+` |
 | Statement Type | `INSERT` |
 | Database Connection Pooling Service | `CS_DBCP_ORACLE_RW` |
@@ -184,16 +163,16 @@ SELECT ID, COL01, COL02, COL03, COL04, COL05, COL06, COL07, COL08, COL09, COL10,
 
 | 출발 | 관계 | 도착 |
 |---|---|---|
-| ExecuteSQLRecord | `success` | PutDatabaseRecord |
+| ExecuteSQL | `success` | PutDatabaseRecord |
 | PutDatabaseRecord | `failure`, `retry` | Funnel(실패 FlowFile 보관·확인용) |
 
 ## B.4 실행
 
-1. Controller Service 세 개를 Enable한다.
+1. Controller Service 두 개를 Enable한다.
 2. PutDatabaseRecord를 Start한다.
-3. ExecuteSQLRecord에서 **Run Once**를 실행한다.
-4. PG queue가 0이고 Funnel 앞 queue가 비어 있으면 완료다. 시험 환경에서는 FlowFile 5개(약 16 MB)가
-   수 초 안에 처리됐다.
+3. ExecuteSQL에서 **Run Once**를 실행한다.
+4. PG queue가 0이고 Funnel 앞 queue가 비어 있으면 완료다. 시험 환경에서는 FlowFile 5개가 수 초 안에
+   처리됐다.
 
 다시 실행할 때는 `truncate table APP.TMP_TEST_COPY`를 먼저 한다. `ID`가 기본키라 비우지 않으면
 중복 키로 failure에 쌓인다.

@@ -104,6 +104,36 @@ end;
 `exception when others then null`은 trigger 오류로 모든 로그인이 막히는 것을 방지합니다. 대신 trigger가
 실패하면 NLS가 적용되지 않아 적재가 변환 오류로 실패하므로 결과는 곧바로 드러납니다.
 
+#### Connection Pool과 logon trigger
+
+logon trigger는 Pool에서 커넥션을 빌릴 때마다 실행되는 것이 아니라, Pool이 Oracle에 물리 연결을 새로
+맺어 세션이 생길 때 한 번 실행됩니다. 그때 설정한 NLS는 세션이 끝날 때까지 유지되므로, 같은 물리 연결을
+여러 번 빌려 써도 계속 적용됩니다.
+
+![Connection Pool and logon trigger](./assets/oracle-pool-logon-trigger.png)
+
+1. HikariCP가 물리 연결을 만들 때 드라이버가 로그인 정보에 `v$session.program = NIFI_TMP_TEST_COPY`를
+   함께 보냅니다. 따라서 trigger가 실행되는 시점에 `v$session.program` 값이 이미 들어 있습니다.
+2. 로그인이 끝나면 trigger가 `NIFI_READER`이면서 program이 `NIFI_TMP_TEST_COPY`인 세션에만
+   `ALTER SESSION SET NLS_TIMESTAMP_FORMAT`을 실행합니다.
+3. Processor가 커넥션을 빌렸다가 반납해도 물리 연결은 닫히지 않고 같은 세션이 재사용됩니다. HikariCP는
+   반납할 때 autoCommit, 트랜잭션 격리 수준, readOnly 같은 JDBC 상태만 되돌리고 `ALTER SESSION`으로 바꾼
+   NLS는 건드리지 않습니다.
+4. 연결이 수명 만료나 오류로 정리되어 Pool이 새로 만들면, 새 세션에서 trigger가 다시 실행됩니다. 따라서
+   Pool 안의 모든 세션은 항상 같은 NLS를 갖습니다.
+
+주의할 점은 다음과 같습니다.
+
+- trigger를 만들거나 고치기 전에 이미 열려 있던 연결에는 적용되지 않습니다. trigger를 바꾼 뒤에는
+  `CS_DBCP_ORACLE_RW`를 Disable→Enable해 연결을 새로 맺습니다.
+- 같은 Pool을 쓰는 ExecuteSQL 세션에도 NLS가 적용됩니다. 조회 SQL은 `TO_CHAR`에 형식을 직접 지정하므로
+  영향이 없습니다.
+- 같은 세션에서 누군가 `ALTER SESSION`으로 NLS를 다시 바꾸면 그 값이 Pool에 남아 다음 사용에 이어집니다.
+  이 Flow에는 그런 SQL이 없습니다.
+- trigger가 적용되었는지는 `v$session`의 program 값(B.5)과 적재 결과로 확인합니다. NLS가 적용되지
+  않았다면 세션 기본 형식(`DD-MON-RR HH.MI.SSXFF AM`)으로 `26/03/08 02:52:36.547885`를 변환하지 못해
+  failure에 쌓입니다.
+
 ## B.3 NiFi 구성
 
 루트 PG 아래 `TEST_TMP_TEST_COPY` PG를 만들고 Parameter Context `PC_SQOOP_REPLACEMENT_COMMON`을

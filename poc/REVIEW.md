@@ -140,3 +140,33 @@ python3 poc/teardown_flow.py http://<nifi-host>:<port>/nifi-api
 - NiFi `InvokeHTTP`는 인증서 검증을 건너뛰는 옵션이 없다(SSL Context Service만 받는다). API가 https면 자체 서명 인증서라도 truststore에 넣어야 한다. 빌더는 `tls.api_client`에 `verify` 키가 있으면 거부한다.
 - 검증 skip은 API(worker) → NiFi 방향에서만 가능하다(`nifi.tls.verify: false`). 운영에서는 `ca_bundle`로 검증하는 것을 권장한다.
 - 단위 테스트 `tests/test_tls.py`가 자체 서명 + skip, 검증 실패 재시도, CA 검증, mTLS를 실제 HTTPS 서버로 확인한다.
+
+## 8. 테이블 목록으로 Job PG N개 생성 (2026-10-07, NiFi 2.4.0)
+
+`build_flow.py`가 root에 Processor를 바로 만들지 않고 최상위 PG 하나 안에 모든 PG를 만든다. `config.json`의 `jobs`(테이블 목록)를 받아 Job PG를 한 번에 만든다.
+
+```text
+root
+└── SQOOP_REPLACEMENT (common context, 공유 Controller Service: DBCP META/SRC, JSON/Parquet writer, API SSL)
+    ├── 05_CONTROL_RECEIVER   HandleHttpRequest 1개 → 10_Route_By_Job → Output Port to_<JOB.KEY> × N
+    ├── JOB_<JOB.KEY> × N     control_in → 09C_Route_By_Action(validate→PG-40 입구, reissue→70) + PG-00/10/20
+    └── 90_EVENT_LOGGER       events_in ← 모든 PG의 events 포트 → load_event INSERT
+```
+
+- Receiver는 노드당 포트를 하나만 열 수 있어 하나만 둔다. Job PG N개가 Receiver와 connection N개로 연결된다(Job당 route 1, Output Port 1, connection 1).
+- Job PG 안의 processor 구성은 모두 같고 Parameter Context(`PC_JOB_<JOB.KEY>`, common 상속)만 다르다.
+- 원천 pool(`CS_DBCP_SRC`)은 모든 Job이 공유한다. 최대 연결 수는 `SRC.JDBC.MAX.CONNS`(기본 Job당 5, 최소 10).
+- `load_event.process_group`에 이벤트가 난 PG 이름(`JOB_<JOB.KEY>`, `05_CONTROL_RECEIVER`)이 들어간다.
+- 예전 형식(`job_params` 하나)도 Job 1개로 받는다. `teardown_flow.py`는 최상위 PG와 common을 상속한 Job context를 모두 지운다.
+
+결과(테이블 2개: `insp_dtl` 105,000건 8파티션, `insp_hist` 35,000건 4파티션, 동시에 trigger):
+
+| 항목 | 결과 |
+|---|---|
+| 생성 | Job PG 2개(각 processor 77개), Receiver 10개, Event Logger 2개. invalid 0 |
+| PG 사이 connection | Receiver `to_PG_INSP_DTL_DAILY` → `JOB_PG_INSP_DTL_DAILY.control_in`, `to_APP_INSP_HIST` → `JOB_APP_INSP_HIST.control_in`, events × 3 → `events_in` |
+| 실행 | 두 run 모두 `STAGE_VALIDATING`, dispatch `ACKED`, Job별 `_SUCCESS` marker |
+| 미등록 jobKey(`/validate/NO_SUCH_JOB`) | 202 응답 후 `05_CONTROL_RECEIVER`의 `CONTROL_UNKNOWN_JOB` 이벤트(API는 ACK timeout 뒤 재전송) |
+| `/reissue/APP_INSP_HIST` | `JOB_APP_INSP_HIST`로만 전달되어 `RECOVERY_REISSUED` 기록 |
+| 실행 중 teardown | 최상위 PG와 context 3개 삭제, root 비어 있음 |
+| 예전 `job_params` 설정 | Job PG 1개로 생성 |

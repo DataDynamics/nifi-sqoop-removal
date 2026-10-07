@@ -207,11 +207,11 @@ flowchart LR
     T[PG-00 Trigger] --> C[PG-10 Run Coordinator]
     C -->|partition FlowFiles| W[PG-20 Extract Workers]
     API[[Load Control API<br/>FastAPI]] -->|POST /validate/jobKey| RC[PG-05 Control Receiver]
-    RC -->|validate-in| S[PG-40 Staging Validation]
+    RC -->|control_in: validate| S[PG-40 Staging Validation]
     S -->|validated| P[PG-50 Publish]
     P --> V[PG-60 Target Validation]
     API -.->|POST /reissue/jobKey 선택| RC
-    RC -.->|reissue-in| W
+    RC -.->|control_in: reissue| W
 
     C -- runs, manifest --> API
     W -- claim, chunks, fail --> API
@@ -1201,7 +1201,16 @@ No Retry의 오류 코드는 `${invokehttp.response.body:jsonPath('$.code')}`로
 
 ### 9.5 API 호출 수신: PG-05 Control Receiver
 
-API는 검증 시작(`VALIDATE_RUN`)과 선택 기능인 파티션 재발행(`REISSUE_PARTITION`)을 NiFi에 HTTP로 요청한다. Job마다 Process Group과 Parameter Context(`PC_JOB_<JOB_NAME>`)가 다르고 한 포트는 하나의 `HandleHttpRequest`만 열 수 있다. 그래서 root 수준에 공통 수신 Process Group 하나를 두고 `jobKey`로 각 Job PG에 전달한다.
+API는 검증 시작(`VALIDATE_RUN`)과 선택 기능인 파티션 재발행(`REISSUE_PARTITION`)을 NiFi에 HTTP로 요청한다. Job마다 Process Group과 Parameter Context(`PC_JOB_<JOB_NAME>`)가 다르고 한 포트는 하나의 `HandleHttpRequest`만 열 수 있다. 그래서 최상위 PG(`SQOOP_REPLACEMENT`) 안에 공통 수신 Process Group 하나를 두고 `jobKey`로 각 Job PG에 전달한다. 테이블이 N개면 Job PG가 N개이고, Receiver와 Job PG 사이 connection도 N개다.
+
+```text
+root
+└── SQOOP_REPLACEMENT                 최상위 PG. common Parameter Context, 공유 Controller Service
+    ├── 05_CONTROL_RECEIVER           HandleHttpRequest 1개(노드당 포트 1개), Output Port to_<JOB_KEY> × N
+    ├── JOB_<JOB_KEY> × N             Input Port control_in → action(validate/reissue)으로 분기
+    │                                 PG-00/10/20/40~60 processor, PC_JOB_<JOB_KEY>(common 상속)
+    └── 90_EVENT_LOGGER               Input Port events_in ← 모든 PG의 Output Port events
+```
 
 ```mermaid
 flowchart LR
@@ -1210,9 +1219,14 @@ flowchart LR
     V -->|valid| R2[08_Respond_202<br/>HandleHttpResponse]
     R2 --> J[09_Extract_Body<br/>EvaluateJsonPath]
     J --> RT{10_Route_By_Job<br/>RouteOnAttribute}
-    RT -->|ORACLE_INSP_DTL_DAILY validate| P1[Output: INSP_DTL validate-in]
-    RT -->|ORACLE_INSP_DTL_DAILY reissue| P2[Output: INSP_DTL reissue-in]
+    RT -->|ORACLE_INSP_DTL_DAILY| P1[Output: to_ORACLE_INSP_DTL_DAILY]
+    RT -->|ORACLE_ORDER_DAILY| P2[Output: to_ORACLE_ORDER_DAILY]
     RT -->|unmatched| E[PG-90 ERROR<br/>미등록 jobKey]
+    P1 --> J1[JOB_ORACLE_INSP_DTL_DAILY<br/>Input: control_in]
+    P2 --> J2[JOB_ORACLE_ORDER_DAILY<br/>Input: control_in]
+    J1 --> A{09C_Route_By_Action}
+    A -->|validate| S[PG-40 입구]
+    A -->|reissue| R[70 재발행 수신]
 ```
 
 | ID | Processor | Scheduling | 주요 Properties | Relationship |
@@ -1222,12 +1236,13 @@ flowchart LR
 | 07 | `HandleHttpResponse` | All Nodes, 1 | HTTP Status Code=400 | success→PG-90 WARN |
 | 08 | `HandleHttpResponse` | All Nodes, 1 | HTTP Status Code=202 | success→09 |
 | 09 | `EvaluateJsonPath` + `UpdateAttribute` | All Nodes, 1 | `load.run.id=$.runId`, `load.dispatch.id=$.dispatchId`, `partition.id=$.partitionId`, `control.action=${http.request.uri:substringAfter('/'):substringBefore('/')}`, `load.job.key=${http.request.uri:substringAfterLast('/')}` | matched→10 |
-| 10 | `RouteOnAttribute` | All Nodes, 1 | Job별 `${load.job.key:equals('ORACLE_INSP_DTL_DAILY'):and(${control.action:equals('validate')})}` 등 | Job PG Output Port, unmatched→PG-90 ERROR |
+| 10 | `RouteOnAttribute` | All Nodes, 1 | Job별 property 하나: `ORACLE_INSP_DTL_DAILY=${load.job.key:equals('ORACLE_INSP_DTL_DAILY')}` | Job별 Output Port `to_<JOB_KEY>`, unmatched→PG-90 ERROR |
+| 09C | `RouteOnAttribute` (Job PG 안) | All Nodes, 1 | `validate=${control.action:equals('validate')}`, `reissue=${control.action:equals('reissue')}` | validate→PG-40 입구, reissue→70, unmatched→PG-90 ERROR |
 
 - 검증은 수십 분 걸릴 수 있으므로 08에서 먼저 202를 응답하고 HTTP 연결을 붙잡지 않는다. API는 2xx를 받으면 dispatch를 `SENT`로 바꾸고, 검증 flow가 `/validation/start`를 호출해야 `ACKED`가 된다. 202 응답 직후 노드가 죽어 FlowFile이 사라지면 API가 ACK timeout 뒤 다시 보낸다.
 - `HandleHttpRequest`는 모든 노드에서 동작한다. API는 NiFi LB 주소(`nifi.receiver_url`)로 호출하며, 어느 노드가 받든 Job PG의 첫 단계 CAS가 중복 실행을 막는다. 그래서 PG-40~60은 All Nodes로 스케줄한다(2장).
-- 새 Job을 추가하면 10에 route 두 개(validate, reissue)와 Output Port를 추가한다. 등록되지 않은 `jobKey`는 ERROR로 남기고, API의 dispatch는 ACK timeout 뒤 재전송된다. 계속 실패하면 `DEAD`가 되어 알림이 간다.
-- TLS는 선택이다. TLS를 끄면 05는 http로 받고 API의 `nifi.tls.enabled: false`, `receiver_url: http://...`로 맞춘다. TLS를 켜면 `CS_SSL_RECEIVER`를 지정하고 API는 `nifi.tls.enabled: true`로 호출한다. 자체 서명 인증서면 API 쪽에서 `nifi.tls.verify: false`로 검증을 건너뛸 수 있다(운영 비권장). mTLS(Client Authentication=REQUIRED)를 쓰면 API만 호출할 수 있다. 어느 경우든 방화벽으로 수신 포트를 API 서버 대역에만 연다. 방화벽으로 수신 포트를 API 서버 대역에만 연다.
+- 새 Job을 추가하면 10에 route 하나와 Output Port `to_<JOB_KEY>` 하나를 추가하고 Job PG의 `control_in`에 연결한다. PoC 빌더(`poc/build_flow.py`)는 테이블 목록(`jobs`)을 받아 Job PG, route, port, connection을 한 번에 만든다. 등록되지 않은 `jobKey`는 ERROR로 남기고, API의 dispatch는 ACK timeout 뒤 재전송된다. 계속 실패하면 `DEAD`가 되어 알림이 간다.
+- TLS는 선택이다. TLS를 끄면 05는 http로 받고 API의 `nifi.tls.enabled: false`, `receiver_url: http://...`로 맞춘다. TLS를 켜면 `CS_SSL_RECEIVER`를 지정하고 API는 `nifi.tls.enabled: true`로 호출한다. 자체 서명 인증서면 API 쪽에서 `nifi.tls.verify: false`로 검증을 건너뛸 수 있다(운영 비권장). mTLS(Client Authentication=REQUIRED)를 쓰면 API만 호출할 수 있다. 어느 경우든 방화벽으로 수신 포트를 API 서버 대역에만 연다.
 
 ---
 
@@ -1237,7 +1252,7 @@ flowchart LR
 
 ```mermaid
 flowchart TD
-    I[Input: validate-in<br/>PG-05에서 전달] --> ST[40S_Validation_Start<br/>InvokeHTTP POST validation/start]
+    I[Input: control_in → 09C validate<br/>PG-05에서 전달] --> ST[40S_Validation_Start<br/>InvokeHTTP POST validation/start]
     ST -->|Original 2xx| T{40T_Is_Started<br/>RouteOnAttribute}
     ST -->|Retry or Failure| SR[40R_RetryFlowFile]
     SR -->|retry| ST
@@ -1448,7 +1463,7 @@ API는 64에서 저장된 TARGET 지표가 모두 PASS이고 `status='PUBLISHED'
 
 ### 13.2 재발행 수신 (선택)
 
-`recovery.mode=REISSUE`일 때만 사용한다. API는 stale 파티션의 claim을 CAS로 초기화한 뒤 `REISSUE_PARTITION` dispatch를 만들고, PG-05를 거쳐 Job PG의 `reissue-in`으로 전달한다. 요청 본문에는 Worker 실행에 필요한 값이 모두 들어 있다.
+`recovery.mode=REISSUE`일 때만 사용한다. API는 stale 파티션의 claim을 CAS로 초기화한 뒤 `REISSUE_PARTITION` dispatch를 만들고, PG-05를 거쳐 Job PG의 `control_in`으로 전달하고, 09C가 reissue로 분기한다. 요청 본문에는 Worker 실행에 필요한 값이 모두 들어 있다.
 
 ```json
 { "runId": "...", "dispatchId": "...", "partitionId": "0003",

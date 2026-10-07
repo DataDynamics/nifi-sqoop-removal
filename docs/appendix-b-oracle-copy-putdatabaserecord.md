@@ -2,8 +2,7 @@
 
 이 부록은 Oracle 테이블을 NiFi에서 SQL로 조회하고, 같은 스키마로 만든 다른 Oracle 테이블에
 `PutDatabaseRecord`로 적재하는 시험 Flow를 정리합니다. 조회는 `ExecuteSQL`(Avro 출력)로 합니다. timestamp
-컬럼은 조회 SQL에서 `RR/MM/DD HH24:MI:SSXFF` 형식의 문자열로 바꿔 넘깁니다. 본 매뉴얼의 Sqoop 대체
-Flow(PG-00~90)와는 독립된 PG이고, Load Control API를 쓰지 않습니다.
+컬럼은 조회 SQL에서 `RR/MM/DD HH24:MI:SSXFF` 형식의 문자열로 바꿔 넘깁니다.
 
 시험 환경(CFM 4.12 / NiFi 2.6, Oracle 23 Free `FREEPDB1`)에서 2026-10-07에 실행했고, 5만 건이
 원본과 완전히 일치했습니다. 예시 값은 시험 환경 기준입니다.

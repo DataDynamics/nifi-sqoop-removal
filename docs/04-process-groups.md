@@ -1,13 +1,13 @@
 # Process Group별 동작 원리와 검증
 
-Processor 이름과 속성의 최종 기준은 `nifi-flow/deploy_job_flow.py`다. 아래 검증은 비운영 데이터로 실행하고,
-NiFi queue, bulletin, provenance, API 원장을 함께 확인한다.
+Processor 이름과 속성의 최종 기준은 `nifi-flow/deploy_job_flow.py`입니다. 아래 검증은 비운영 데이터로 실행하고,
+NiFi queue, bulletin, provenance, API 원장을 함께 확인합니다.
 
 ## 1. 공통 구현 규칙
 
 ### 1.1 FlowFile attribute
 
-주요 attribute는 다음과 같다.
+주요 attribute는 다음과 같습니다.
 
 | Attribute | 생성 위치 | 용도 |
 |---|---|---|
@@ -25,23 +25,23 @@ NiFi queue, bulletin, provenance, API 원장을 함께 확인한다.
 
 ### 1.2 API 호출
 
-- `ReplaceText`로 요청 JSON을 만든 뒤 `InvokeHTTP`를 호출한다.
-- Authorization은 sensitive dynamic property로 `#{CONTROL.API.AUTHORIZATION}`만 참조한다.
-- `X-Request-Id=${UUID()}`, `X-Run-Id=${load.run.id}`를 보낸다.
-- 5xx와 연결 실패는 5회 재시도하며, 4xx는 재시도하지 않고 `errors`로 보낸다.
-- 상태 변경 API는 멱등이므로 같은 FlowFile 재시도가 안전하다.
+- `ReplaceText`로 요청 JSON을 만든 뒤 `InvokeHTTP`를 호출합니다.
+- Authorization은 sensitive dynamic property로 `#{CONTROL.API.AUTHORIZATION}`만 참조합니다.
+- `X-Request-Id=${UUID()}`, `X-Run-Id=${load.run.id}`를 보냅니다.
+- 5xx와 연결 실패는 5회 재시도하며, 4xx는 재시도하지 않고 `errors`로 보냅니다.
+- 상태 변경 API는 멱등이므로 같은 FlowFile 재시도가 안전합니다.
 
 ### 1.3 오류 경로
 
-각 PG의 단계 입구에서 `load.stage`를 정한다. 실패 relationship은 해당 PG의 `errors` Output Port로 모이고,
-상위 Job PG에서 PG-90으로 연결된다.
+각 PG의 단계 입구에서 `load.stage`를 정합니다. 실패 relationship은 해당 PG의 `errors` Output Port로 모이고,
+상위 Job PG에서 PG-90으로 연결됩니다.
 
 ## 2. PG-00 Trigger
 
 ### 목적
 
-업무일자를 가진 빈 FlowFile 하나로 run을 시작한다. 클러스터 중복 생성을 막기 위해 Trigger는 Primary
-Node에서만 실행하며 배포 직후 disabled다.
+업무일자를 가진 빈 FlowFile 하나로 run을 시작합니다. 클러스터 중복 생성을 막기 위해 Trigger는 Primary
+Node에서만 실행하며 배포 직후 disabled입니다.
 
 ### Processor 흐름
 
@@ -51,8 +51,8 @@ Node에서만 실행하며 배포 직후 disabled다.
 | 01 | `01_Set_Trigger_Attributes` | Job key, business key, `load.stage=RUN_CREATE` 설정 |
 | 02 | `02_Validate_Trigger` | 업무일자가 `YYYY-MM-DD` 형식이면 `start-run`, 아니면 `errors` |
 
-업무일자는 이후 SQL에 들어가므로 02가 입력 경계다. 형식 검사만 수행하므로 실제 존재하는 날짜인지까지
-검증하지는 않는다.
+업무일자는 이후 SQL에 들어가므로 02가 입력 경계입니다. 형식 검사만 수행하므로 실제 존재하는 날짜인지까지
+검증하지는 않습니다.
 
 ### 관련 설정
 
@@ -62,16 +62,16 @@ Node에서만 실행하며 배포 직후 disabled다.
 
 ### 단계 검증
 
-1. 00이 disabled인지 확인한다.
-2. 올바른 `BUSINESS.KEY`로 Run Once 후 PG-10 입력 queue로 FlowFile 하나만 이동하는지 확인한다.
-3. 두 NiFi 노드에서 run이 중복 생성되지 않는지 API `load_run`을 확인한다.
-4. 시험 환경에서 잘못된 형식을 넣으면 PG-90에 `RUN_CREATE_FAILED` 이벤트만 남고 run은 생성되지 않아야 한다.
+1. 00이 disabled인지 확인합니다.
+2. 올바른 `BUSINESS.KEY`로 Run Once 후 PG-10 입력 queue로 FlowFile 하나만 이동하는지 확인합니다.
+3. 두 NiFi 노드에서 run이 중복 생성되지 않는지 API `load_run`을 확인합니다.
+4. 시험 환경에서 잘못된 형식을 넣으면 PG-90에 `RUN_CREATE_FAILED` 이벤트만 남고 run은 생성되지 않아야 합니다.
 
 ## 3. PG-10 Run Coordinator
 
 ### 목적
 
-run을 만들고 Oracle SCN을 고정한 뒤, 같은 SCN에서 원천 지표와 파티션 manifest를 계산해 API에 등록한다.
+run을 만들고 Oracle SCN을 고정한 뒤, 같은 SCN에서 원천 지표와 파티션 manifest를 계산해 API에 등록합니다.
 
 ### Processor 흐름
 
@@ -90,7 +90,7 @@ run을 만들고 Oracle SCN을 고정한 뒤, 같은 SCN에서 원천 지표와 
 
 ### 동작 원리
 
-14의 SCN은 16과 모든 PG-20 query에서 재사용된다. 16은 한 SQL 안에서 다음을 계산한다.
+14의 SCN은 16과 모든 PG-20 query에서 재사용됩니다. 16은 한 SQL 안에서 다음을 계산합니다.
 
 - `SOURCE_COUNT`
 - split NULL 수, min, max
@@ -99,7 +99,7 @@ run을 만들고 Oracle SCN을 고정한 뒤, 같은 SCN에서 원천 지표와 
 - 각 범위의 예상 row count
 
 API는 manifest 등록 시 파티션 ID 중복, 계획 수, 예상 건수 합계, 0건 허용, NULL, 범위 연속성, 마지막
-상한 포함 여부를 검사한다. 위반하면 `FAILED_MANIFEST`로 commit한 뒤 422를 반환한다.
+상한 포함 여부를 검사합니다. 위반하면 `FAILED_MANIFEST`로 commit한 뒤 422를 반환합니다.
 
 ### 관련 설정
 
@@ -129,14 +129,14 @@ SELECT partition_id, lower_bound, upper_bound, upper_inclusive,
 
 검증 기준:
 
-- run은 `EXTRACTING`이다.
-- 파티션 수가 `PARTITION.COUNT`와 같다.
-- 예상 건수 합계가 `source_count`와 같다.
-- 경계가 연속이고 마지막 파티션만 상한을 포함한다.
-- 0건 파티션은 이미 `SUCCESS`이며 PG-20 queue로 가지 않는다.
-- `SOURCE` 지표에 원천 건수/금액/시각 범위가 저장된다.
+- run은 `EXTRACTING`입니다.
+- 파티션 수가 `PARTITION.COUNT`와 같습니다.
+- 예상 건수 합계가 `source_count`와 같습니다.
+- 경계가 연속이고 마지막 파티션만 상한을 포함합니다.
+- 0건 파티션은 이미 `SUCCESS`이며 PG-20 queue로 가지 않습니다.
+- `SOURCE` 지표에 원천 건수/금액/시각 범위가 저장됩니다.
 
-Oracle의 독립 쿼리로 같은 SCN의 건수를 비교한다.
+Oracle의 독립 쿼리로 같은 SCN의 건수를 비교합니다.
 
 ```sql
 SELECT COUNT(*)
@@ -149,7 +149,7 @@ SELECT COUNT(*)
 ### 목적
 
 각 파티션의 소유권을 얻은 worker 하나만 Oracle을 조회하고, 결과를 Parquet chunk로 HDFS에 기록한 뒤
-API에 보고한다.
+API에 보고합니다.
 
 ### Processor 흐름
 
@@ -167,8 +167,8 @@ API에 보고한다.
 
 ### 동작 원리
 
-claim은 `PENDING/RETRY → RUNNING` CAS다. 같은 token 재요청은 응답 유실 재시도로 보고 다시 성공한다.
-다른 worker가 이미 처리 중이거나 run이 끝났으면 `claimed=false`로 정상 종료한다.
+claim은 `PENDING/RETRY → RUNNING` CAS입니다. 같은 token 재요청은 응답 유실 재시도로 보고 다시 성공합니다.
+다른 worker가 이미 처리 중이거나 run이 끝났으면 `claimed=false`로 정상 종료합니다.
 
 34의 핵심 설정:
 
@@ -182,12 +182,12 @@ claim은 `PENDING/RETRY → RUNNING` CAS다. 같은 token 재요청은 응답 �
 | Default Decimal Precision/Scale | Oracle 기본 precision/scale Parameter |
 | 재시도 | 없음; 실패를 PG-90에 즉시 보고 |
 
-36 성공 후에만 37이 content를 JSON으로 바꾼다. 순서가 바뀌면 Parquet 대신 JSON이 HDFS에 쓰이거나
-Parquet binary가 API body로 전송될 수 있다.
+36 성공 후에만 37이 content를 JSON으로 바꿉니다. 순서가 바뀌면 Parquet 대신 JSON이 HDFS에 쓰이거나
+Parquet binary가 API body로 전송될 수 있습니다.
 
-API는 `load_file`의 모든 `WRITTEN` chunk를 집계한다. chunk index가 `0..n-1`로 완전하고 row 합계가
-예상 건수와 같아야 파티션을 `SUCCESS`로 만든다. 모든 파티션 성공과 전체 건수 일치를 만족한 마지막
-보고가 run을 `EXTRACTED_VALIDATED`로 전이하고 검증 dispatch를 예약한다.
+API는 `load_file`의 모든 `WRITTEN` chunk를 집계합니다. chunk index가 `0..n-1`로 완전하고 row 합계가
+예상 건수와 같아야 파티션을 `SUCCESS`로 만듭니다. 모든 파티션 성공과 전체 건수 일치를 만족한 마지막
+보고가 run을 `EXTRACTED_VALIDATED`로 전이하고 검증 dispatch를 예약합니다.
 
 ### 단계 검증
 
@@ -210,21 +210,21 @@ SELECT partition_id, chunk_index, fragment_count, record_count,
 
 검증 기준:
 
-- 각 활성 파티션은 한 worker만 claim한다.
-- HDFS 파일 수와 `load_file`의 WRITTEN 행 수가 같다.
-- 파티션별 `actual_row_count = expected_row_count`다.
-- 완료 뒤 run은 `EXTRACTED_VALIDATED`, 검증 dispatch는 한 행이다.
-- 이 시점에는 `_SUCCESS`가 아직 없거나 PG-40이 시작하며 생성된다.
+- 각 활성 파티션은 한 worker만 claim합니다.
+- HDFS 파일 수와 `load_file`의 WRITTEN 행 수가 같습니다.
+- 파티션별 `actual_row_count = expected_row_count`입니다.
+- 완료 뒤 run은 `EXTRACTED_VALIDATED`, 검증 dispatch는 한 행입니다.
+- 이 시점에는 `_SUCCESS`가 아직 없거나 PG-40이 시작하며 생성됩니다.
 
 장애 검증은 비운영에서 한 파티션의 HDFS 경로/권한을 의도적으로 잘못 설정하는 방식보다 별도 시험 Job과
-격리된 경로를 사용하는 것이 안전하다. 실패 시 게시 단계가 시작되지 않아야 한다.
+격리된 경로를 사용하는 것이 안전합니다. 실패 시 게시 단계가 시작되지 않아야 합니다.
 
 ## 5. PG-05 Control Receiver
 
 ### 목적
 
-Load Control worker의 validate/reissue HTTP 요청을 받아 Job별 PG로 라우팅한다. root에 하나만 존재하며
-모든 Job이 공유한다.
+Load Control worker의 validate/reissue HTTP 요청을 받아 Job별 PG로 라우팅합니다. root에 하나만 존재하며
+모든 Job이 공유합니다.
 
 ### Processor 흐름
 
@@ -239,9 +239,9 @@ Load Control worker의 validate/reissue HTTP 요청을 받아 Job별 PG로 라�
 
 ### 동작 원리
 
-202는 수신 확인일 뿐 처리 ACK가 아니다. validate의 ACK는 PG-40 `/validation/start`, reissue의 ACK는
-PG-20의 새 claim이다. 202 직후 NiFi 노드가 종료되면 API sweeper가 `ack_timeout` 뒤 dispatch를 다시
-보낸다.
+202는 수신 확인일 뿐 처리 ACK가 아닙니다. validate의 ACK는 PG-40 `/validation/start`, reissue의 ACK는
+PG-20의 새 claim입니다. 202 직후 NiFi 노드가 종료되면 API sweeper가 `ack_timeout` 뒤 dispatch를 다시
+보냅니다.
 
 ### 관련 설정
 
@@ -251,11 +251,11 @@ PG-20의 새 claim이다. 202 직후 NiFi 노드가 종료되면 API sweeper가 
 
 ### 단계 검증
 
-- `worker.log`에서 `dispatch_sending`과 `dispatch_sent httpStatus=202`를 확인한다.
-- `load_dispatch`가 `PENDING → SENT → ACKED`로 바뀌는지 확인한다.
-- PG-05 provenance에서 `X-Run-Id`, `X-Dispatch-Id`와 request URI를 확인한다.
-- validate FlowFile이 해당 Job의 `validate-in`으로 하나만 들어가는지 확인한다.
-- 미등록 경로가 404인지 확인한다.
+- `worker.log`에서 `dispatch_sending`과 `dispatch_sent httpStatus=202`를 확인합니다.
+- `load_dispatch`가 `PENDING → SENT → ACKED`로 바뀌는지 확인합니다.
+- PG-05 provenance에서 `X-Run-Id`, `X-Dispatch-Id`와 request URI를 확인합니다.
+- validate FlowFile이 해당 Job의 `validate-in`으로 하나만 들어가는지 확인합니다.
+- 미등록 경로가 404인지 확인합니다.
 
 ```sql
 SELECT dispatch_id, dispatch_type, status, attempt_count,
@@ -269,7 +269,7 @@ SELECT dispatch_id, dispatch_type, status, attempt_count,
 ### 목적
 
 검증 실행 소유권을 획득하고 HDFS run 경로를 Hive external table로 연결한 뒤 원천 기대값과 staging
-지표를 비교한다.
+지표를 비교합니다.
 
 ### Processor 흐름
 
@@ -293,11 +293,11 @@ SELECT dispatch_id, dispatch_type, status, attempt_count,
 
 ### 동작 원리
 
-검증 FlowFile은 API worker가 새로 만들기 때문에 PG-10의 attribute를 갖지 않는다. 42 응답에서 HDFS 경로,
-staging table, business key, 원천/추출 건수, SOURCE 지표를 다시 받는다.
+검증 FlowFile은 API worker가 새로 만들기 때문에 PG-10의 attribute를 갖지 않습니다. 42 응답에서 HDFS 경로,
+staging table, business key, 원천/추출 건수, SOURCE 지표를 다시 받습니다.
 
 API는 49가 계산한 PASS/FAIL을 다시 읽어 FAIL이 하나라도 있거나 지표가 비어 있으면
-`STAGING_VALIDATED`로 전이하지 않는다.
+`STAGING_VALIDATED`로 전이하지 않습니다.
 
 기본 지표:
 
@@ -329,17 +329,17 @@ SELECT metric_name, expected_value, actual_value, result
 
 검증 기준:
 
-- dispatch는 `ACKED`, run은 최종적으로 `STAGING_VALIDATED`다.
-- staging LOCATION이 정확히 해당 run 경로다.
-- `_SUCCESS`가 존재하고 Hive row count가 `source_count`와 같다.
-- 모든 지표가 PASS다.
-- 같은 dispatch를 다시 받아도 43에서 종료되고 staging/publish가 중복 실행되지 않는다.
+- dispatch는 `ACKED`, run은 최종적으로 `STAGING_VALIDATED`입니다.
+- staging LOCATION이 정확히 해당 run 경로입니다.
+- `_SUCCESS`가 존재하고 Hive row count가 `source_count`와 같습니다.
+- 모든 지표가 PASS입니다.
+- 같은 dispatch를 다시 받아도 43에서 종료되고 staging/publish가 중복 실행되지 않습니다.
 
 ## 7. PG-50 Publish
 
 ### 목적
 
-publish token으로 게시 실행자를 하나만 선택하고, staging 데이터를 target에 `INSERT OVERWRITE`한다.
+publish token으로 게시 실행자를 하나만 선택하고, staging 데이터를 target에 `INSERT OVERWRITE`합니다.
 
 ### Processor 흐름
 
@@ -358,15 +358,15 @@ publish token으로 게시 실행자를 하나만 선택하고, staging 데이�
 
 ### 동작 원리
 
-52의 `STAGING_VALIDATED → PUBLISHING` CAS에 성공한 token 하나만 55를 실행한다. `INSERT OVERWRITE`는
-자동 재시도하지 않는다.
+52의 `STAGING_VALIDATED → PUBLISHING` CAS에 성공한 token 하나만 55를 실행합니다. `INSERT OVERWRITE`는
+자동 재시도하지 않습니다.
 
-`PutClouderaHiveQL` 실패 relationship만으로 SQL이 제출되지 않았는지, 실행 중 끊겼는지 구분할 수 없다.
-따라서 성공 이외에는 `PUBLISH_UNKNOWN`으로 보고한다. 운영자가 Hive query history와 target을 확인하기
-전에는 재실행하지 않는다.
+`PutClouderaHiveQL` 실패 relationship만으로 SQL이 제출되지 않았는지, 실행 중 끊겼는지 구분할 수 없습니다.
+따라서 성공 이외에는 `PUBLISH_UNKNOWN`으로 보고합니다. 운영자가 Hive query history와 target을 확인하기
+전에는 재실행하지 않습니다.
 
-HiveServer2 연결 자체가 불가능하면 Processor가 FlowFile을 input queue로 되돌릴 수 있다. 이 경우 SQL 제출
-전이므로 연결 복구 뒤 이어서 처리된다. queue와 bulletin을 함께 본다.
+HiveServer2 연결 자체가 불가능하면 Processor가 FlowFile을 input queue로 되돌릴 수 있습니다. 이 경우 SQL 제출
+전이므로 연결 복구 뒤 이어서 처리됩니다. queue와 bulletin을 함께 봅니다.
 
 ### 관련 설정
 
@@ -392,17 +392,17 @@ SELECT status, publish_started_at, published_at, error_code, error_message
 
 검증 기준:
 
-- 게시 중 `PUBLISHING`, 정상 보고 뒤 `PUBLISHED`다.
-- 의도한 target partition만 교체되었다.
-- 같은 publish token 재요청은 게시를 다시 실행하지 않는다.
-- 다른 token은 `claimed=false`다.
-- 의도적 실패 시험은 격리된 target에서 수행하며 `PUBLISH_UNKNOWN` 운영 절차까지 검증한다.
+- 게시 중 `PUBLISHING`, 정상 보고 뒤 `PUBLISHED`입니다.
+- 의도한 target partition만 교체되었습니다.
+- 같은 publish token 재요청은 게시를 다시 실행하지 않습니다.
+- 다른 token은 `claimed=false`입니다.
+- 의도적 실패 시험은 격리된 target에서 수행하며 `PUBLISH_UNKNOWN` 운영 절차까지 검증합니다.
 
 ## 8. PG-60 Target Validation
 
 ### 목적
 
-게시된 target의 업무 범위를 다시 측정하고 최종 `SUCCESS`를 요청한다.
+게시된 target의 업무 범위를 다시 측정하고 최종 `SUCCESS`를 요청합니다.
 
 ### Processor 흐름
 
@@ -418,9 +418,9 @@ SELECT status, publish_started_at, published_at, error_code, error_message
 
 ### 동작 원리
 
-API는 저장된 TARGET 지표가 모두 PASS일 때만 `PUBLISHED → SUCCESS`로 전이한다. 실패해도 자동 재게시하지
-않는다. target 범위가 잘못되었을 가능성이 있으므로 운영자가 원인을 분석한 뒤 새 run 또는 별도 복구를
-결정한다.
+API는 저장된 TARGET 지표가 모두 PASS일 때만 `PUBLISHED → SUCCESS`로 전이합니다. 실패해도 자동 재게시하지
+않습니다. target 범위가 잘못되었을 가능성이 있으므로 운영자가 원인을 분석한 뒤 새 run 또는 별도 복구를
+결정합니다.
 
 ### 단계 검증
 
@@ -433,16 +433,16 @@ SELECT stage, metric_name, expected_value, actual_value, result
 
 검증 기준:
 
-- SOURCE/STAGING/TARGET의 의미가 같은 지표가 일치한다.
-- 모든 TARGET 지표가 PASS다.
-- run은 `SUCCESS`, `completed_at`이 채워진다.
-- `source_count = extracted_count = staging_count = target_count`다.
+- SOURCE/STAGING/TARGET의 의미가 같은 지표가 일치합니다.
+- 모든 TARGET 지표가 PASS입니다.
+- run은 `SUCCESS`, `completed_at`이 채워집니다.
+- `source_count = extracted_count = staging_count = target_count`입니다.
 
 ## 9. PG-70 Cleanup
 
 ### 목적
 
-API가 보존 기간으로 선정한 종료 run의 staging table과 HDFS run 경로만 삭제하고 결과를 기록한다.
+API가 보존 기간으로 선정한 종료 run의 staging table과 HDFS run 경로만 삭제하고 결과를 기록합니다.
 
 ### Processor 흐름
 
@@ -462,11 +462,11 @@ API가 보존 기간으로 선정한 종료 run의 staging table과 HDFS run 경
 
 ### 동작 원리
 
-API는 `SUCCESS`, `FAILED_*`, `TIMED_OUT` 중 보존 기간이 지난 run만 반환한다. 진행 중 상태와
-`PUBLISH_UNKNOWN`은 대상이 아니다.
+API는 `SUCCESS`, `FAILED_*`, `TIMED_OUT` 중 보존 기간이 지난 run만 반환합니다. 진행 중 상태와
+`PUBLISH_UNKNOWN`은 대상이 아닙니다.
 
 75는 HDFS 경로가 정확히 `<root>/<job>/run_id=<runId>`인지, table 이름이 현재 prefix와 형식에 맞는지
-검사한다. `DeleteHDFS`가 glob을 받을 수 있으므로 이 검사는 삭제 안전 경계다.
+검사합니다. `DeleteHDFS`가 glob을 받을 수 있으므로 이 검사는 삭제 안전 경계입니다.
 
 ### 단계 검증
 
@@ -477,20 +477,20 @@ curl -fsS -H 'Authorization: Bearer <token>' \
 
 검증 기준:
 
-- 보존 기간 전 run은 반환되지 않는다.
-- cleanup 대상의 staging table과 run 경로만 삭제된다.
-- target은 변하지 않는다.
-- `load_run.cleaned_at`과 `RUN_CLEANED` 이벤트가 기록된다.
-- 경로/prefix가 현재 설정과 다른 대상은 삭제하지 않고 PG-90에 `CLEANUP_FAILED`를 남긴다.
+- 보존 기간 전 run은 반환되지 않습니다.
+- cleanup 대상의 staging table과 run 경로만 삭제됩니다.
+- target은 변하지 않습니다.
+- `load_run.cleaned_at`과 `RUN_CLEANED` 이벤트가 기록됩니다.
+- 경로/prefix가 현재 설정과 다른 대상은 삭제하지 않고 PG-90에 `CLEANUP_FAILED`를 남깁니다.
 
-운영 전 cleanup 시험은 비운영 Job에서 보존 기간을 짧게 설정하고 만든 전용 run만 대상으로 수행한다.
+운영 전 cleanup 시험은 비운영 Job에서 보존 기간을 짧게 설정하고 만든 전용 run만 대상으로 수행합니다.
 
 ## 10. PG-90 Error and Event
 
 ### 목적
 
 모든 PG의 실패를 같은 형식으로 정규화하고, 단계에 따라 run/partition 실패를 API에 보고하며,
-`load_event`와 NiFi 로그에 상세를 남긴다.
+`load_event`와 NiFi 로그에 상세를 남깁니다.
 
 ### Processor 흐름
 
@@ -542,11 +542,11 @@ grep '<run_id>' load-control-api/logs/*.log
 
 검증 기준:
 
-- 상태 실패 이벤트와 Processor 상세 이벤트가 모두 추적 가능하다.
-- 409 정상 경합은 WARN이다.
-- `ORA-01555`/`ORA-08180`은 run을 `FAILED_SNAPSHOT_EXPIRED`로 만든다.
-- 93/95 자체 실패가 PG-90으로 순환하지 않고 96/97로 계속 진행한다.
-- `PutHDFS`/`PutClouderaHiveQL` 상세 원인은 bulletin과 provenance로 연결해 찾을 수 있다.
+- 상태 실패 이벤트와 Processor 상세 이벤트가 모두 추적 가능합니다.
+- 409 정상 경합은 WARN입니다.
+- `ORA-01555`/`ORA-08180`은 run을 `FAILED_SNAPSHOT_EXPIRED`로 만듭니다.
+- 93/95 자체 실패가 PG-90으로 순환하지 않고 96/97로 계속 진행합니다.
+- `PutHDFS`/`PutClouderaHiveQL` 상세 원인은 bulletin과 provenance로 연결해 찾을 수 있습니다.
 
 ## 11. 단계별 성공 체크 요약
 

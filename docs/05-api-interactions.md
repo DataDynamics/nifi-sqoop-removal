@@ -2,7 +2,7 @@
 
 ## 1. API의 책임
 
-Load Control API는 데이터를 이동하지 않는다. PostgreSQL 원장에 다음을 기록하고 판정한다.
+Load Control API는 데이터를 이동하지 않습니다. PostgreSQL 원장에 다음을 기록하고 판정합니다.
 
 - run과 partition 상태
 - claim/publish token 소유권
@@ -21,7 +21,7 @@ Load Control API는 데이터를 이동하지 않는다. PostgreSQL 원장에 �
 | API worker sweeper | 정체와 timeout을 주기적으로 복구 |
 | PostgreSQL | durable ledger, CAS, lock, outbox, event |
 
-server와 worker를 여러 개 실행해도 DB의 lock, lease, advisory lock으로 경합을 제어한다.
+server와 worker를 여러 개 실행해도 DB의 lock, lease, advisory lock으로 경합을 제어합니다.
 
 ## 3. 인증과 공통 규칙
 
@@ -36,9 +36,9 @@ server와 worker를 여러 개 실행해도 DB의 lock, lease, advisory lock으�
 - `X-Run-Id`: NiFi가 전달하는 로그 상관관계 키
 
 `nifi`는 NiFi Flow 자동화용 서비스 role이고, `operator`는 사람이 수행하는 복구·확정
-작업용 role이다. 같은 token digest를 두 role에 등록하면 두 권한을 모두 갖게 되므로
-운영에서는 반드시 별도 token을 사용한다. token 미제공은 401, 해당 role 권한이 없는
-token은 403을 받는다.
+작업용 role입니다. 같은 token digest를 두 role에 등록하면 두 권한을 모두 갖게 되므로
+운영에서는 반드시 별도 token을 사용합니다. token 미제공은 401, 해당 role 권한이 없는
+token은 403을 받습니다.
 
 | 범위 | 허용 role |
 |---|---|
@@ -48,10 +48,10 @@ token은 403을 받는다.
 | dispatch resend, publish unknown resolve | `operator` |
 | health/ready/metrics | 인증 없음; 내부망 제한 필요 |
 
-현재 Bearer token은 JWT가 아닌 정적 opaque token이며 자동 만료하지 않는다. 설정에서
-digest를 제거하고 API server를 재시작해야 폐기된다. 만료 없음은 영구 사용을 의미하지
-않으며, 정기 교체와 유출 시 즉시 폐기를 운영 절차로 보장한다. role 설정, 원문·digest
-배치 위치, 무중단 교체 절차는 [설정 레퍼런스 8.3](./02-configuration.md#83-auth)을 따른다.
+현재 Bearer token은 JWT가 아닌 정적 opaque token이며 자동 만료하지 않습니다. 설정에서
+digest를 제거하고 API server를 재시작해야 폐기됩니다. 만료 없음은 영구 사용을 의미하지
+않으며, 정기 교체와 유출 시 즉시 폐기를 운영 절차로 보장합니다. role 설정, 원문·digest
+배치 위치, 무중단 교체 절차는 [설정 레퍼런스 8.3](./02-configuration.md#83-auth)을 따릅니다.
 
 ## 4. 엔드포인트 맵
 
@@ -77,7 +77,7 @@ digest를 제거하고 API server를 재시작해야 폐기된다. 만료 없음
 | dispatch 재전송 | `POST /v1/runs/{id}/dispatches/{did}/resend` | 운영자 | `PENDING` |
 | 게시 결과 확정 | `POST /v1/runs/{id}/publish-unknown/resolve` | 운영자 | 게시 성공/실패 확정 |
 
-실제 OpenAPI는 실행 중인 API의 `/docs`, `/openapi.json`에서 확인한다.
+실제 OpenAPI는 실행 중인 API의 `/docs`, `/openapi.json`에서 확인합니다.
 
 ## 5. run과 manifest
 
@@ -108,7 +108,7 @@ Content-Type: application/json
 }
 ```
 
-같은 Job/business key의 활성 run이 있으면 409 `DUPLICATE_ACTIVE_RUN`이다.
+같은 Job/business key의 활성 run이 있으면 409 `DUPLICATE_ACTIVE_RUN`입니다.
 
 ### 5.2 manifest 등록
 
@@ -139,11 +139,11 @@ Content-Type: application/json
 }
 ```
 
-응답의 `dispatchPartitions`에는 예상 0건 partition이 빠진다. 같은 manifest 재요청은 기존 partition 목록을
-반환하지만 검증 예약을 다시 만들지 않는다.
+응답의 `dispatchPartitions`에는 예상 0건 partition이 빠집니다. 같은 manifest 재요청은 기존 partition 목록을
+반환하지만 검증 예약을 다시 만들지 않습니다.
 
-manifest 위반은 상태를 `FAILED_MANIFEST`로 commit한 뒤 422 `MANIFEST_INVALID`를 반환한다. 단순 예외로
-rollback하지 않는 이유는 실패 원인을 원장에 남기기 위해서다.
+manifest 위반은 상태를 `FAILED_MANIFEST`로 commit한 뒤 422 `MANIFEST_INVALID`를 반환합니다. 단순 예외로
+rollback하지 않는 이유는 실패 원인을 원장에 남기기 위해서입니다.
 
 ## 6. partition claim과 chunk 보고
 
@@ -165,7 +165,7 @@ rollback하지 않는 이유는 실패 원인을 원장에 남기기 위해서�
 }
 ```
 
-`claimed=false`는 오류가 아니라 정상 경합이다. NiFi는 Oracle query를 실행하지 않고 FlowFile을 종료한다.
+`claimed=false`는 오류가 아니라 정상 경합입니다. NiFi는 Oracle query를 실행하지 않고 FlowFile을 종료합니다.
 
 ### 6.2 chunk 보고
 
@@ -192,17 +192,17 @@ rollback하지 않는 이유는 실패 원인을 원장에 남기기 위해서�
 }
 ```
 
-API는 다음을 검증한다.
+API는 다음을 검증합니다.
 
-- claim token이 현재 소유자와 같은가
-- `chunkIndex < chunkCount`인가
-- HDFS path가 run 경로 바로 아래인가, `..`가 없는가
-- 성공 partition에 다른 내용이 다시 오지 않았는가
-- 모든 chunk index가 연속이고 같은 chunkCount를 보고했는가
-- row count 합계가 partition 예상값과 같은가
-- 모든 partition 합계가 source count와 같은가
+- claim token이 현재 소유자와 같습니까
+- `chunkIndex < chunkCount`입니까
+- HDFS path가 run 경로 바로 아래입니까, `..`가 없습니까
+- 성공 partition에 다른 내용이 다시 오지 않았습니까
+- 모든 chunk index가 연속이고 같은 chunkCount를 보고했습니까
+- row count 합계가 partition 예상값과 같습니까
+- 모든 partition 합계가 source count와 같습니까
 
-마지막 판정과 `VALIDATE_RUN` dispatch INSERT는 같은 트랜잭션이다.
+마지막 판정과 `VALIDATE_RUN` dispatch INSERT는 같은 트랜잭션입니다.
 
 ## 7. outbox와 PG-05 ACK
 
@@ -232,8 +232,8 @@ sequenceDiagram
 | `ACKED` | validation/start 또는 reissue claim이 도착 |
 | `DEAD` | 영구 오류/최대 시도 초과, 운영자 조치 필요 |
 
-dispatcher는 `FOR UPDATE SKIP LOCKED`로 짧게 lease하고 transaction을 닫은 뒤 HTTP를 호출한다. 전송 중
-worker가 종료되면 lease 만료 후 다시 가져간다. 전달 보장은 최소 1회이므로 수신 측 CAS가 중복을 제거한다.
+dispatcher는 `FOR UPDATE SKIP LOCKED`로 짧게 lease하고 transaction을 닫은 뒤 HTTP를 호출합니다. 전송 중
+worker가 종료되면 lease 만료 후 다시 가져갑니다. 전달 보장은 최소 1회이므로 수신 측 CAS가 중복을 제거합니다.
 
 ## 8. validation과 publish
 
@@ -243,7 +243,7 @@ worker가 종료되면 lease 만료 후 다시 가져간다. 전달 보장은 �
 {"dispatchId":"<dispatch-uuid>","node":"nifi-01"}
 ```
 
-첫 호출만 `started=true`이며 다음 기대값을 반환한다.
+첫 호출만 `started=true`이며 다음 기대값을 반환합니다.
 
 ```json
 {
@@ -277,8 +277,8 @@ worker가 종료되면 lease 만료 후 다시 가져간다. 전달 보장은 �
 }
 ```
 
-같은 `(run, stage, metricName, queryVersion)`은 UPSERT된다. `stage-validated`와 `success`는 저장된 지표를
-다시 읽어 FAIL이 없고 지표가 비어 있지 않을 때만 다음 상태로 전이한다.
+같은 `(run, stage, metricName, queryVersion)`은 UPSERT됩니다. `stage-validated`와 `success`는 저장된 지표를
+다시 읽어 FAIL이 없고 지표가 비어 있지 않을 때만 다음 상태로 전이합니다.
 
 ### 8.3 publish claim/result
 
@@ -288,14 +288,14 @@ claim:
 {"publishToken":"<uuid>"}
 ```
 
-첫 token만 `claimed=true`다. 결과:
+첫 token만 `claimed=true`입니다. 결과:
 
 ```json
 {"publishToken":"<uuid>","outcome":"PUBLISHED","message":""}
 ```
 
-outcome은 `PUBLISHED`, `FAILED_PUBLISH`, `PUBLISH_UNKNOWN` 중 하나다. `PUBLISH_UNKNOWN`은 종료 상태가
-아니며 새 run도 막는다.
+outcome은 `PUBLISHED`, `FAILED_PUBLISH`, `PUBLISH_UNKNOWN` 중 하나입니다. `PUBLISH_UNKNOWN`은 종료 상태가
+아니며 새 run도 막습니다.
 
 ## 9. 실패 보고
 
@@ -311,8 +311,8 @@ outcome은 `PUBLISHED`, `FAILED_PUBLISH`, `PUBLISH_UNKNOWN` 중 하나다. `PUBL
 }
 ```
 
-허용된 `(expectedStatus, failStatus)` 조합만 받는다. 잘못된 전이는 422
-`FAIL_TRANSITION_NOT_ALLOWED`다.
+허용된 `(expectedStatus, failStatus)` 조합만 받습니다. 잘못된 전이는 422
+`FAIL_TRANSITION_NOT_ALLOWED`입니다.
 
 ### 9.2 partition 실패
 
@@ -327,7 +327,7 @@ outcome은 `PUBLISHED`, `FAILED_PUBLISH`, `PUBLISH_UNKNOWN` 중 하나다. `PUBL
 ```
 
 `ORA-01555`, `ORA-08180` 또는 `errorClass=SNAPSHOT`이면 run은 `FAILED_SNAPSHOT_EXPIRED`, 나머지는
-`FAILED_EXTRACT`다.
+`FAILED_EXTRACT`입니다.
 
 ## 10. HTTP 상태와 호출자 동작
 
@@ -342,8 +342,8 @@ outcome은 `PUBLISHED`, `FAILED_PUBLISH`, `PUBLISH_UNKNOWN` 중 하나다. `PUBL
 | 422 | 입력/manifest/전이 위반 | 설정 또는 Flow 수정 |
 | 5xx | DB/API 일시 장애 | backoff 재시도 |
 
-409가 모두 무해한 것은 아니다. `DUPLICATE_ACTIVE_RUN`, 늦은 `CLAIM_MISMATCH`는 정상 경합일 수 있지만
-`CHUNK_CONFLICT`는 이미 성공한 파일 보고가 달라졌다는 뜻이므로 조사해야 한다.
+409가 모두 무해한 것은 아닙니다. `DUPLICATE_ACTIVE_RUN`, 늦은 `CLAIM_MISMATCH`는 정상 경합일 수 있지만
+`CHUNK_CONFLICT`는 이미 성공한 파일 보고가 달라졌다는 뜻이므로 조사해야 합니다.
 
 ## 11. sweeper 상호작용
 
@@ -378,7 +378,7 @@ sequenceDiagram
 
 ### 12.1 dispatch 재전송
 
-PG-05 route/port/Job PG를 먼저 복구한 뒤 실행한다.
+PG-05 route/port/Job PG를 먼저 복구한 뒤 실행합니다.
 
 ```bash
 curl -X POST \
@@ -386,11 +386,11 @@ curl -X POST \
   <API>/v1/runs/<run_id>/dispatches/<dispatch_id>/resend
 ```
 
-`DEAD` 또는 ACK 없는 `SENT`를 `PENDING`으로 돌리고 attempt count를 초기화한다.
+`DEAD` 또는 ACK 없는 `SENT`를 `PENDING`으로 돌리고 attempt count를 초기화합니다.
 
 ### 12.2 `PUBLISH_UNKNOWN` 확정
 
-Hive query history와 target 데이터를 확인한 증거를 먼저 확보한다.
+Hive query history와 target 데이터를 확인한 증거를 먼저 확보합니다.
 
 ```bash
 curl -X POST \
@@ -400,8 +400,8 @@ curl -X POST \
   <API>/v1/runs/<run_id>/publish-unknown/resolve
 ```
 
-실제로 게시가 완료되었으면 `PUBLISHED`로 확정한다. 이 경우 PG-60이 자동 재개되지 않으므로 target 지표를
-직접 검증하고 필요한 후속 조치를 운영 절차에 따라 수행한다.
+실제로 게시가 완료되었으면 `PUBLISHED`로 확정합니다. 이 경우 PG-60이 자동 재개되지 않으므로 target 지표를
+직접 검증하고 필요한 후속 조치를 운영 절차에 따라 수행합니다.
 
 ## 13. DB 원장과 추적
 
@@ -414,7 +414,7 @@ curl -X POST \
 | `load_dispatch` | NiFi 호출 outbox |
 | `load_event` | API 상태 이벤트와 PG-90 오류 이벤트 |
 
-한 장애를 추적할 때 다음 키를 사용한다.
+한 장애를 추적할 때 다음 키를 사용합니다.
 
 1. `run_id`
 2. 필요하면 `partition_id`, `dispatch_id`

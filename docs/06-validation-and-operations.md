@@ -2,14 +2,14 @@
 
 ## 1. 검증 전략
 
-검증은 다음 네 층으로 수행한다.
+검증은 다음 네 층으로 수행합니다.
 
 1. 구성 검증: 연결, 권한, Parameter, Controller Service
 2. PG 단계 검증: queue/provenance/API 원장으로 각 단계의 입력과 출력 확인
 3. E2E 정합성: 원천=추출=staging=target 및 지표 PASS
 4. 장애/복구: 중복, API 중단, HDFS 실패, snapshot expired, 게시 결과 불명
 
-시험 run마다 다음 증적을 남긴다.
+시험 run마다 다음 증적을 남깁니다.
 
 - 배포 commit과 설정 파일 checksum
 - Job key, business key, run ID, snapshot SCN
@@ -71,18 +71,18 @@ SELECT event_time, event_level, event_name, error_class, error_code,
 
 ### 3.1 준비
 
-- 다른 schedule을 중지하거나 시험 Job key를 분리한다.
-- 시험 business key의 Oracle 기대 건수와 지표를 미리 계산한다.
-- target partition의 기존 건수/지표를 기록한다.
-- Trigger 00은 disabled 상태에서 시작한다.
+- 다른 schedule을 중지하거나 시험 Job key를 분리합니다.
+- 시험 business key의 Oracle 기대 건수와 지표를 미리 계산합니다.
+- target partition의 기존 건수/지표를 기록합니다.
+- Trigger 00은 disabled 상태에서 시작합니다.
 
 ### 3.2 실행
 
-1. Job PG를 start한다.
-2. business key를 설정한다.
-3. Trigger 00을 enable하고 Run Once한다.
-4. 즉시 다시 disable한다.
-5. TUI 또는 SQL에서 상태 전이를 관찰한다.
+1. Job PG를 start합니다.
+2. business key를 설정합니다.
+3. Trigger 00을 enable하고 Run Once합니다.
+4. 즉시 다시 disable합니다.
+5. TUI 또는 SQL에서 상태 전이를 관찰합니다.
 
 예상 상태 순서:
 
@@ -108,10 +108,10 @@ CREATED → EXTRACTING → EXTRACTED_VALIDATED → STAGE_VALIDATING
 
 ### 3.4 독립 SQL 비교
 
-아래 SQL은 API 호스트에서 `bin/oracle.sh -f`, `bin/hive.sh -f`로 실행할 수 있다. HDFS chunk는
-`bin/hdfs.sh ls -h <hdfs_run_path>`로 확인한다([부록 A. 운영 조회 도구 사용법](./appendix-a-query-tools.md)).
+아래 SQL은 API 호스트에서 `bin/oracle.sh -f`, `bin/hive.sh -f`로 실행할 수 있습니다. HDFS chunk는
+`bin/hdfs.sh ls -h <hdfs_run_path>`로 확인합니다([부록 A. 운영 조회 도구 사용법](./appendix-a-query-tools.md)).
 
-Oracle은 run의 SCN을 사용한다.
+Oracle은 run의 SCN을 사용합니다.
 
 ```sql
 SELECT COUNT(*) AS cnt,
@@ -136,7 +136,7 @@ SELECT COUNT(*) AS cnt,
 
 ## 4. 필수 장애 시나리오
 
-운영 데이터나 운영 target을 사용하지 말고 격리된 Job/table/path에서 수행한다.
+운영 데이터나 운영 target을 사용하지 말고 격리된 Job/table/path에서 수행합니다.
 
 | 시나리오 | 주입 방법 예 | 기대 결과 |
 |---|---|---|
@@ -170,17 +170,17 @@ SELECT COUNT(*) AS cnt,
 
 ### 5.2 병렬도 조정 순서
 
-1. split 분포와 인덱스를 먼저 고친다.
-2. `PARTITION.COUNT`를 충분히 두어 worker에 작업을 공급한다.
-3. PG-20 34의 Concurrent Tasks와 `ORACLE.POOL.MAX`를 함께 조정한다.
-4. `EXTRACT.FETCH.SIZE`와 `EXTRACT.ROWS.PER.FILE`을 파일 크기 기준으로 조정한다.
-5. HDFS와 Oracle 중 병목 지점을 다시 측정한다.
+1. split 분포와 인덱스를 먼저 고칩니다.
+2. `PARTITION.COUNT`를 충분히 두어 worker에 작업을 공급합니다.
+3. PG-20 34의 Concurrent Tasks와 `ORACLE.POOL.MAX`를 함께 조정합니다.
+4. `EXTRACT.FETCH.SIZE`와 `EXTRACT.ROWS.PER.FILE`을 파일 크기 기준으로 조정합니다.
+5. HDFS와 Oracle 중 병목 지점을 다시 측정합니다.
 
-파티션 수를 무조건 늘리면 manifest의 파티션별 COUNT query, API row 수, small file이 함께 증가한다.
+파티션 수를 무조건 늘리면 manifest의 파티션별 COUNT query, API row 수, small file이 함께 증가합니다.
 
 ### 5.3 back pressure
 
-빌더 기본값은 모든 연결에 10,000 FlowFile / 1GB다. 운영에서는 다음을 검토한다.
+빌더 기본값은 모든 연결에 10,000 FlowFile / 1GB입니다. 운영에서는 다음을 검토합니다.
 
 - PG-10→PG-20 입력: 전체 worker 동시성의 최소 2배 이상
 - 34→36: 대용량 Parquet가 오래 쌓이지 않도록 100~500개 수준부터 측정
@@ -202,8 +202,8 @@ bin/monitor.sh
 | Run detail | partition 진행률, validation 지표, dispatch, event |
 | Log | run ID/request ID 필터, WARN/ERROR |
 
-주요 키는 대시보드 `Enter`, `x`, `s`, `l`, `a`, `r`, run 상세 `s`, `p`, `l`이다. 운영 작업은
-operator token이 필요하다.
+주요 키는 대시보드 `Enter`, `x`, `s`, `l`, `a`, `r`, run 상세 `s`, `p`, `l`입니다. 운영 작업은
+operator token이 필요합니다.
 
 ### 6.2 로그
 
@@ -213,13 +213,13 @@ grep '<run_id>' load-control-api/logs/worker.log
 grep 'SQOOP_REPLACEMENT' <NIFI_HOME>/logs/nifi-app.log
 ```
 
-API request 한 건은 `requestId`로 수신, 서비스 판정, 응답을 묶어 추적한다. API의 `dispatchId`는 worker
-로그와 PG-05 provenance를 연결한다.
+API request 한 건은 `requestId`로 수신, 서비스 판정, 응답을 묶어 추적합니다. API의 `dispatchId`는 worker
+로그와 PG-05 provenance를 연결합니다.
 
 ### 6.3 원천·HDFS·Hive 직접 조회
 
-TUI가 보여 주는 API 기록을 실제 데이터와 맞춰 볼 때는 API 호스트의 조회 도구를 쓴다. 세 도구 모두 기본이
-읽기 전용이다.
+TUI가 보여 주는 API 기록을 실제 데이터와 맞춰 볼 때는 API 호스트의 조회 도구를 씁니다. 세 도구 모두 기본이
+읽기 전용입니다.
 
 ```bash
 cd load-control-api
@@ -228,7 +228,7 @@ bin/hdfs.sh ls -h <hdfs_run_path>
 bin/hive.sh -c "SELECT COUNT(*) FROM stg.<stage_table_name>"
 ```
 
-시나리오별 사용 예와 문제 해결은 [부록 A. 운영 조회 도구 사용법](./appendix-a-query-tools.md)에 있다.
+시나리오별 사용 예와 문제 해결은 [부록 A. 운영 조회 도구 사용법](./appendix-a-query-tools.md)에 있습니다.
 
 ### 6.4 권장 경보
 
@@ -274,36 +274,36 @@ bin/hive.sh -c "SELECT COUNT(*) FROM stg.<stage_table_name>"
 
 ## 9. 재처리 원칙
 
-- manifest, extract, staging validation 실패는 설정/원인을 고친 뒤 새 run으로 전체 재실행한다.
-- 일부 partition만 새 SCN으로 재실행하지 않는다.
-- `REISSUE`만 같은 run/SCN의 정체 partition을 다시 보낸다.
-- 게시와 target validation 실패는 자동 게시하지 않는다.
-- 같은 business key의 종료 run이 있어도 새 run 생성은 가능하다.
-- `PUBLISH_UNKNOWN`은 먼저 확정해야 새 run을 만들 수 있다.
-- 실패 run의 HDFS 파일과 staging table은 보존 기간 동안 조사 증적으로 남긴다.
+- manifest, extract, staging validation 실패는 설정/원인을 고친 뒤 새 run으로 전체 재실행합니다.
+- 일부 partition만 새 SCN으로 재실행하지 않습니다.
+- `REISSUE`만 같은 run/SCN의 정체 partition을 다시 보냅니다.
+- 게시와 target validation 실패는 자동 게시하지 않습니다.
+- 같은 business key의 종료 run이 있어도 새 run 생성은 가능합니다.
+- `PUBLISH_UNKNOWN`은 먼저 확정해야 새 run을 만들 수 있습니다.
+- 실패 run의 HDFS 파일과 staging table은 보존 기간 동안 조사 증적으로 남깁니다.
 
 ## 10. `PUBLISH_UNKNOWN` 운영 절차
 
-1. 해당 Job의 Trigger와 수동 재실행을 중지한다.
-2. run ID, publish 시작 시각, Hive query ID를 확보한다.
-3. Hive query history에서 compile/submit/execute/commit 여부를 확인한다.
-4. target partition의 건수와 모든 품질 지표를 source/staging과 비교한다.
-5. 게시가 확실히 완료되었으면 `PUBLISHED`, 변경되지 않았거나 확실히 실패했으면 `FAILED_PUBLISH`로 확정한다.
-6. 판단 근거를 resolution reason과 incident 기록에 남긴다.
-7. `PUBLISHED`로 확정한 경우 PG-60이 자동 재개되지 않으므로 target 검증과 후속 상태 처리 방식을 결정한다.
+1. 해당 Job의 Trigger와 수동 재실행을 중지합니다.
+2. run ID, publish 시작 시각, Hive query ID를 확보합니다.
+3. Hive query history에서 compile/submit/execute/commit 여부를 확인합니다.
+4. target partition의 건수와 모든 품질 지표를 source/staging과 비교합니다.
+5. 게시가 확실히 완료되었으면 `PUBLISHED`, 변경되지 않았거나 확실히 실패했으면 `FAILED_PUBLISH`로 확정합니다.
+6. 판단 근거를 resolution reason과 incident 기록에 남깁니다.
+7. `PUBLISHED`로 확정한 경우 PG-60이 자동 재개되지 않으므로 target 검증과 후속 상태 처리 방식을 결정합니다.
 
-모호하면 임의로 성공 처리하지 않는다. target 복구 또는 업무 승인 절차로 넘긴다.
+모호하면 임의로 성공 처리하지 않습니다. target 복구 또는 업무 승인 절차로 넘깁니다.
 
 ## 11. DEAD dispatch 복구
 
-1. `last_http_status`, `last_error`, attempt count를 확인한다.
-2. API worker에서 PG-05 URL에 network 접근이 되는지 확인한다.
-3. PG-05가 running이고 Job route/Output Port/root 연결이 존재하는지 확인한다.
-4. Job PG와 목적 PG가 running인지 확인한다.
-5. 원인을 복구한 뒤 TUI 또는 operator API로 resend한다.
-6. `PENDING → SENT → ACKED`를 확인한다.
+1. `last_http_status`, `last_error`, attempt count를 확인합니다.
+2. API worker에서 PG-05 URL에 network 접근이 되는지 확인합니다.
+3. PG-05가 running이고 Job route/Output Port/root 연결이 존재하는지 확인합니다.
+4. Job PG와 목적 PG가 running인지 확인합니다.
+5. 원인을 복구한 뒤 TUI 또는 operator API로 resend합니다.
+6. `PENDING → SENT → ACKED`를 확인합니다.
 
-원인을 고치지 않고 resend만 반복하지 않는다.
+원인을 고치지 않고 resend만 반복하지 않습니다.
 
 ## 12. cleanup 운영
 
@@ -315,7 +315,7 @@ curl -fsS -H 'Authorization: Bearer <token>' \
 ```
 
 현재 root/prefix와 달라 안전 검사에서 거부된 오래된 run은 경로와 table을 두 번 확인한 뒤 수동 삭제하고
-API에 기록할 수 있다.
+API에 기록할 수 있습니다.
 
 ```bash
 hdfs dfs -rm -r '<exact-hdfsRunPath>'
@@ -328,38 +328,38 @@ curl -X POST \
   <API>/v1/runs/<run_id>/cleanup
 ```
 
-target table/partition은 cleanup 대상이 아니다.
+target table/partition은 cleanup 대상이 아닙니다.
 
 ## 13. 변경과 확장 검증
 
 ### 새 Job 추가
 
-- 새 `JOB.KEY`와 원천/target 설정을 작성한다.
-- `common_params`가 기존 Job과 같은지 diff한다.
-- Flow를 생성하고 PG-05의 기존 route가 유지되는지 확인한다.
-- 두 Job을 동시에 실행해 Oracle/Hive/API 용량과 상태 격리를 검증한다.
+- 새 `JOB.KEY`와 원천/target 설정을 작성합니다.
+- `common_params`가 기존 Job과 같은지 diff합니다.
+- Flow를 생성하고 PG-05의 기존 route가 유지되는지 확인합니다.
+- 두 Job을 동시에 실행해 Oracle/Hive/API 용량과 상태 격리를 검증합니다.
 
 ### schema 변경
 
-- `SRC.COLUMNS`, `HIVE.STAGE.DDL.COLUMNS`, `HIVE.INSERT.COLUMNS`, target schema를 함께 변경한다.
-- decimal/timestamp 변환과 Parquet schema를 시험한다.
-- staging/target 지표 SQL에 사용되는 column도 확인한다.
-- 기존 staging table은 run별 이름이므로 새 run과 충돌하지 않지만 target 호환성은 별도 검토한다.
+- `SRC.COLUMNS`, `HIVE.STAGE.DDL.COLUMNS`, `HIVE.INSERT.COLUMNS`, target schema를 함께 변경합니다.
+- decimal/timestamp 변환과 Parquet schema를 시험합니다.
+- staging/target 지표 SQL에 사용되는 column도 확인합니다.
+- 기존 staging table은 run별 이름이므로 새 run과 충돌하지 않지만 target 호환성은 별도 검토합니다.
 
 ### 공통 설정 변경
 
-공통 Parameter Context 변경은 모든 Job에 영향을 준다. 변경 창을 잡고 Job Trigger를 중지한 뒤 적용하며,
-NiFi가 참조 Processor/Controller Service를 잠시 중지·재기동할 수 있음을 고려한다.
+공통 Parameter Context 변경은 모든 Job에 영향을 줍니다. 변경 창을 잡고 Job Trigger를 중지한 뒤 적용하며,
+NiFi가 참조 Processor/Controller Service를 잠시 중지·재기동할 수 있음을 고려합니다.
 
 ## 14. 운영 준비 완료 체크리스트
 
-- [ ] API server/worker 이중화와 PostgreSQL 백업/HA를 검증했다.
-- [ ] NiFi→API, API worker→PG-05 양방향 network를 검증했다.
-- [ ] Oracle 권한, undo, 인덱스, 세션 한도를 승인받았다.
-- [ ] Hive timezone과 target partition 범위를 확인했다.
-- [ ] 정상 E2E와 필수 장애 시나리오를 통과했다.
-- [ ] `PUBLISH_UNKNOWN`과 DEAD dispatch 운영자를 지정했다.
-- [ ] HDFS staging 용량과 cleanup 보존 기간을 승인받았다.
-- [ ] TUI/로그/Prometheus/경보가 운영 관제에 연결되었다.
-- [ ] Trigger schedule과 재실행 권한을 통제했다.
-- [ ] Sqoop rollback 또는 target 복구 절차가 준비되었다.
+- [ ] API server/worker 이중화와 PostgreSQL 백업/HA를 검증했습니다.
+- [ ] NiFi→API, API worker→PG-05 양방향 network를 검증했습니다.
+- [ ] Oracle 권한, undo, 인덱스, 세션 한도를 승인받았습니다.
+- [ ] Hive timezone과 target partition 범위를 확인했습니다.
+- [ ] 정상 E2E와 필수 장애 시나리오를 통과했습니다.
+- [ ] `PUBLISH_UNKNOWN`과 DEAD dispatch 운영자를 지정했습니다.
+- [ ] HDFS staging 용량과 cleanup 보존 기간을 승인받았습니다.
+- [ ] TUI/로그/Prometheus/경보가 운영 관제에 연결되었습니다.
+- [ ] Trigger schedule과 재실행 권한을 통제했습니다.
+- [ ] Sqoop rollback 또는 target 복구 절차가 준비되었습니다.

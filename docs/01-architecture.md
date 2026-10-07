@@ -2,8 +2,8 @@
 
 ## 1. Sqoop에서 무엇을 대체하는가
 
-Sqoop은 split column의 범위를 나누고 여러 Mapper가 각 범위를 JDBC로 읽어 HDFS에 쓴다. 이 프로젝트는
-그 기능을 다음처럼 분리한다.
+Sqoop은 split column의 범위를 나누고 여러 Mapper가 각 범위를 JDBC로 읽어 HDFS에 씁니다. 이 프로젝트는
+그 기능을 다음처럼 분리합니다.
 
 | 기존 역할 | 대체 구성 |
 |---|---|
@@ -16,7 +16,7 @@ Sqoop은 split column의 범위를 나누고 여러 Mapper가 각 범위를 JDBC
 | 임시 산출물 정리 | PG-70이 API가 선정한 대상만 삭제 |
 
 NiFi Processor의 병렬 실행만으로는 모든 파티션의 성공과 후속 단계 1회 실행을 원자적으로 판정하기
-어렵다. 그래서 완료 판정을 PostgreSQL 트랜잭션과 CAS를 사용하는 API로 분리한다.
+어렵습니다. 그래서 완료 판정을 PostgreSQL 트랜잭션과 CAS를 사용하는 API로 분리합니다.
 
 ## 2. 데이터 plane과 control plane
 
@@ -44,12 +44,12 @@ flowchart TB
     R --> X
 ```
 
-`server`는 HTTP 요청을 받아 트랜잭션 안에서 판정하고, `worker`는 요청 없이 계속 실행되며 다음을 맡는다.
+`server`는 HTTP 요청을 받아 트랜잭션 안에서 판정하고, `worker`는 요청 없이 계속 실행되며 다음을 맡습니다.
 
-- dispatcher: outbox의 NiFi 호출을 PG-05로 전달한다.
-- sweeper: stale 파티션, run timeout, ACK timeout, 검증 정체, 게시 결과 불명을 찾는다.
+- dispatcher: outbox의 NiFi 호출을 PG-05로 전달합니다.
+- sweeper: stale 파티션, run timeout, ACK timeout, 검증 정체, 게시 결과 불명을 찾습니다.
 
-두 프로세스는 직접 통신하지 않고 PostgreSQL만 공유한다.
+두 프로세스는 직접 통신하지 않고 PostgreSQL만 공유합니다.
 
 ## 3. Canvas 구조
 
@@ -68,9 +68,9 @@ NiFi root
 ```
 
 > [!IMPORTANT]
-> 위 `JOB_<JOB.KEY>` 구조는 원천 테이블마다 하나씩 생성한다. 예를 들어 Oracle 테이블 6개면 Job PG 6개,
-> Job별 자식 PG 8개로 총 48개의 자식 PG가 생기며, PG-05만 하나를 공유한다. 빌더는 설정을 템플릿처럼
-> 사용해 생성 작업을 자동화하지만, 생성된 Processor를 여러 Job이 공유하지는 않는다.
+> 위 `JOB_<JOB.KEY>` 구조는 원천 테이블마다 하나씩 생성합니다. 예를 들어 Oracle 테이블 6개면 Job PG 6개,
+> Job별 자식 PG 8개로 총 48개의 자식 PG가 생기며, PG-05만 하나를 공유합니다. 빌더는 설정을 템플릿처럼
+> 사용해 생성 작업을 자동화하지만, 생성된 Processor를 여러 Job이 공유하지는 않습니다.
 
 ```mermaid
 flowchart LR
@@ -85,13 +85,13 @@ flowchart LR
     T & C & W & S & P & V & CL -. errors .-> E[PG-90]
 ```
 
-Trigger 00과 Cleanup 70만 Primary Node에서 실행한다. 다른 Processor는 All Nodes다. PG-20의 실질적인
+Trigger 00과 Cleanup 70만 Primary Node에서 실행합니다. 다른 Processor는 All Nodes입니다. PG-20의 실질적인
 최대 병렬도는 `NiFi 노드 수 × 34_Execute_Partition_Query Concurrent Tasks`이며 Oracle 연결 풀과
-승인 세션 수보다 크면 안 된다.
+승인 세션 수보다 크면 안 됩니다.
 
-6개 Job을 동시에 실행하면 이 병렬도와 Oracle 연결 풀이 Job별로 존재한다. 전체 Oracle 최대 부하는
+6개 Job을 동시에 실행하면 이 병렬도와 Oracle 연결 풀이 Job별로 존재합니다. 전체 Oracle 최대 부하는
 `동시 실행 Job 수 × NiFi 노드 수 × Job별 PG-20 Concurrent Tasks`를 기준으로 계산하고, PG-10의 SCN·manifest
-조회 연결도 여유분에 포함한다.
+조회 연결도 여유분에 포함합니다.
 
 ## 4. 식별자와 산출물 격리
 
@@ -110,26 +110,26 @@ Trigger 00과 Cleanup 70만 Primary Node에서 실행한다. 다른 Processor는
 <HIVE.STAGE.DB>.<HIVE.STAGE.TABLE.PREFIX><run_id에서 하이픈 제거>
 ```
 
-재실행은 실패한 run을 고치지 않고 새 run ID와 새 SCN으로 전체를 다시 실행한다.
+재실행은 실패한 run을 고치지 않고 새 run ID와 새 SCN으로 전체를 다시 실행합니다.
 
 ## 5. 동일 시점 읽기와 파티션
 
-PG-10이 run 시작 시 SCN을 한 번 조회한다. 원천 지표, 파티션별 예상 건수, PG-20의 실제 데이터 조회가
-모두 `AS OF SCN <snapshot_scn>`을 사용한다.
+PG-10이 run 시작 시 SCN을 한 번 조회합니다. 원천 지표, 파티션별 예상 건수, PG-20의 실제 데이터 조회가
+모두 `AS OF SCN <snapshot_scn>`을 사용합니다.
 
 SCN의 개념, Oracle Undo가 과거 block을 재구성하는 방식, snapshot 오류와 6개 테이블 간 동일 시점의
-보장 경계는 [Oracle SCN 상세 기술](./07-oracle-scn.md)을 참고한다.
+보장 경계는 [Oracle SCN 상세 기술](./07-oracle-scn.md)을 참고합니다.
 
 ```sql
 WHERE split_column >= lower_bound
   AND split_column <  upper_bound  -- 마지막 파티션만 <=
 ```
 
-현재 빌더는 split column의 NULL 전용 파티션을 만들지 않는다. 업무 범위 안에 NULL이 있으면 manifest의
-`sourceNullSplitCount`가 0보다 크지만 NULL 파티션이 없어 API가 manifest를 거부한다. 따라서 split column은
-NOT NULL이거나 업무 조건 안에서 NULL이 없어야 한다.
+현재 빌더는 split column의 NULL 전용 파티션을 만들지 않습니다. 업무 범위 안에 NULL이 있으면 manifest의
+`sourceNullSplitCount`가 0보다 크지만 NULL 파티션이 없어 API가 manifest를 거부합니다. 따라서 split column은
+NOT NULL이거나 업무 조건 안에서 NULL이 없어야 합니다.
 
-예상 건수가 0인 파티션은 API가 등록 시점에 `SUCCESS`로 처리하고 PG-20에 보내지 않는다.
+예상 건수가 0인 파티션은 API가 등록 시점에 `SUCCESS`로 처리하고 PG-20에 보내지 않습니다.
 
 ## 6. run 상태 모델
 
@@ -157,8 +157,8 @@ stateDiagram-v2
     PUBLISH_UNKNOWN --> FAILED_PUBLISH: 운영자 확정
 ```
 
-같은 `job_key + business_key`에는 활성 run이 하나만 존재할 수 있다. `PUBLISH_UNKNOWN`도 운영자가
-확정하기 전까지 활성 run이다.
+같은 `job_key + business_key`에는 활성 run이 하나만 존재할 수 있습니다. `PUBLISH_UNKNOWN`도 운영자가
+확정하기 전까지 활성 run입니다.
 
 ## 7. 중복과 장애를 막는 장치
 
@@ -226,4 +226,4 @@ sequenceDiagram
 - API 및 PG-05의 이중화와 방화벽 경로
 - `FAIL` 또는 `REISSUE` 복구 정책
 
-다음 단계는 [설정 레퍼런스](./02-configuration.md)에서 각 결정을 실제 값으로 옮기는 것이다.
+다음 단계는 [설정 레퍼런스](./02-configuration.md)에서 각 결정을 실제 값으로 옮기는 것입니다.

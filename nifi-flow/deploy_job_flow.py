@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """Sqoop 대체 NiFi Flow를 REST API로 만든다(Cloudera CFM 4.12 / NiFi 2.6).
 
-사용법: deploy_job_flow.py <nifi-api-url> <config.json>      (형식: job-config.example.json)
+사용법: deploy_job_flow.py <nifi-api-url> <config.json> [process-group-name] [--parent-id <pg-id>]
+        (config 형식: job-config.example.json)
+        process-group-name을 주면 Job PG 이름으로 쓴다(config의 names.process_group보다 우선).
+        --parent-id를 주면 그 PG 안에 Job PG를 만든다(기본 root). PG-05는 그대로 root에 두고,
+        root부터 그 PG까지 각 단계에 중계 Input Port(validate-<JOB>, reissue-<JOB>)를 만들어 잇는다.
 
 만드는 것
     root: PG-05 Control Receiver(모든 Job 공통) ─validate-<JOB>▶ Job PG validate-in,  ─reissue-<JOB>▶ reissue-in
+          (Job PG가 --parent-id 안에 있으면 중간 PG마다 같은 이름의 중계 Input Port를 거친다)
     Job PG(JOB_<JOB.KEY>):
         PG-00 Trigger ─start-run▶ PG-10 Run Coordinator ─partitions(RR)▶ PG-20 Extract Worker
         validate-in ▶ PG-40 Staging Validation ─staging-valid▶ PG-50 Publish ─published▶ PG-60 Target Validation
@@ -22,20 +27,27 @@
 
 자세한 사용법과 설계는 docs/README.md에서 시작한다.
 """
+import argparse
 import json
 import sys
 import time
 import urllib.error
 import urllib.request
 
-API = sys.argv[1].rstrip("/")
-CFG = json.load(open(sys.argv[2]))
+ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+ap.add_argument("api_url")
+ap.add_argument("config")
+ap.add_argument("process_group_name", nargs="?")
+ap.add_argument("--parent-id", help="Job PG를 만들 상위 PG id(기본 root)")
+ARGS = ap.parse_args()
+API = ARGS.api_url.rstrip("/")
+CFG = json.load(open(ARGS.config))
 NAMES = CFG.get("names", {})
 JOB_KEY = CFG["job_params"]["JOB.KEY"]
 if not __import__("re").fullmatch(r"[A-Z0-9_]{1,200}", JOB_KEY):
     raise SystemExit(f"JOB.KEY must match [A-Z0-9_]+: {JOB_KEY}")
 # Job PG와 Job Context는 JOB.KEY로 정하고, 공통 Context와 PG-05는 모든 Job이 공유한다.
-TOP_NAME = NAMES.get("process_group", f"JOB_{JOB_KEY}")
+TOP_NAME = ARGS.process_group_name or NAMES.get("process_group", f"JOB_{JOB_KEY}")
 PC_COMMON = NAMES.get("common_context", "PC_SQOOP_REPLACEMENT_COMMON")
 PC_JOB = NAMES.get("job_context", f"PC_JOB_{JOB_KEY}")
 RECEIVER_NAME = NAMES.get("control_receiver", "PG-05 Control Receiver")  # root에 하나, 모든 Job이 공유
@@ -108,9 +120,22 @@ def param_ctx(name, params, inherited=None):
     return call("POST", "/parameter-contexts", {"revision": REV, "component": comp})["id"]
 
 
-# 같은 이름의 Job PG가 있으면 덮어쓰지 않고 멈춘다. 재배포는 remove_job_flow.py로 지운 뒤 한다.
+def group_path(gid):
+    """root부터 gid까지의 PG id 목록을 돌려준다(gid가 root면 [root]). breadcrumb를 위로 따라간다."""
+    bc = call("GET", f"/flow/process-groups/{gid}")["processGroupFlow"]["breadcrumb"]
+    path = []
+    while bc:
+        path.append(bc["id"])
+        bc = bc.get("parentBreadcrumb")
+    return path[::-1]
+
+
+# Job PG는 PARENT(--parent-id, 기본 root) 안에 만든다. PG-05는 항상 root에 있다.
+# 같은 이름의 Job PG가 PARENT에 있으면 덮어쓰지 않고 멈춘다. 재배포는 remove_job_flow.py로 지운 뒤 한다.
 root = call("GET", "/flow/process-groups/root")["processGroupFlow"]["id"]
-for g in call("GET", f"/flow/process-groups/{root}")["processGroupFlow"]["flow"]["processGroups"]:
+PARENT = ARGS.parent_id or root
+PATH = group_path(PARENT)   # [root, ..., PARENT]. PG-05 → Job PG 연결이 거치는 PG들
+for g in call("GET", f"/flow/process-groups/{PARENT}")["processGroupFlow"]["flow"]["processGroups"]:
     if g["component"]["name"] == TOP_NAME:
         raise SystemExit(f"{TOP_NAME} already exists ({g['id']}); delete it first")
 
@@ -164,7 +189,7 @@ def new_pg(parent, name, x, y, comments="", ctx=None):
     return ent["id"]
 
 
-TOP = new_pg(root, TOP_NAME, 1000, 300, "Sqoop 대체 적재 Job: Oracle 원천, 자식 PG + Port 구조")
+TOP = new_pg(PARENT, TOP_NAME, 1000, 300, "Sqoop 대체 적재 Job: Oracle 원천, 자식 PG + Port 구조")
 
 # ---------------------------------------------------------------- Controller Services (TOP에 두고 자식 PG가 공유)
 services = {}   # 이름 -> 생성 응답 entity. 빌드 끝에서 모두 ENABLED로 바꾼다.
@@ -1213,8 +1238,9 @@ def register_job():
        RouteOnAttribute는 동적 속성마다 같은 이름의 relationship을 만든다.
     3. 10의 속성에서 등록된 Job 목록을 다시 읽어 05_Listen_Control의 Allowed Paths 정규식을 모든 Job으로 갱신한다.
     4. 동작마다 PG-05 Output Port(<action>-<JOB>)를 만들고, 10 → Output Port 연결(PG-05 안)과
-       Output Port → Job PG Input Port(validate-in·reissue-in) 연결(root)을 만든다.
-       Port 위치는 Job 목록 순서로 정해 Job끼리 겹치지 않게 한다.
+       Output Port → Job PG Input Port(validate-in·reissue-in) 연결을 만든다. Job PG가 root 바로 아래가
+       아니면 root부터 PARENT까지 각 PG에 같은 이름의 중계 Input Port를 만들고 단계마다 연결해 내려간다.
+       중계 Port는 만든 뒤 RUNNING으로 바꾼다. Port 위치는 Job 목록 순서로 정해 Job끼리 겹치지 않게 한다.
     5. 10의 relationship 중 연결되지 않은 것(unmatched 등)을 auto-terminate로 지정한다.
     6. PG-05를 다시 RUNNING으로 바꾼다.
     등록된 Job 목록(정렬)을 돌려준다.
@@ -1241,10 +1267,25 @@ def register_job():
             "destination": {"id": out["id"], "groupId": G05, "type": "OUTPUT_PORT"},
             "selectedRelationships": [f"{action}.{JOB_KEY}"],
             "backPressureObjectThreshold": 10000, "backPressureDataSizeThreshold": "1 GB"}})
-        call("POST", f"/process-groups/{root}/connections", {"revision": REV, "component": {
-            "source": {"id": out["id"], "groupId": G05, "type": "OUTPUT_PORT"},
+        src = {"id": out["id"], "groupId": G05, "type": "OUTPUT_PORT"}
+        relays = []
+        for outer, inner in zip(PATH, PATH[1:]):
+            relay = call("POST", f"/process-groups/{inner}/input-ports", {"revision": REV, "component": {
+                "name": f"{action}-{JOB_KEY}",
+                "position": {"x": 0, "y": (row + (action == "reissue")) * ROWH}}})
+            dst = {"id": relay["id"], "groupId": inner, "type": "INPUT_PORT"}
+            call("POST", f"/process-groups/{outer}/connections", {"revision": REV, "component": {
+                "source": src, "destination": dst,
+                "backPressureObjectThreshold": 10000, "backPressureDataSizeThreshold": "1 GB"}})
+            relays.append(relay["id"])
+            src = dst
+        call("POST", f"/process-groups/{PARENT}/connections", {"revision": REV, "component": {
+            "source": src,
             "destination": {"id": ports[(TOP, top_port, "in")], "groupId": TOP, "type": "INPUT_PORT"},
             "backPressureObjectThreshold": 10000, "backPressureDataSizeThreshold": "1 GB"}})
+        for rid in relays:
+            cur = call("GET", f"/input-ports/{rid}")
+            call("PUT", f"/input-ports/{rid}/run-status", {"revision": cur["revision"], "state": "RUNNING"})
     # 연결된 route 외(unmatched, 지워진 Job)는 auto-terminate
     used_rels = {rel for cn in call("GET", f"/process-groups/{G05}/connections")["connections"]
                  if cn["component"]["source"]["id"] == r10["id"] for rel in cn["component"]["selectedRelationships"]}
@@ -1258,7 +1299,7 @@ def register_job():
 registered = register_job()
 
 # 만든 구성요소 id를 JSON으로 출력한다(Trigger enable·Run Once, 모니터링에 쓴다).
-print(json.dumps({"process_group": TOP, "trigger": trig, "receiver": G05, "receiver_jobs": registered,
+print(json.dumps({"process_group": TOP, "parent": PARENT, "trigger": trig, "receiver": G05, "receiver_jobs": registered,
                   "groups": {"PG-00": G00, "PG-10": G10, "PG-20": G20, "PG-40": G40, "PG-50": G50,
                              "PG-60": G60, "PG-70": G70, "PG-90": G90},
                   "processors": {k: v[0]["component"]["id"] for k, v in procs.items()}}, indent=1))

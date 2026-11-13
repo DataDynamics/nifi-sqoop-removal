@@ -67,6 +67,18 @@ NiFi root
     └── PG-90 Error and Event
 ```
 
+Job PG는 기본으로 root에 만들지만, 배포할 때 `--parent-id <PG id>`를 주면 그 PG 안에 만듭니다. 이때도
+PG-05는 root에 그대로 두고, root부터 그 PG까지 각 단계에 중계 Input Port(`validate-<JOB.KEY>`,
+`reissue-<JOB.KEY>`)를 만들어 Job PG의 `validate-in`·`reissue-in`까지 잇습니다.
+
+```text
+NiFi root
+├── PG-05 Control Receiver ─validate-<JOB.KEY> / reissue-<JOB.KEY>─┐
+└── <상위 PG>                                                      │
+    ├── validate-<JOB.KEY>, reissue-<JOB.KEY>   # 중계 Input Port ◀┘
+    └── <Job PG 이름>                           # validate-in, reissue-in으로 연결
+```
+
 > [!IMPORTANT]
 > 위 `JOB_<JOB.KEY>` 구조는 원천 테이블마다 하나씩 생성합니다. 예를 들어 Oracle 테이블 6개면 Job PG 6개,
 > Job별 자식 PG 8개로 총 48개의 자식 PG가 생기며, PG-05만 하나를 공유합니다. 빌더는 설정을 템플릿처럼

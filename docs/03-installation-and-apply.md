@@ -318,6 +318,25 @@ python3 nifi-flow/deploy_job_flow.py \
   > /secure/path/job-insp-dtl-flow-ids.json
 ```
 
+Job PG 이름과 위치는 선택 인자로 바꿀 수 있습니다.
+
+```bash
+python3 nifi-flow/deploy_job_flow.py \
+  http://<nifi-host>:<port>/nifi-api \
+  /secure/path/job-insp-dtl.json \
+  <process-group-name> --parent-id <parent-pg-id> \
+  > /secure/path/job-insp-dtl-flow-ids.json
+```
+
+| 인자 | 기본값 | 의미 |
+|---|---|---|
+| `<process-group-name>` | config의 `names.process_group`, 없으면 `JOB_<JOB.KEY>` | 생성할 Job PG 이름 |
+| `--parent-id <parent-pg-id>` | root | Job PG를 만들 상위 PG의 id. NiFi UI에서 그 PG의 Operate 패널 또는 URL의 `processGroupId`로 확인 |
+
+`--parent-id`를 주어도 PG-05는 root에 둡니다. 빌더가 root부터 상위 PG까지 각 단계에 중계 Input Port
+(`validate-<JOB.KEY>`, `reissue-<JOB.KEY>`)를 만들고 연결한 뒤 실행 상태로 둡니다. 출력 JSON의 `parent`에
+Job PG를 만든 상위 PG id가 들어갑니다.
+
 빌더가 수행하는 작업:
 
 1. NiFi에 설치된 Processor/Controller Service 타입을 조회합니다.
@@ -325,14 +344,14 @@ python3 nifi-flow/deploy_job_flow.py \
 3. Job Parameter Context를 생성하고 공통 Context를 상속합니다.
 4. Job PG, 8개 자식 PG, Input/Output Port, 연결을 만듭니다.
 5. Oracle, PostgreSQL, Hive pool과 JSON/Parquet writer를 생성·enable합니다.
-6. 공유 PG-05를 만들거나 기존 PG-05에 Job route를 등록합니다.
+6. 공유 PG-05를 만들거나 기존 PG-05에 Job route를 등록합니다. `--parent-id`를 주었으면 중계 Input Port도 만듭니다.
 7. PG-05를 실행 상태로 되돌립니다.
 8. Trigger 00은 `DISABLED`로 유지하고 생성된 ID를 JSON으로 출력합니다.
 
 중요한 동작:
 
 - 빌드는 트랜잭션이 아닙니다. 중간 실패를 자동 rollback하지 않습니다.
-- 같은 Job PG가 있으면 덮어쓰지 않고 중단합니다.
+- 같은 이름의 Job PG가 같은 상위 PG(기본 root)에 있으면 덮어쓰지 않고 중단합니다.
 - 기존 공통 Context를 갱신할 때 이를 참조하는 구성요소가 NiFi에 의해 잠시 정지될 수 있습니다.
 - PG-05에 Job을 등록할 때 PG-05가 잠시 멈춥니다. 그동안 실패한 API worker 호출은 재시도됩니다.
 
@@ -344,7 +363,18 @@ python3 nifi-flow/remove_job_flow.py \
   /secure/path/job-insp-dtl.json
 ```
 
-제거 스크립트는 Job PG와 Job Context 및 PG-05의 해당 Job route만 지웁니다. PostgreSQL 원장, HDFS 산출물,
+배포할 때 Job PG 이름이나 `--parent-id`를 주었으면 제거할 때도 같은 값을 줍니다. 다르면 Job PG를 찾지 못해
+PG와 PG-05 등록이 남습니다.
+
+```bash
+python3 nifi-flow/remove_job_flow.py \
+  http://<nifi-host>:<port>/nifi-api \
+  /secure/path/job-insp-dtl.json \
+  <process-group-name> --parent-id <parent-pg-id>
+```
+
+제거 스크립트는 Job PG와 Job Context, PG-05의 해당 Job route, 그리고 `--parent-id` 배포에서 만든 중계 Input
+Port와 연결만 지웁니다. PostgreSQL 원장, HDFS 산출물,
 Hive target은 지우지 않습니다. 마지막 Job이면 공유 PG-05와 공통 Context도 제거합니다.
 
 ## 8. 생성 직후 UI 점검
@@ -372,6 +402,7 @@ Context가 빠진 PG가 없는지 확인합니다.
 - root에 공유 PG-05가 하나만 있습니까
 - `Allowed Paths`가 현재 등록된 Job 목록을 포함합니까
 - `validate-<JOB>`, `reissue-<JOB>` Output Port가 해당 Job Input Port로 연결됩니까
+- `--parent-id`로 배포했으면 root부터 상위 PG까지 각 PG에 같은 이름의 중계 Input Port가 있고 running입니까
 - `CS_HTTP_CONTEXT_MAP`이 enabled입니까
 - PG-05가 running입니까
 

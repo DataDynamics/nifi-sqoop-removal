@@ -61,3 +61,4 @@
 - CDP HiveServer2(Hive 3)와 ACID managed target 테이블
 - 운영 규모 데이터의 처리 시간·부하, NiFi 노드 장애
 - 운영 Oracle의 undo 보존 시간, 인덱스, 세션 한도
+- `--parent-id`로 상위 PG 안에 Job PG를 만드는 배포·제거(중계 Input Port 경로). 실제 클러스터에서 실행하지 않았습니다

@@ -324,6 +324,17 @@ python3 nifi-flow/deploy_job_flow.py http://<nifi-host>:<port>/nifi-api config/j
 python3 nifi-flow/deploy_job_flow.py http://<nifi-host>:<port>/nifi-api config/jobs/table-06.json
 ```
 
+Job PG를 root가 아닌 특정 PG 안에 만들려면 그 PG의 id를 `--parent-id`로 줍니다. 3번째 인자로 Job PG 이름도
+지정할 수 있습니다. PG-05는 그대로 root에 두고, root부터 상위 PG까지 각 단계에 중계 Input Port
+(`validate-<JOB.KEY>`, `reissue-<JOB.KEY>`)를 만들어 연결합니다. 지울 때도 같은 이름과 `--parent-id`를 줍니다.
+
+```bash
+python3 nifi-flow/deploy_job_flow.py http://<nifi-host>:<port>/nifi-api config/jobs/table-01.json \
+  MY_TABLE_01 --parent-id <parent-pg-id>
+python3 nifi-flow/remove_job_flow.py http://<nifi-host>:<port>/nifi-api config/jobs/table-01.json \
+  MY_TABLE_01 --parent-id <parent-pg-id>
+```
+
 결과는 `JOB_ORACLE_TABLE_01_DAILY`부터 `JOB_ORACLE_TABLE_06_DAILY`까지 6개의 독립 Job PG입니다. Job마다
 Trigger, queue, Controller Service, 오류 처리와 상태가 분리되고, root의 PG-05만 6개 Job route를 공유합니다.
 
@@ -355,7 +366,7 @@ Parameter 참조를 run별 attribute로 교체해야 합니다. 현재 구현에
 
 | 키 | 기본값 | 의미 |
 |---|---|---|
-| `process_group` | `JOB_<JOB.KEY>` | root에 생성할 Job PG 이름 |
+| `process_group` | `JOB_<JOB.KEY>` | 생성할 Job PG 이름. 스크립트 3번째 인자로 주면 그 값이 우선 |
 | `job_context` | `PC_JOB_<JOB.KEY>` | Job Parameter Context |
 | `common_context` | `PC_SQOOP_REPLACEMENT_COMMON` | 공유 Parameter Context |
 | `control_receiver` | `PG-05 Control Receiver` | 공유 수신 PG 이름 |

@@ -66,8 +66,8 @@ outbox, ACK timeout, stale 판정을 담당하고 PG-05를 통해 검증 시작�
 ├── docs/                          전체 적용·설정·검증·운영 매뉴얼
 ├── TODO.md                        운영 적용에 남은 일
 ├── nifi-flow/
-│   ├── deploy_job_flow.py         NiFi REST API로 Job Flow 배포
-│   ├── remove_job_flow.py         배포한 Job Flow 삭제
+│   ├── deploy_job_flow.py         NiFi REST API로 Job Flow 배포(PG 이름, --parent-id로 상위 PG 지정 가능)
+│   ├── remove_job_flow.py         배포한 Job Flow 삭제(배포 때와 같은 인자)
 │   └── job-config.example.json    Job Flow 설정 예시
 ├── test-environment/
 │   └── hdfs-hive/                 HDFS·Hive 시험 환경

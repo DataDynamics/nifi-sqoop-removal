@@ -298,7 +298,8 @@ bin/hive.sh -c "SELECT COUNT(*) FROM stg.<stage_table_name>"
 
 1. `last_http_status`, `last_error`, attempt count를 확인합니다.
 2. API worker에서 PG-05 URL에 network 접근이 되는지 확인합니다.
-3. PG-05가 running이고 Job route/Output Port/root 연결이 존재하는지 확인합니다.
+3. PG-05가 running이고 Job route/Output Port/root 연결이 존재하는지 확인합니다. Job PG가 상위 PG 안에 있으면
+   중간 PG의 중계 Input Port(`validate-<JOB>`, `reissue-<JOB>`)가 running이고 연결이 이어져 있는지도 확인합니다.
 4. Job PG와 목적 PG가 running인지 확인합니다.
 5. 원인을 복구한 뒤 TUI 또는 operator API로 resend합니다.
 6. `PENDING → SENT → ACKED`를 확인합니다.

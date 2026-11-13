@@ -224,7 +224,8 @@ SELECT partition_id, chunk_index, fragment_count, record_count,
 ### 목적
 
 Load Control worker의 validate/reissue HTTP 요청을 받아 Job별 PG로 라우팅합니다. root에 하나만 존재하며
-모든 Job이 공유합니다.
+모든 Job이 공유합니다. Job PG를 `--parent-id`로 다른 PG 안에 만든 경우에도 PG-05는 root에 있고, Output Port에서
+Job PG까지는 중간 PG마다 있는 중계 Input Port(`validate-<JOB>`, `reissue-<JOB>`)를 거칩니다.
 
 ### Processor 흐름
 
@@ -255,6 +256,7 @@ PG-20의 새 claim입니다. 202 직후 NiFi 노드가 종료되면 API sweeper�
 - `load_dispatch`가 `PENDING → SENT → ACKED`로 바뀌는지 확인합니다.
 - PG-05 provenance에서 `X-Run-Id`, `X-Dispatch-Id`와 request URI를 확인합니다.
 - validate FlowFile이 해당 Job의 `validate-in`으로 하나만 들어가는지 확인합니다.
+- `--parent-id`로 배포했으면 중계 Input Port가 running이고 그 앞 연결에 FlowFile이 쌓이지 않는지 확인합니다.
 - 미등록 경로가 404인지 확인합니다.
 
 ```sql

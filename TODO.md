@@ -46,6 +46,7 @@
 
 - [ ] 운영과 같은 구성(실제 HDFS·Hive, 운영 Oracle)에서 [검증 결과](./docs/08-verification-results.md) 2장 시나리오를 다시 수행
 - [ ] 시험하지 못한 장애: 파티션 처리 중 NiFi 노드 종료·재기동, API 인스턴스 1개 종료, worker 종료, 관리 DB 연결 차단
+- [ ] Job PG를 상위 PG 안에 만들 경우(`deploy_job_flow.py --parent-id`) 배포 → validate·reissue 수신 → `remove_job_flow.py` 제거를 실제 클러스터에서 확인한다. 중계 Input Port 경로는 아직 실행해 보지 않았다
 - [ ] 운영 규모 데이터로 2/4/8 파티션 처리 시간과 Oracle·API·관리 DB 부하를 재고 `PARTITION.COUNT`, `EXTRACT.ROWS.PER.FILE`, Concurrent Tasks를 정한다
 
 ## 7. 전환

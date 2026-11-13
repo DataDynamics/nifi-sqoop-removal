@@ -1,26 +1,33 @@
 #!/usr/bin/env python3
 """deploy_job_flow.py가 만든 Job을 지운다.
 
-사용법: remove_job_flow.py <nifi-api-url> <config.json>   (배포에 쓴 config)
+사용법: remove_job_flow.py <nifi-api-url> <config.json> [process-group-name] [--parent-id <pg-id>]
+        배포에 쓴 config, PG 이름, 상위 PG id를 그대로 준다(--parent-id 기본 root).
 
 - Job PG(`JOB_<JOB.KEY>`)와 Job Parameter Context(`PC_JOB_<JOB.KEY>`)를 지운다.
 - root PG-05 Control Receiver에서는 이 Job의 route·Output Port·연결만 지운다.
+  Job PG가 상위 PG 안에 있으면 중간 PG의 중계 Input Port(validate-<JOB>, reissue-<JOB>)와 연결도 지운다.
 - 남은 Job이 없으면 PG-05와 공통 Parameter Context도 지운다.
 """
+import argparse
 import json
 import sys
 import time
 import urllib.error
 import urllib.request
 
-if len(sys.argv) != 3:
-    raise SystemExit(__doc__)
-API = sys.argv[1].rstrip("/")
-CFG = json.load(open(sys.argv[2]))
+ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+ap.add_argument("api_url")
+ap.add_argument("config")
+ap.add_argument("process_group_name", nargs="?")
+ap.add_argument("--parent-id", help="Job PG가 있는 상위 PG id(기본 root)")
+ARGS = ap.parse_args()
+API = ARGS.api_url.rstrip("/")
+CFG = json.load(open(ARGS.config))
 NAMES = CFG.get("names", {})
 RECEIVER_NAME = NAMES.get("control_receiver", "PG-05 Control Receiver")
 JOB_KEY = CFG["job_params"]["JOB.KEY"]
-PG_NAME = NAMES.get("process_group", f"JOB_{JOB_KEY}")
+PG_NAME = ARGS.process_group_name or NAMES.get("process_group", f"JOB_{JOB_KEY}")
 PC_COMMON = NAMES.get("common_context", "PC_SQOOP_REPLACEMENT_COMMON")
 PC_JOB = NAMES.get("job_context", f"PC_JOB_{JOB_KEY}")
 CID = "nifi-flow-remover"   # DELETE 요청의 clientId 쿼리 값. revision version과 함께 보낸다.
@@ -110,13 +117,46 @@ def delete_pg(pid):
     print("deleted", pid)
 
 
+def stop_input_port(pid):
+    """Input Port가 RUNNING이면 멈춘다. 연결·Port를 지우려면 양 끝이 멈춰 있어야 한다."""
+    cur = call("GET", f"/input-ports/{pid}")
+    if cur["component"]["state"] == "RUNNING":
+        call("PUT", f"/input-ports/{pid}/run-status", {"revision": cur["revision"], "state": "STOPPED"})
+
+
+def delete_route_chain(out_port, job_pg):
+    """PG-05 Output Port에서 Job PG Input Port까지 이어진 연결과 중계 Input Port를 지운다.
+
+    root에서 시작해 연결의 destination을 따라 내려간다. destination이 Job PG가 아니면 중계 Input Port이므로
+    멈추고 다음 단계로 간다. 중계 Port는 들어오는 연결과 나가는 연결을 모두 지운 뒤에 지운다.
+    """
+    gid, src = root, out_port
+    while True:
+        cn = next((x for x in call("GET", f"/process-groups/{gid}/connections")["connections"]
+                   if x["component"]["source"]["id"] == src), None)
+        nxt = None
+        if cn:
+            dst = cn["component"]["destination"]
+            if dst["groupId"] != job_pg:
+                stop_input_port(dst["id"])
+                nxt = (dst["groupId"], dst["id"])
+            delete_connection(cn)
+        if gid != root:   # src는 중계 Input Port
+            cur = call("GET", f"/input-ports/{src}")
+            call("DELETE", f"/input-ports/{src}?version={cur['revision']['version']}&clientId={CID}")
+        if nxt is None:
+            return
+        gid, src = nxt
+
+
 def unregister_job(receiver, job_pg):
     """root PG-05에서 이 Job의 연결·Output Port·route를 지운다. 남은 Job 목록을 돌려준다.
 
     순서:
     1. Job PG와 PG-05를 멈춘다.
-    2. root에서 Job PG로 들어가는 연결(PG-05 Output Port → Job PG validate-in·reissue-in)을 비우고 지운다.
-    3. PG-05 안에서 이 Job의 Output Port(validate-<JOB>, reissue-<JOB>)로 가는 연결을 지우고 Port를 지운다.
+    2. 이 Job의 PG-05 Output Port(validate-<JOB>, reissue-<JOB>)마다 Job PG까지 이어진 연결과 중계 Input Port를
+       지우고(delete_route_chain), PG-05 안에서 그 Port로 가는 연결을 지운 뒤 Port를 지운다.
+    3. PARENT에 Job PG로 들어가는 연결이 남아 있으면(중간에 멈춘 배포 등) 비우고 지운다.
     4. 10_Route_By_Job_Action에서 validate.<JOB>·reissue.<JOB> 동적 속성을 지운다(값 None이 속성 삭제다).
        연결이 먼저 지워져 있어야 해당 relationship이 사라질 수 있다.
     5. 남은 Job이 있으면 05_Listen_Control의 Allowed Paths를 남은 Job으로 줄이고 PG-05를 다시 시작한다.
@@ -125,9 +165,6 @@ def unregister_job(receiver, job_pg):
     # 연결의 양 끝(PG-05 Output Port, Job PG Input Port)이 멈춰 있어야 연결을 지울 수 있다.
     stop_pg(job_pg)
     stop_pg(receiver)
-    for cn in call("GET", f"/process-groups/{root}/connections")["connections"]:
-        if cn["component"]["destination"]["groupId"] == job_pg:
-            delete_connection(cn)
     procs = call("GET", f"/process-groups/{receiver}/processors")["processors"]
     r10 = next(p for p in procs if p["component"]["name"].startswith("10_"))
     r05 = next(p for p in procs if p["component"]["name"].startswith("05_"))
@@ -135,11 +172,15 @@ def unregister_job(receiver, job_pg):
     for port in call("GET", f"/process-groups/{receiver}/output-ports")["outputPorts"]:
         if port["component"]["name"] not in names:
             continue
+        delete_route_chain(port["id"], job_pg)
         for cn in call("GET", f"/process-groups/{receiver}/connections")["connections"]:
             if cn["component"]["destination"]["id"] == port["id"]:
                 delete_connection(cn)
         cur = call("GET", f"/output-ports/{port['id']}")
         call("DELETE", f"/output-ports/{port['id']}?version={cur['revision']['version']}&clientId={CID}")
+    for cn in call("GET", f"/process-groups/{PARENT}/connections")["connections"]:
+        if cn["component"]["destination"]["groupId"] == job_pg:
+            delete_connection(cn)
     r10 = call("GET", f"/processors/{r10['id']}")
     call("PUT", f"/processors/{r10['id']}", {"revision": r10["revision"], "component": {"id": r10["id"], "config": {
         "properties": {f"validate.{JOB_KEY}": None, f"reissue.{JOB_KEY}": None}}}})
@@ -157,16 +198,25 @@ def unregister_job(receiver, job_pg):
 
 
 # 순서: PG-05에서 이 Job 등록 해제(남은 Job이 없으면 PG-05 삭제) → Job PG 삭제 → Parameter Context 삭제.
-# Job PG로 들어가는 root 연결이 남아 있으면 Job PG를 지울 수 없으므로 등록 해제를 먼저 한다.
+# Job PG로 들어가는 연결이 남아 있으면 Job PG를 지울 수 없으므로 등록 해제를 먼저 한다.
+# Job PG는 PARENT(--parent-id, 기본 root)에서, PG-05는 root에서 찾는다.
 root = call("GET", "/flow/process-groups/root")["processGroupFlow"]["id"]
-children = {pg["component"]["name"]: pg["id"]
-            for pg in call("GET", f"/flow/process-groups/{root}")["processGroupFlow"]["flow"]["processGroups"]}
+PARENT = ARGS.parent_id or root
+
+
+def child_groups(gid):
+    return {pg["component"]["name"]: pg["id"]
+            for pg in call("GET", f"/flow/process-groups/{gid}")["processGroupFlow"]["flow"]["processGroups"]}
+
+
+root_children = child_groups(root)
+children = child_groups(PARENT)
 receiver_left = False   # PG-05가 남았는지(다른 Job이 쓰는지). 남으면 공통 Context도 지우지 않는다.
-if PG_NAME in children and RECEIVER_NAME in children:
-    if unregister_job(children[RECEIVER_NAME], children[PG_NAME]):
+if PG_NAME in children and RECEIVER_NAME in root_children:
+    if unregister_job(root_children[RECEIVER_NAME], children[PG_NAME]):
         receiver_left = True
     else:
-        delete_pg(children[RECEIVER_NAME])
+        delete_pg(root_children[RECEIVER_NAME])
 if PG_NAME in children:
     delete_pg(children[PG_NAME])
 # Job context가 common을 상속하므로 Job부터 지운다. common은 PG-05나 다른 Job이 쓰면 남긴다.

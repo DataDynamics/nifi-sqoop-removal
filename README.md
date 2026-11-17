@@ -63,6 +63,7 @@ outbox, ACK timeout, stale 판정을 담당하고 PG-05를 통해 검증 시작�
 ```text
 .
 ├── README.md                      이 문서
+├── setup.md                       NiFi Flow 배포 Setup 가이드(단계별 설정 파일 작성법)
 ├── docs/                          전체 적용·설정·검증·운영 매뉴얼
 ├── TODO.md                        운영 적용에 남은 일
 ├── nifi-flow/
@@ -76,6 +77,7 @@ outbox, ACK timeout, stale 판정을 담당하고 PG-05를 통해 검증 시작�
 
 ## 시작하기
 
+배포 순서와 설정 파일 작성법만 빠르게 따라가려면 [Setup 가이드](./setup.md)를 본다.
 처음 적용하는 경우 [전체 적용 매뉴얼](./docs/README.md)부터 읽는다. 아키텍처, 모든 설정값, PG별 동작과
 검증, Load Control API 상호작용, 장애 복구까지 실제 배포 순서로 정리되어 있다.
 

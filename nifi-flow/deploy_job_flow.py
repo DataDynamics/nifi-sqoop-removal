@@ -28,7 +28,10 @@
 자세한 사용법과 설계는 docs/README.md에서 시작한다.
 """
 import argparse
+import datetime
 import json
+import os
+import socket
 import sys
 import time
 import urllib.error
@@ -39,18 +42,93 @@ ap.add_argument("api_url")
 ap.add_argument("config")
 ap.add_argument("process_group_name", nargs="?")
 ap.add_argument("--parent-id", help="Job PG를 만들 상위 PG id(기본 root)")
+ap.add_argument("--timeout", type=float, default=60,
+                help="NiFi REST 호출 하나의 timeout 초(기본 60). 넘으면 어느 호출에서 멈췄는지 남기고 종료한다")
+ap.add_argument("--log-file", help="진행 로그를 이 파일에 남긴다(append). 지정하지 않으면 콘솔(stdout)에 출력한다")
+ap.add_argument("--debug", action="store_true",
+                help="요청 본문과 응답 앞부분도 로그에 남긴다(PASSWORD·AUTHORIZATION 값은 가린다)")
 ARGS = ap.parse_args()
 API = ARGS.api_url.rstrip("/")
-CFG = json.load(open(ARGS.config))
+
+# ---------------------------------------------------------------- 진행 로그
+# 진행 로그는 --log-file이 있으면 그 파일에, 없으면 콘솔(stdout)에 즉시(flush) 쓴다.
+# --log-file이 있어도 ERROR는 콘솔(stderr)에도 출력해 실패를 바로 알 수 있게 한다. 결과 JSON은 항상 stdout으로 나간다.
+LOG_FILE = open(ARGS.log_file, "a", encoding="utf-8") if ARGS.log_file else None
+T0 = time.monotonic()
+CALLS = 0
+
+
+def log(msg, level="INFO"):
+    """시각·경과 시간과 함께 진행 로그 한 줄을 --log-file 또는 콘솔(stdout)에 바로 쓴다."""
+    line = (f"{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} +{time.monotonic() - T0:7.1f}s "
+            f"{level:5} {msg}")
+    if LOG_FILE:
+        LOG_FILE.write(line + "\n")
+        LOG_FILE.flush()
+        if level == "ERROR":
+            print(line, file=sys.stderr, flush=True)
+    else:
+        print(line, flush=True)
+
+
+def die(msg):
+    """오류를 로그에 남기고 종료한다."""
+    log(msg, "ERROR")
+    log(f"배포 실패(NiFi API 호출 {CALLS}회). 일부 구성요소가 만들어졌을 수 있으니 remove_job_flow.py로 지운 뒤 다시 한다",
+        "ERROR")
+    raise SystemExit(1)
+
+
+def _excepthook(tp, val, tb):
+    """예상하지 못한 예외도 로그 파일에 남긴다(traceback은 stderr에 기본 형식으로 출력)."""
+    import traceback
+    log("예상하지 못한 오류로 중단: " + "".join(traceback.format_exception(tp, val, tb)).rstrip(), "ERROR")
+
+
+sys.excepthook = _excepthook
+
+SENSITIVE = ("PASSWORD", "AUTHORIZATION")
+
+
+def mask(obj):
+    """로그용으로 sensitive 값(이름이 PASSWORD·AUTHORIZATION으로 끝나는 키·Parameter)을 가린다."""
+    if isinstance(obj, dict):
+        out = {}
+        sens_param = str(obj.get("name", "")).upper().endswith(SENSITIVE) or obj.get("sensitive") is True
+        for k, v in obj.items():
+            if (k.upper().replace("-", ".").endswith(SENSITIVE) or (k == "value" and sens_param)) \
+                    and isinstance(v, str) and not v.startswith("#{"):
+                out[k] = "****"
+            else:
+                out[k] = mask(v)
+        return out
+    if isinstance(obj, list):
+        return [mask(x) for x in obj]
+    return obj
+
+
+log(f"deploy_job_flow 시작: python {sys.version.split()[0]}, host {socket.gethostname()}, pid {os.getpid()}")
+log(f"NiFi API: {API} (호출 timeout {ARGS.timeout:g}s)")
+for _k in ("http_proxy", "https_proxy", "no_proxy", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY"):
+    if os.environ.get(_k):
+        log(f"환경변수 {_k}={os.environ[_k]} (NiFi 호출이 proxy를 거치면 응답이 없을 수 있다)", "WARN")
+log(f"config 읽기: {os.path.abspath(ARGS.config)}")
+try:
+    with open(ARGS.config, encoding="utf-8") as _f:
+        CFG = json.load(_f)
+except (OSError, ValueError) as e:
+    die(f"config를 읽을 수 없다: {e}")
 NAMES = CFG.get("names", {})
 JOB_KEY = CFG["job_params"]["JOB.KEY"]
 if not __import__("re").fullmatch(r"[A-Z0-9_]{1,200}", JOB_KEY):
-    raise SystemExit(f"JOB.KEY must match [A-Z0-9_]+: {JOB_KEY}")
+    die(f"JOB.KEY must match [A-Z0-9_]+: {JOB_KEY}")
 # Job PG와 Job Context는 JOB.KEY로 정하고, 공통 Context와 PG-05는 모든 Job이 공유한다.
 TOP_NAME = ARGS.process_group_name or NAMES.get("process_group", f"JOB_{JOB_KEY}")
 PC_COMMON = NAMES.get("common_context", "PC_SQOOP_REPLACEMENT_COMMON")
 PC_JOB = NAMES.get("job_context", f"PC_JOB_{JOB_KEY}")
 RECEIVER_NAME = NAMES.get("control_receiver", "PG-05 Control Receiver")  # root에 하나, 모든 Job이 공유
+log(f"JOB.KEY={JOB_KEY}, Job PG={TOP_NAME}, Job Context={PC_JOB}, 공통 Context={PC_COMMON}, "
+    f"Receiver={RECEIVER_NAME}, parent={ARGS.parent_id or 'root'}")
 # 새 구성요소를 만들 때 쓰는 revision. 생성 요청은 version 0으로 보내고, 수정할 때는 GET으로 받은 revision을 쓴다.
 CLIENT_ID = "nifi-flow-deployer"
 REV = {"version": 0, "clientId": CLIENT_ID}
@@ -63,22 +141,51 @@ def call(method, path, body=None):
     응답 본문이 비어 있으면(DELETE 등) None을 돌려준다. HTTP 오류는 상태 코드와 본문 앞 2000자를 담아
     SystemExit로 배포를 멈춘다. 배포는 중간 상태를 되돌리지 않으므로 실패하면 remove_job_flow.py로 지우고 다시 한다.
     """
-    req =urllib.request.Request(API + path, method=method,
-                                 data=None if body is None else json.dumps(body).encode(),
+    global CALLS
+    CALLS += 1
+    n = CALLS
+    payload = None if body is None else json.dumps(body).encode()
+    log(f"[#{n}] {method} {path}" + (f" ({len(payload)} bytes)" if payload else ""), "DEBUG" if method == "GET" else "INFO")
+    if ARGS.debug and body is not None:
+        log(f"[#{n}] request body: {json.dumps(mask(body), ensure_ascii=False)[:4000]}", "DEBUG")
+    req = urllib.request.Request(API + path, method=method, data=payload,
                                  headers={"Content-Type": "application/json"})
+    t = time.monotonic()
     try:
-        with urllib.request.urlopen(req) as r:
+        with urllib.request.urlopen(req, timeout=ARGS.timeout) as r:
             data = r.read()
-            return json.loads(data) if data else None
+            status = r.status
     except urllib.error.HTTPError as e:
-        raise SystemExit(f"{method} {path} -> {e.code}: {e.read().decode()[:2000]}")
+        die(f"[#{n}] {method} {path} -> HTTP {e.code} ({time.monotonic() - t:.2f}s): "
+            f"{e.read().decode(errors='replace')[:2000]}")
+    except (urllib.error.URLError, socket.timeout, TimeoutError, ConnectionError, OSError) as e:
+        reason = getattr(e, "reason", e)
+        die(f"[#{n}] {method} {API + path} 연결 실패 ({time.monotonic() - t:.2f}s): "
+            f"{type(reason).__name__}: {reason}. NiFi 주소·포트·방화벽·proxy 설정을 확인한다")
+    log(f"[#{n}] -> {status} ({time.monotonic() - t:.2f}s, {len(data)} bytes)", "DEBUG")
+    if ARGS.debug and data:
+        try:
+            shown = json.dumps(mask(json.loads(data)), ensure_ascii=False)
+        except ValueError:
+            shown = data.decode(errors="replace")
+        log(f"[#{n}] response: {shown[:1000]}", "DEBUG")
+    try:
+        return json.loads(data) if data else None
+    except ValueError:
+        die(f"[#{n}] {method} {path} 응답이 JSON이 아니다(NiFi API URL이 /nifi-api로 끝나는지 확인): "
+            f"{data[:500].decode(errors='replace')}")
 
 
 # 이 NiFi에 설치된 Processor·Controller Service 타입을 짧은 클래스 이름(예: InvokeHTTP)으로 찾도록 색인한다.
 # 같은 짧은 이름이 여러 NAR에 있으면 나중에 나온 것이 남는다.
+log("NiFi 연결 확인: /flow/about")
+_about = call("GET", "/flow/about")["about"]
+log(f"NiFi 연결 OK: {_about.get('title')} {_about.get('version')}")
+log("설치된 Processor·Controller Service 타입 조회")
 TYPES = {t["type"].split(".")[-1]: t for t in
          call("GET", "/flow/processor-types")["processorTypes"]
          + call("GET", "/flow/controller-service-types")["controllerServiceTypes"]}
+log(f"타입 {len(TYPES)}개 색인")
 
 
 def bundle(short):
@@ -88,7 +195,7 @@ def bundle(short):
     ClouderaHiveConnectionPool, PutClouderaHiveQL은 Cloudera CFM에만 있으므로 Apache NiFi에서는 여기서 실패한다.
     """
     if short not in TYPES:
-        raise SystemExit(f"{short} not found in this NiFi (Hive components need Cloudera CFM)")
+        die(f"{short} not found in this NiFi (Hive components need Cloudera CFM)")
     return TYPES[short]["bundle"], TYPES[short]["type"]
 
 
@@ -101,6 +208,7 @@ def drop_param_ctx(name):
     """
     for pc in call("GET", "/flow/parameter-contexts")["parameterContexts"]:
         if pc["component"]["name"] == name:
+            log(f"기존 Parameter Context 삭제: {name} ({pc['id']})")
             call("DELETE", f"/parameter-contexts/{pc['id']}?version={pc['revision']['version']}&clientId={CLIENT_ID}")
 
 
@@ -117,7 +225,10 @@ def param_ctx(name, params, inherited=None):
         for k, v in params.items()]}
     if inherited:
         comp["inheritedParameterContexts"] = [{"id": inherited, "component": {"id": inherited}}]
-    return call("POST", "/parameter-contexts", {"revision": REV, "component": comp})["id"]
+    log(f"Parameter Context 생성: {name} (Parameter {len(params)}개" + (f", 상속 {inherited})" if inherited else ")"))
+    pid = call("POST", "/parameter-contexts", {"revision": REV, "component": comp})["id"]
+    log(f"Parameter Context 생성됨: {name} = {pid}")
+    return pid
 
 
 def group_path(gid):
@@ -133,11 +244,14 @@ def group_path(gid):
 # Job PG는 PARENT(--parent-id, 기본 root) 안에 만든다. PG-05는 항상 root에 있다.
 # 같은 이름의 Job PG가 PARENT에 있으면 덮어쓰지 않고 멈춘다. 재배포는 remove_job_flow.py로 지운 뒤 한다.
 root = call("GET", "/flow/process-groups/root")["processGroupFlow"]["id"]
+log(f"root PG: {root}")
 PARENT = ARGS.parent_id or root
 PATH = group_path(PARENT)   # [root, ..., PARENT]. PG-05 → Job PG 연결이 거치는 PG들
+log(f"상위 PG: {PARENT}, root부터 경로: {' > '.join(PATH)}")
 for g in call("GET", f"/flow/process-groups/{PARENT}")["processGroupFlow"]["flow"]["processGroups"]:
     if g["component"]["name"] == TOP_NAME:
-        raise SystemExit(f"{TOP_NAME} already exists ({g['id']}); delete it first")
+        die(f"{TOP_NAME} already exists ({g['id']}); delete it first")
+log(f"같은 이름의 Job PG 없음: {TOP_NAME}")
 
 def ensure_common(params):
     """공통 Parameter Context(PC_COMMON)를 준비하고 id를 돌려준다.
@@ -153,6 +267,8 @@ def ensure_common(params):
     for pc in call("GET", "/flow/parameter-contexts")["parameterContexts"]:
         if pc["component"]["name"] != PC_COMMON:
             continue
+        log(f"공통 Parameter Context 값 갱신: {PC_COMMON} ({pc['id']}, Parameter {len(params)}개). "
+            "참조하는 구성요소를 NiFi가 잠깐 멈췄다가 다시 시작한다")
         # update-request에는 현재 revision이 필요하므로 최신 상태를 다시 읽는다.
         cur = call("GET", f"/parameter-contexts/{pc['id']}")
         req = call("POST", f"/parameter-contexts/{pc['id']}/update-requests", {
@@ -160,17 +276,21 @@ def ensure_common(params):
                 {"parameter": {"name": k, "value": v, "sensitive": k.endswith(("PASSWORD", "AUTHORIZATION"))}}
                 for k, v in params.items()]}})["request"]
         while not req["complete"]:
+            log(f"공통 Context 갱신 진행 중: {req.get('percentCompleted')}% {req.get('state', '')}")
             time.sleep(1)
             req = call("GET", f"/parameter-contexts/{pc['id']}/update-requests/{req['requestId']}")["request"]
         call("DELETE", f"/parameter-contexts/{pc['id']}/update-requests/{req['requestId']}")
         if req.get("failureReason"):
-            raise SystemExit(f"update {PC_COMMON}: {req['failureReason']}")
+            die(f"update {PC_COMMON}: {req['failureReason']}")
+        log(f"공통 Parameter Context 갱신 완료: {PC_COMMON}")
         return pc["id"]
+    log(f"공통 Parameter Context 없음, 새로 만든다: {PC_COMMON}")
     return param_ctx(PC_COMMON, params)
 
 
 # Job Context는 이 Job만 쓰므로 지우고 config 값으로 새로 만든다. 공통 Context를 상속하므로 Job PG 안에서는
 # 공통 Parameter(CONTROL.API.URL, JDBC 등)와 Job Parameter(JOB.KEY, SRC.* 등)를 모두 #{...}로 참조할 수 있다.
+log("== Parameter Context 준비")
 drop_param_ctx(PC_JOB)
 common = ensure_common(CFG["common_params"])
 job = param_ctx(PC_JOB, CFG["job_params"], inherited=common)
@@ -182,11 +302,16 @@ def new_pg(parent, name, x, y, comments="", ctx=None):
     자식 PG는 부모 PG의 Parameter Context를 상속하지 않으므로 매번 지정한다. ctx를 주지 않으면 Job Context를
     쓰고, root 공통 PG-05는 공통 Context(ctx=common)를 쓴다. 생성 직후 받은 revision으로 PUT해서 Context를 붙인다.
     """
+    log(f"Process Group 생성: {name} (상위 {parent})")
     ent = call("POST", f"/process-groups/{parent}/process-groups",
                {"revision": REV, "component": {"name": name, "position": {"x": x, "y": y}, "comments": comments}})
     call("PUT", f"/process-groups/{ent['id']}", {"revision": ent["revision"], "component": {
         "id": ent["id"], "parameterContext": {"id": ctx or job}}})
+    log(f"Process Group 생성됨: {name} = {ent['id']} (Parameter Context {ctx or job})")
     return ent["id"]
+
+
+log("== Job Process Group 생성")
 
 
 TOP = new_pg(PARENT, TOP_NAME, 1000, 300, "Sqoop 대체 적재 Job: Oracle 원천, 자식 PG + Port 구조")
@@ -203,9 +328,11 @@ def cs(name, short, props, group=None):
     빌드 끝에서 services 전체를 ENABLED로 바꾼다.
     """
     b, t = bundle(short)
+    log(f"Controller Service 생성: {name} ({short})")
     ent = call("POST", f"/process-groups/{group or TOP}/controller-services",
                {"revision": REV, "component": {"type": t, "bundle": b, "name": name, "properties": props}})
     services[name] = ent
+    log(f"Controller Service 생성됨: {name} = {ent['id']}")
     return ent["id"]
 
 
@@ -365,14 +492,17 @@ def p(g, key, name, short, props=None, col=0, row=0, tasks=1, sched="0 sec", sen
     if retry:
         config.update({"retriedRelationships": retry[0], "retryCount": retry[1],
                        "backoffMechanism": "PENALIZE_FLOWFILE", "maxBackoffPeriod": "1 min"})
+    log(f"Processor 생성: {name} ({short}) in {g}")
     ent = call("POST", f"/process-groups/{g}/processors", {"revision": REV, "component": {
         "type": t, "bundle": b, "name": name, "position": {"x": col * COLW, "y": row * ROWH}, "config": config}})
     procs[key] = (ent, g)
+    log(f"Processor 생성됨: {name} = {ent['component']['id']}")
     return key
 
 
 def label(g, text, x, y, width, height):
     """PG 설명 Label. Processor 영역 위쪽에 둔다."""
+    log(f"Label 생성: {text.splitlines()[0][:60]} in {g}")
     call("POST", f"/process-groups/{g}/labels", {"revision": REV, "component": {
         "label": text, "position": {"x": x, "y": y}, "width": width, "height": height,
         "style": {"font-size": "14px"}}})
@@ -384,6 +514,7 @@ def port(g, name, kind, col, row):
     자식 PG 사이 연결(links)과 PG 안 연결(c의 ("in"|"out", name))이 (g, name, kind)로 이 Port를 찾는다.
     """
     path ="input-ports" if kind == "in" else "output-ports"
+    log(f"{'Input' if kind == 'in' else 'Output'} Port 생성: {name} in {g}")
     ent = call("POST", f"/process-groups/{g}/{path}",
                {"revision": REV, "component": {"name": name, "position": {"x": col * COLW, "y": row * ROWH}}})
     ports[(g, name, kind)] = ent["id"]
@@ -503,6 +634,7 @@ SPLIT = "#{SRC.SPLIT.COLUMN}"
 N = "#{PARTITION.COUNT}"
 
 # 최상위 배치: 왼쪽 열은 실행 흐름, 오른쪽 열은 제어 수신·검증, 아래는 공통 오류
+log("== 자식 Process Group 생성")
 G00 = new_pg(TOP, "PG-00 Trigger", 0, 0, "스케줄 트리거와 업무일자 형식 검증")
 G10 = new_pg(TOP, "PG-10 Run Coordinator", 0, 260, "run 생성, 원천 지표·manifest 계산, manifest 등록")
 G20 = new_pg(TOP, "PG-20 Extract Worker", 0, 520, "claim, 파티션 추출, PutHDFS, chunk 보고")
@@ -510,6 +642,7 @@ G20 = new_pg(TOP, "PG-20 Extract Worker", 0, 520, "claim, 파티션 추출, PutH
 G05 = next((g["id"] for g in call("GET", f"/flow/process-groups/{root}")["processGroupFlow"]["flow"]["processGroups"]
             if g["component"]["name"] == RECEIVER_NAME), None)
 RECEIVER_NEW = G05 is None
+log(f"{RECEIVER_NAME}: " + ("root에 없음, 새로 만든다" if RECEIVER_NEW else f"이미 있음 ({G05}), Job route만 추가한다"))
 if RECEIVER_NEW:
     G05 = new_pg(root, RECEIVER_NAME, 300, 300, "공통: API worker의 validate/reissue 호출 수신, Job별 Output Port", ctx=common)
 G40 = new_pg(TOP, "PG-40 Staging Validation", 700, 260, "/validation/start, _SUCCESS, Hive staging 테이블과 지표 검증")
@@ -582,6 +715,7 @@ PG-70 Cleanup(1시간 주기),  모든 PG →(errors)→ PG-90
 상세: docs/README.md""", 0, -250, 1100, 170)
 
 # ===== PG-00 Trigger
+log("== PG-00 Trigger")
 # 00 GenerateFlowFile(하루 1회, Primary)이 빈 JSON FlowFile을 만들고, 01이 load.job.key·load.business.key를
 # Parameter에서 attribute로 옮기며 load.stage=RUN_CREATE로 표시한다. 02가 업무일자 형식을 검사해
 # valid면 start-run(→ PG-10), unmatched면 errors(→ PG-90, run이 없으므로 이벤트만 남는다)로 보낸다.
@@ -600,6 +734,7 @@ c(G00, "P00", "success", "P01"); c(G00, "P01", "success", "P02")
 c(G00, "P02", "valid", ("out", "start-run")); c(G00, "P02", "unmatched", ("out", "errors"))
 
 # ===== PG-10 Run Coordinator
+log("== PG-10 Run Coordinator")
 # 11 run 생성 본문 → 12 POST /runs → 13 응답에서 load.run.id, load.hdfs.path, load.stage.table을 꺼내고
 # load.stage=MANIFEST로 표시 → 14·15 Oracle SCN 고정(load.snapshot.scn) → 16 원천 지표+파티션 manifest SQL
 # → 17 Jolt로 manifest 요청 본문 → 18 POST /runs/{id}/manifest(응답이 content) → 19 dispatchPartitions 분할
@@ -709,6 +844,7 @@ c(G10, "P19", "split", "P20"); c(G10, "P19", "failure", ("out", "errors"))
 c(G10, "P20", "matched", ("out", "partitions")); c(G10, "P20", ["unmatched", "failure"], ("out", "errors"))
 
 # ===== PG-20 Extract Worker. 입력은 PG-10 manifest와 PG-05 reissue 두 곳
+log("== PG-20 Extract Worker")
 # 들어오는 FlowFile은 load.run.id, load.snapshot.scn, partition.*(id·lower·upper·upper.inclusive 등)
 # attribute를 갖는다. 30 claim token → 31·32 POST .../claim → 33 소유·숫자 형식 확인 → 34 AS OF SCN 조회
 # (EXTRACT.ROWS.PER.FILE 행마다 Parquet chunk FlowFile 하나, fragment.index/count/identifier가 붙는다)
@@ -764,6 +900,7 @@ c(G20, "P34", "success", "P35"); c(G20, "P34", "failure", ("out", "errors"))
 c(G20, "P35", "success", "P36"); c(G20, "P36", "success", "P37"); c(G20, "P37", "success", "P38")
 
 # ===== PG-05 Control Receiver. root 공통 PG. 처음 만들 때만 Processor를 둔다.
+log("== PG-05 Control Receiver")
 # Job별 route(10의 validate.<JOB>/reissue.<JOB>), Output Port, Allowed Paths는 register_job이 추가한다.
 # 오류 기록 Processor는 두지 않는다. 400·unmatched는 API가 ACK timeout 뒤 다시 보내고, 계속 실패하면 DEAD로 알린다.
 if RECEIVER_NEW:
@@ -806,6 +943,7 @@ port(TOP, "validate-in", "in", -1, 1)
 port(TOP, "reissue-in", "in", -1, 3)
 
 # ===== PG-40 Staging Validation
+log("== PG-40 Staging Validation")
 # PG-05가 보낸 FlowFile(load.run.id, load.dispatch.id)로 시작한다. 40 load.stage=VALIDATION_START
 # → 41·42 POST .../validation/start(dispatch ACK) → 43 started 확인 → 44 응답에서 run 정보·원천 기대값을
 # attribute로 꺼내고 load.stage=STAGE_VALIDATION → 45·46 _SUCCESS marker → 47·48 Hive external staging 테이블
@@ -929,6 +1067,7 @@ c(G40, "V4D", "Original", "V4E")
 c(G40, "V4E", "validated", ("out", "staging-valid")); c(G40, "V4E", "unmatched", ("out", "errors"))
 
 # ===== PG-50 Publish. 결과는 57이 직접 보고하므로 PG-90은 이벤트만 남긴다.
+log("== PG-50 Publish")
 # 50 publish.token 생성, load.stage=PUBLISH → 51·52 POST .../publish/claim → 53 claimed 확인
 # → 54 INSERT OVERWRITE SQL(target·partition·컬럼은 Parameter, FlowFile 값은 형식 검사한 stage table 이름만)
 # → 55 실행 → success면 56(PUBLISHED), failure·retry면 56U(PUBLISH_UNKNOWN) → 57 POST .../publish/result
@@ -963,6 +1102,7 @@ c(G50, "B57", "Original", "B58")
 c(G50, "B58", "published", ("out", "published")); c(G50, "B58", "unmatched", ("out", "errors"))
 
 # ===== PG-60 Target Validation
+log("== PG-60 Target Validation")
 # 60 load.stage=TARGET_VALIDATION → 61 target 업무 범위 지표 SQL(metrics_sql, 기대값은 PG-40에서 받은 attribute가
 # 그대로 따라온다) → 62·63 POST .../validations(stage=TARGET) → 64·65 POST .../success → 66 success 확인.
 # 실패는 errors로 가며 PG-90이 run을 FAILED_TARGET_VALIDATION으로 보고한다. success의 성공 경로는 끝(auto-terminate).
@@ -985,6 +1125,7 @@ c(G60, "T63", "Original", "T64"); c(G60, "T64", "success", "T65"); c(G60, "T64",
 c(G60, "T65", "Original", "T66"); c(G60, "T66", "unmatched", ("out", "errors"))
 
 # ===== PG-70 Cleanup. 대상 판정은 API, NiFi는 지우고 기록만 한다.
+log("== PG-70 Cleanup")
 # 70 1시간 주기 트리거(Primary) → 71 load.stage=CLEANUP, 비교용 prefix attribute → 72 GET /cleanup/candidates
 # (응답이 content) → 73 runs 분할 → 74 run별 attribute → 75 경로·table 이름 안전 검사 → 76·77 DROP TABLE
 # → 78 DeleteHDFS(재귀) → 79·7A POST /runs/{id}/cleanup. 실패는 errors(이벤트만)로 가고 다음 주기에 다시 한다.
@@ -1032,6 +1173,7 @@ c(G70, "C78", "success", "C79"); c(G70, "C78", "failure", ("out", "errors"))
 c(G70, "C79", "success", "C7A"); c(G70, "C79", "failure", ("out", "errors"))
 
 # ===== PG-90 Error and Event. 모든 PG의 errors가 여기로 온다.
+log("== PG-90 Error and Event")
 # 90 오류 정규화(error.stage·code·level·event·class·message, load.fail.expected·status) → 91 분기
 # → report_run: 92 본문 → 93 POST /runs/{id}/fail / report_partition: 94 본문 → 95 POST .../partitions/{pid}/fail
 # / unmatched: 보고 없이 → 96 nifi_ops.load_event INSERT → 97 nifi-app.log 구조화 로그.
@@ -1156,7 +1298,9 @@ def endpoint(g, ref):
 
 # 예약해 둔 PG 내부 연결을 만든다. back pressure는 모두 10000개·1GB다.
 # Port에서 나가는 연결에는 relationship이 없으므로 selectedRelationships를 넣지 않는다.
+log(f"== PG 내부 연결 생성 ({len(conns)}개)")
 for g, src, rels, dst, extra in conns:
+    log(f"연결 생성: {src} --{','.join(rels) or '-'}--> {dst} in {g}")
     comp = {"source": endpoint(g, src), "destination": endpoint(g, dst),
             "backPressureObjectThreshold": 10000, "backPressureDataSizeThreshold": "1 GB", **extra}
     if not isinstance(src, tuple):
@@ -1164,7 +1308,9 @@ for g, src, rels, dst, extra in conns:
     call("POST", f"/process-groups/{g}/connections", {"revision": REV, "component": comp})
 
 # 자식 PG 사이 연결(Output Port → Input Port)은 두 PG의 부모인 TOP에 만든다.
+log(f"== 자식 PG 사이 연결 생성 ({len(links)}개)")
 for sg, sname, dg, dname, extra in links:
+    log(f"연결 생성: {sg}:{sname} --> {dg}:{dname}")
     comp = {"source": {"id": ports[(sg, sname, "out")], "groupId": sg, "type": "OUTPUT_PORT"},
             "destination": {"id": ports[(dg, dname, "in")], "groupId": dg, "type": "INPUT_PORT"},
             "backPressureObjectThreshold": 10000, "backPressureDataSizeThreshold": "1 GB", **extra}
@@ -1173,6 +1319,7 @@ for sg, sname, dg, dname, extra in links:
 # Job PG 입구 → 자식 PG. 재발행은 Worker에 Round Robin으로 나눈다.
 for name, dg, dname, extra in (("validate-in", G40, "validate", {}),
                                ("reissue-in", G20, "partitions", {"loadBalanceStrategy": "ROUND_ROBIN"})):
+    log(f"연결 생성: {TOP_NAME}:{name} --> {dg}:{dname}")
     comp = {"source": {"id": ports[(TOP, name, "in")], "groupId": TOP, "type": "INPUT_PORT"},
             "destination": {"id": ports[(dg, dname, "in")], "groupId": dg, "type": "INPUT_PORT"},
             "backPressureObjectThreshold": 10000, "backPressureDataSizeThreshold": "1 GB", **extra}
@@ -1185,19 +1332,24 @@ used = {}
 for g, src, rels, _, _ in conns:
     if not isinstance(src, tuple):
         used.setdefault(src, set()).update(rels)
+log(f"== auto-terminate relationship 지정 (Processor {len(procs)}개)")
 for key, (ent, _) in procs.items():
     cur = call("GET", f"/processors/{ent['component']['id']}")
     rels = {r["name"] for r in cur["component"]["relationships"]}
+    log(f"auto-terminate: {ent['component']['name']} {sorted(rels - used.get(key, set()))}")
     call("PUT", f"/processors/{ent['component']['id']}", {"revision": cur["revision"], "component": {
         "id": ent["component"]["id"], "config": {"autoTerminatedRelationships": sorted(rels - used.get(key, set()))}}})
 
 # Controller Service를 켠다. Processor는 시작하지 않는다(Job PG 시작은 운영자가 한다).
+log(f"== Controller Service ENABLE ({len(services)}개)")
 for name, ent in services.items():
+    log(f"Controller Service ENABLE 요청: {name} ({ent['id']})")
     cur = call("GET", f"/controller-services/{ent['id']}")
     call("PUT", f"/controller-services/{ent['id']}/run-status", {"revision": cur["revision"], "state": "ENABLED"})
 
 # Trigger는 PG 전체 시작에 섞여 즉시 실행되지 않도록 DISABLED로 둔다.
 trig = procs["P00"][0]["component"]["id"]
+log(f"Trigger DISABLED로 설정: 00_Generate_Trigger ({trig})")
 cur = call("GET", f"/processors/{trig}")
 call("PUT", f"/processors/{trig}/run-status", {"revision": cur["revision"], "state": "DISABLED"})
 
@@ -1210,14 +1362,19 @@ def stop_pg(pg):
     PG 안 모든 Processor가 RUNNING이 아니고 active thread가 0이 될 때까지 1초 간격으로 최대 60초 기다리고,
     그래도 멈추지 않으면 빌드를 멈춘다.
     """
+    log(f"PG 정지 요청: {pg}")
     call("PUT", f"/flow/process-groups/{pg}", {"id": pg, "state": "STOPPED"})
-    for _ in range(60):
+    for i in range(60):
         procs_ = call("GET", f"/process-groups/{pg}/processors")["processors"]
         if all(x["status"]["aggregateSnapshot"]["activeThreadCount"] == 0
                and x["component"]["state"] != "RUNNING" for x in procs_):
+            log(f"PG 정지 완료: {pg}")
             return
+        busy = [x["component"]["name"] for x in procs_ if x["status"]["aggregateSnapshot"]["activeThreadCount"]
+                or x["component"]["state"] == "RUNNING"]
+        log(f"PG 정지 대기 {i + 1}/60s: 아직 실행 중 {busy}")
         time.sleep(1)
-    raise SystemExit(f"{pg} did not stop")
+    die(f"{pg} did not stop")
 
 
 def receiver_proc(name_prefix):
@@ -1245,8 +1402,10 @@ def register_job():
     6. PG-05를 다시 RUNNING으로 바꾼다.
     등록된 Job 목록(정렬)을 돌려준다.
     """
+    log(f"== {RECEIVER_NAME}에 Job 등록: {JOB_KEY}")
     stop_pg(G05)
     r10 = receiver_proc("10_")
+    log(f"route 추가: validate.{JOB_KEY}, reissue.{JOB_KEY} → {r10['component']['name']}")
     call("PUT", f"/processors/{r10['id']}", {"revision": r10["revision"], "component": {"id": r10["id"], "config": {
         "properties": {f"validate.{JOB_KEY}": f"${{http.request.uri:equals('/validate/{JOB_KEY}')}}",
                        f"reissue.{JOB_KEY}": f"${{http.request.uri:equals('/reissue/{JOB_KEY}')}}"}}}})
@@ -1255,10 +1414,12 @@ def register_job():
     jobs = sorted({k.split(".", 1)[1] for k in r10["component"]["config"]["properties"]
                    if k.startswith(("validate.", "reissue."))})
     r05 = receiver_proc("05_")
+    log(f"등록된 Job 목록 {jobs}, Allowed Paths 갱신: {r05['component']['name']}")
     call("PUT", f"/processors/{r05['id']}", {"revision": r05["revision"], "component": {"id": r05["id"], "config": {
         "properties": {"Allowed Paths": f"/(validate|reissue)/({'|'.join(jobs)})"}}}})
     row = 2 * jobs.index(JOB_KEY)
     for action, top_port in (("validate", "validate-in"), ("reissue", "reissue-in")):
+        log(f"{RECEIVER_NAME} Output Port·연결 생성: {action}-{JOB_KEY} → {TOP_NAME}:{top_port}")
         out = call("POST", f"/process-groups/{G05}/output-ports", {"revision": REV, "component": {
             "name": f"{action}-{JOB_KEY}",
             "position": {"x": 5 * COLW, "y": (row + (action == "reissue")) * ROWH}}})
@@ -1270,6 +1431,7 @@ def register_job():
         src = {"id": out["id"], "groupId": G05, "type": "OUTPUT_PORT"}
         relays = []
         for outer, inner in zip(PATH, PATH[1:]):
+            log(f"중계 Input Port 생성: {action}-{JOB_KEY} in {inner}")
             relay = call("POST", f"/process-groups/{inner}/input-ports", {"revision": REV, "component": {
                 "name": f"{action}-{JOB_KEY}",
                 "position": {"x": 0, "y": (row + (action == "reissue")) * ROWH}}})
@@ -1292,11 +1454,14 @@ def register_job():
     r10 = call("GET", f"/processors/{r10['id']}")
     call("PUT", f"/processors/{r10['id']}", {"revision": r10["revision"], "component": {"id": r10["id"], "config": {
         "autoTerminatedRelationships": sorted({x["name"] for x in r10["component"]["relationships"]} - used_rels)}}})
+    log(f"{RECEIVER_NAME} 다시 시작: {G05}")
     call("PUT", f"/flow/process-groups/{G05}", {"id": G05, "state": "RUNNING"})
     return jobs
 
 
 registered = register_job()
+log(f"배포 완료: {TOP_NAME} = {TOP} (Processor {len(procs)}개, Controller Service {len(services)}개, "
+    f"연결 {len(conns) + len(links) + 2}개, NiFi API 호출 {CALLS}회). Trigger는 DISABLED 상태다")
 
 # 만든 구성요소 id를 JSON으로 출력한다(Trigger enable·Run Once, 모니터링에 쓴다).
 print(json.dumps({"process_group": TOP, "parent": PARENT, "trigger": trig, "receiver": G05, "receiver_jobs": registered,

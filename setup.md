@@ -12,7 +12,7 @@
 | 단계 | 작업 | 결과물 |
 |---|---|---|
 | 0 | 환경값 수집 | 호스트·포트·계정 목록 |
-| 1 | Oracle 계정·권한 준비 | `NIFI_READER` 계정 |
+| 1 | Oracle 계정·권한 준비 | `NIFI_READER` 계정(또는 권한을 확인한 기존 계정) |
 | 2 | HDFS·Hive 준비 | stage 경로, `stg`·`dw` DB, target 테이블 |
 | 3 | PostgreSQL 준비 | `nifiops` DB와 계정 3개 |
 | 4 | API token 생성 | NiFi token 원문과 digest, operator token 원문과 digest |
@@ -62,6 +62,12 @@ curl -fsS http://nifi-host:8080/nifi-api/flow/about
 
 ### 1-1. 읽기 전용 계정과 권한 (DBA 작업)
 
+> [!NOTE]
+> 이미 사용하는 Oracle 계정이 있으면 이 절의 계정 생성은 건너뛰고 [1-1-1. 기존 계정 사용 시 권한 확인](#1-1-1-기존-계정-사용-시-권한-확인)으로
+> 갑니다. 이 문서의 `NIFI_READER`는 그 계정 이름으로 바꿔 읽습니다.
+
+새 계정을 만드는 경우:
+
 ```sql
 CREATE USER NIFI_READER IDENTIFIED BY "<oracle-password>";
 GRANT CREATE SESSION TO NIFI_READER;
@@ -72,7 +78,96 @@ GRANT SELECT     ON SYS.V_$DATABASE TO NIFI_READER; -- run 시작 시 CURRENT_SC
 
 원천 테이블이 여러 개면 `SELECT`와 `FLASHBACK`을 테이블마다 부여합니다.
 
-### 1-2. NIFI_READER 계정으로 권한 확인
+#### 1-1-1. 기존 계정 사용 시 권한 확인
+
+이미 쓰고 있는 계정(예: `ETL_USER`)을 그대로 쓰려면 계정을 새로 만들지 않고, 그 계정에 Flow가 필요로 하는
+권한 4가지가 있는지만 확인합니다.
+
+| 필요한 권한 | 쓰는 곳 | 다음 중 하나가 있으면 충족 |
+|---|---|---|
+| 접속 | PG-10, PG-20 | `CREATE SESSION` |
+| 원천 조회 | PG-10 manifest, PG-20 추출 | 테이블 `SELECT`, `SELECT ANY TABLE`, 또는 그 계정이 테이블 owner |
+| `AS OF SCN` 조회 | PG-10 manifest, PG-20 추출 | 테이블 `FLASHBACK`, `FLASHBACK ANY TABLE`, 또는 그 계정이 테이블 owner |
+| SCN 조회 | PG-10 | `V_$DATABASE` `SELECT`, `SELECT ANY DICTIONARY`, 또는 `SELECT_CATALOG_ROLE` |
+
+아래 쿼리는 모두 **그 기존 계정으로 접속해서** 실행합니다. 이 계정의 세션에서 실제로 쓸 수 있는 권한만
+보여 주므로, NiFi가 같은 계정으로 접속했을 때와 결과가 같습니다.
+
+**① 시스템 권한** (`CREATE SESSION`, `ANY` 권한)
+
+```sql
+SELECT PRIVILEGE
+  FROM SESSION_PRIVS
+ WHERE PRIVILEGE IN ('CREATE SESSION', 'SELECT ANY TABLE',
+                     'FLASHBACK ANY TABLE', 'SELECT ANY DICTIONARY')
+ ORDER BY 1;
+```
+
+**② 원천 테이블 권한** (직접 받은 권한과, 활성화된 role·PUBLIC으로 받은 권한 모두 포함)
+
+```sql
+SELECT GRANTEE, TABLE_SCHEMA, TABLE_NAME, PRIVILEGE
+  FROM ALL_TAB_PRIVS
+ WHERE TABLE_SCHEMA = 'APP'
+   AND TABLE_NAME   = 'INSP_DTL'
+   AND PRIVILEGE IN ('SELECT', 'FLASHBACK');
+```
+
+- 결과에 `SELECT`와 `FLASHBACK`이 모두 있으면 됩니다.
+- ①에 `SELECT ANY TABLE`이나 `FLASHBACK ANY TABLE`이 있으면, 해당 권한은 ②에 없어도 충족됩니다.
+- 계정이 테이블 owner라면(예: `APP` 계정 자체) ②의 결과가 비어 있어도 됩니다. owner는 자기 테이블을
+  권한 없이 조회하고 `AS OF SCN`으로 읽을 수 있습니다. 다만 owner 계정은 쓰기·DDL 권한도 가지므로,
+  가능하면 읽기 전용 계정을 따로 만드는 것을 권장합니다.
+
+**③ 확인 대상 테이블이 owner 소유인지**
+
+```sql
+SELECT SYS_CONTEXT('USERENV', 'SESSION_USER') AS login_user FROM DUAL;   -- 'APP'이면 owner
+```
+
+**④ role로 받은 권한이 기본(default) role인지**
+
+role로 받은 권한은 그 role이 **default role**일 때만 JDBC 접속 직후 바로 쓸 수 있습니다. NiFi는 `SET ROLE`을
+실행하지 않으므로, `DEFAULT_ROLE = 'NO'`인 role을 통해 받은 권한은 Flow에서 쓸 수 없습니다.
+
+```sql
+SELECT GRANTED_ROLE, DEFAULT_ROLE FROM USER_ROLE_PRIVS ORDER BY 1;
+SELECT ROLE FROM SESSION_ROLES ORDER BY 1;   -- 지금 세션에서 활성화된 role
+```
+
+②에서 `GRANTEE`가 role 이름으로 나온 권한은, 그 role이 `SESSION_ROLES`에 나오면 사용 가능합니다.
+
+**⑤ 최종 판정: 실제 쿼리 실행**
+
+딕셔너리 조회 결과와 관계없이, 아래 1-2의 두 쿼리가 성공해야 통과입니다. 실패 메시지별 원인은 다음과 같습니다.
+
+| 오류 | 원인 | DBA에 요청할 것 |
+|---|---|---|
+| `ORA-00942: table or view does not exist` (V$DATABASE) | SCN 조회 권한 없음 | `GRANT SELECT ON SYS.V_$DATABASE TO <계정>` |
+| `ORA-00942` (원천 테이블) | 테이블 `SELECT` 없음 | `GRANT SELECT ON APP.INSP_DTL TO <계정>` |
+| `ORA-01031: insufficient privileges` (`AS OF SCN` 쿼리) | `FLASHBACK` 없음 | `GRANT FLASHBACK ON APP.INSP_DTL TO <계정>` |
+| `ORA-01555`, `ORA-08180` | 권한이 아닌 undo 보존 부족 | undo retention 검토 |
+
+기존 계정을 쓸 때는 다음도 확인합니다.
+
+- **비밀번호 만료·잠금 정책:** 다른 애플리케이션과 같은 계정을 쓰면 비밀번호를 바꿀 때 NiFi의
+  `ORACLE.JDBC.PASSWORD`(공통 Parameter)도 함께 바꿔야 합니다.
+- **세션 수 한도:** 계정의 profile `SESSIONS_PER_USER`가 `ORACLE.POOL.MAX × Job 수 × NiFi 노드 수`와
+  기존 애플리케이션 세션을 합친 수보다 커야 합니다.
+
+  ```sql
+  SELECT p.RESOURCE_NAME, p.LIMIT
+    FROM USER_USERS u JOIN DBA_PROFILES p ON p.PROFILE = u.PROFILE
+   WHERE p.RESOURCE_NAME = 'SESSIONS_PER_USER';
+  ```
+
+  `DBA_PROFILES`를 조회할 권한이 없으면 DBA에게 확인을 요청합니다.
+
+7단계의 `ORACLE.JDBC.USER`와 `ORACLE.JDBC.PASSWORD`에는 이 기존 계정 정보를 넣습니다.
+
+### 1-2. Flow에서 쓸 계정으로 권한 확인
+
+새로 만든 `NIFI_READER` 또는 1-1-1의 기존 계정으로 접속해서 실행합니다.
 
 ```sql
 SELECT TO_CHAR(CURRENT_SCN) AS SNAPSHOT_SCN FROM V$DATABASE;
@@ -106,13 +201,122 @@ SELECT COUNT(*)                        AS total_rows,
 
 ### 2-1. HDFS stage 경로
 
+#### 왜 필요한가
+
+stage 경로는 Oracle에서 추출한 데이터를 target 테이블에 게시하기 전에 **run 단위로 잠시 보관하는 HDFS
+작업 공간**입니다. Sqoop이 쓰던 HDFS staging 디렉터리(`--target-dir`)와 같은 역할입니다. Flow에서는 다음
+순서로 쓰입니다.
+
+| 단계 | stage 경로에서 하는 일 | 읽고 쓰는 사용자 |
+|---|---|---|
+| PG-10 | API가 run마다 전용 경로 `<HDFS.STAGE.ROOT>/<JOB.KEY>/run_id=<runId>`를 정해 줍니다 | — |
+| PG-20 | 파티션별로 추출한 Parquet 파일을 그 run 경로에 씁니다(PutHDFS) | NiFi |
+| PG-40 | 모든 파티션이 끝나면 `_SUCCESS` 파일을 쓰고, run 경로를 `LOCATION`으로 하는 Hive external staging 테이블을 만들어 건수·합계를 원천과 비교합니다 | NiFi(쓰기), Hive(읽기) |
+| PG-50 | staging 테이블을 읽어 target 파티션을 `INSERT OVERWRITE`합니다 | Hive(읽기) |
+| PG-70 | 보존 기간이 지난 run 경로를 삭제합니다(DeleteHDFS) | NiFi |
+
+target에 바로 쓰지 않고 이 경로를 거치는 이유는 다음과 같습니다.
+
+- **부분 게시 방지:** 일부 파티션만 성공한 상태로 target이 바뀌지 않습니다. 모든 파티션 추출과 staging
+  검증이 통과한 뒤에만 target을 교체합니다.
+- **run 격리:** run마다 경로가 달라서 재실행하거나 동시에 실행해도 파일이 섞이지 않습니다.
+- **장애 분석:** 실패한 run의 파일이 보존 기간(API `cleanup.failed_retention`, 기본 14일) 동안 남아 있어
+  원인을 확인할 수 있습니다.
+
+따라서 stage 경로에는 **최대 run 크기 × 동시 Job 수 × 보존 기간(성공 3일, 실패 14일)**만큼의 HDFS 용량과
+quota가 필요합니다.
+
+#### 점검 1: NiFi가 HDFS에 어떤 사용자로 접속하는가
+
+예시의 `nifi:nifi`는 가정일 뿐입니다. 실제 HDFS 사용자와 그룹은 환경마다 다르고, `nifi` 사용자·그룹이
+HDFS 쪽에 없을 수도 있습니다. 소유자를 정하기 전에 다음을 확인합니다.
+
+이 Flow의 PutHDFS·DeleteHDFS에는 Kerberos principal 설정이 없습니다. 따라서 simple 인증 클러스터에서는
+**NiFi 프로세스를 실행하는 OS 사용자 이름**이 그대로 HDFS 사용자가 됩니다(NiFi 환경에 `HADOOP_USER_NAME`을
+지정했다면 그 값).
+
 ```bash
-hdfs dfs -mkdir -p /data/nifi/stage
-hdfs dfs -chown nifi:nifi /data/nifi/stage     # NiFi 실행 사용자
+# 각 NiFi 노드에서: NiFi 프로세스의 실행 사용자
+ps -o user= -p "$(pgrep -f org.apache.nifi.NiFi | head -1)"
+
+# NiFi 환경 변수에 HADOOP_USER_NAME이 지정되어 있는지
+grep -rn HADOOP_USER_NAME /opt/nifi/conf/ /etc/nifi/ 2>/dev/null   # CFM 설치 경로에 맞게
+```
+
+HDFS의 그룹은 **NameNode 호스트**의 사용자·그룹 정보(또는 LDAP group mapping)로 정해집니다. NiFi 노드에
+`nifi` 그룹이 있어도 NameNode에 없으면 HDFS에서는 그 그룹에 속하지 않습니다.
+
+```bash
+# 클러스터가 보는 그룹 확인 (NameNode 기준)
+hdfs groups <NiFi 실행 사용자>
+
+# NameNode 호스트에서 사용자·그룹 존재 확인
+id <NiFi 실행 사용자>
+getent group <사용할 그룹>
+```
+
+| 결과 | 조치 |
+|---|---|
+| `hdfs groups`가 사용자와 그룹을 정상으로 보여 줌 | 그 사용자·그룹을 소유자로 씁니다 |
+| 사용자가 그룹 없이 나오거나 오류 | NameNode(또는 LDAP)에 사용자·그룹을 추가하거나, 관리자와 협의해 기존 그룹을 씁니다 |
+| `nifi` 그룹이 없음 | `chown <사용자>:<실제 존재하는 그룹>`으로 지정합니다. 그룹은 점검 2의 Hive 읽기 권한과 함께 정합니다 |
+
+> [!NOTE]
+> 클러스터가 Kerberos를 쓴다면 현재 빌더가 만드는 PutHDFS에는 principal·keytab 설정이 없어서 HDFS 접속이
+> 실패합니다. 이 경우 빌더에 Kerberos 설정을 추가해야 합니다.
+
+#### 점검 2: Hive가 stage 파일을 읽을 수 있는가
+
+PG-40·PG-50에서 Hive는 NiFi가 쓴 파일을 읽습니다. 어떤 사용자로 읽는지는 HiveServer2의
+`hive.server2.enable.doAs` 설정에 따라 달라집니다.
+
+| `hive.server2.enable.doAs` | 파일을 읽는 HDFS 사용자 | 필요한 권한 |
+|---|---|---|
+| `true` | `HIVE.JDBC.USER`(예: `nifi`) | 보통 NiFi 사용자와 같으므로 추가 조치 없음 |
+| `false` (Hive 3·CDP 기본값) | `hive` 서비스 사용자 | stage 경로 그룹에 `hive`를 넣거나 ACL로 읽기 권한 부여 |
+
+PutHDFS는 umask `027`(`HDFS.PERMISSIONS.UMASK`)로 파일을 만들므로 파일 권한이 `rw-r-----`입니다. 즉
+**소유자와 그룹만 읽을 수 있습니다.** `doAs=false`라면 다음 중 하나를 적용합니다.
+
+```bash
+# 방법 A: hive 사용자가 속한 그룹을 stage 경로의 그룹으로 지정
+hdfs dfs -chown <NiFi 사용자>:<hive가 속한 그룹> /data/nifi/stage
+
+# 방법 B: ACL로 hive에 읽기 권한 부여 (dfs.namenode.acls.enabled=true 필요)
+hdfs dfs -setfacl -m user:hive:r-x         /data/nifi/stage
+hdfs dfs -setfacl -m default:user:hive:r-x /data/nifi/stage   # 하위에 새로 생기는 run 경로에도 상속
+```
+
+#### 생성
+
+점검 결과로 정한 사용자·그룹으로 만듭니다. 아래 명령은 HDFS superuser(보통 `hdfs`)로 실행합니다.
+
+```bash
+sudo -u hdfs hdfs dfs -mkdir -p /data/nifi/stage
+sudo -u hdfs hdfs dfs -chown <NiFi 사용자>:<그룹> /data/nifi/stage
+sudo -u hdfs hdfs dfs -chmod 750 /data/nifi/stage
 hdfs dfs -ls -d /data/nifi/stage
 ```
 
-이 경로는 7단계의 `HDFS.STAGE.ROOT`에 씁니다.
+#### 점검 3: 실제 쓰기·삭제 시험
+
+NiFi 노드에서 NiFi 실행 사용자로 run 경로와 같은 깊이의 디렉터리를 만들고 지워 봅니다.
+
+```bash
+sudo -u <NiFi 사용자> hdfs dfs -mkdir -p /data/nifi/stage/_precheck/run_id=test
+sudo -u <NiFi 사용자> hdfs dfs -touchz  /data/nifi/stage/_precheck/run_id=test/_SUCCESS
+sudo -u <NiFi 사용자> hdfs dfs -ls -R   /data/nifi/stage/_precheck
+sudo -u <NiFi 사용자> hdfs dfs -rm -r -skipTrash /data/nifi/stage/_precheck
+```
+
+`doAs=false`라면 hive 사용자로 읽기도 확인합니다(지우기 전에 실행).
+
+```bash
+sudo -u hive hdfs dfs -ls /data/nifi/stage/_precheck/run_id=test
+```
+
+`Permission denied`가 나오면 점검 1·2로 돌아가 소유자·그룹·ACL을 고칩니다. 이 경로는 7단계의
+`HDFS.STAGE.ROOT`에 씁니다.
 
 ### 2-2. Hive DB와 target 테이블
 
@@ -165,6 +369,48 @@ GRANT CREATE ON DATABASE nifiops TO nifi_ops_migrator;
 ---
 
 ## 4단계. Load Control API token 생성
+
+### 4-1. 왜 필요한가
+
+Load Control API는 run의 상태를 결정하는 **유일한 판정자**입니다. 다음과 같은 요청이 모두 이 API로 들어옵니다.
+
+- 파티션 추출 완료 보고
+- 검증 결과 기록
+- target 게시 소유권 요청
+- 최종 성공 처리
+
+API는 이 요청들을 보고 다음 단계를 시작할지 결정합니다. 따라서 **누가 요청했는지 확인하지 않으면** 다음 일이
+생길 수 있습니다.
+
+| 위험 | 예 |
+|---|---|
+| 잘못된 완료 판정 | 네트워크의 다른 프로그램이나 잘못 설정된 다른 Flow가 chunk 보고를 보내 건수가 맞는 것처럼 보이게 함 |
+| 의도하지 않은 게시 | 검증이 끝나지 않은 run에 대해 게시 요청이 들어와 target 파티션이 `INSERT OVERWRITE`로 교체됨 |
+| 운영 조치 오용 | `PUBLISH_UNKNOWN` 수동 확정이나 dispatch 재전송을 아무나 호출함 |
+
+NiFi가 HTTP·무인증이라는 것은 **NiFi UI·REST API에 로그인이 없다**는 뜻일 뿐입니다. NiFi Flow가 Load
+Control API를 호출할 때의 인증과는 관계가 없습니다. 그래서 NiFi가 무인증이어도 이 token은 반드시
+만들어야 하고, API는 token 없는 요청을 `401`로 거부합니다. `auth.token_digests`를 비워 두면 인증이 꺼지는
+것이 아니라 모든 요청이 거부됩니다.
+
+token을 두 개로 나누는 이유는 권한을 분리하기 위해서입니다.
+
+| token | 사용 주체 | 할 수 있는 일 |
+|---|---|---|
+| `NIFI_TOKEN` | NiFi Flow(PG-10·20·40·50·60·70·90) | run 생성, 파티션·chunk 보고, 검증·게시 결과 보고, 실패·cleanup 보고, 조회 |
+| `OPERATOR_TOKEN` | 운영자(TUI, curl) | 조회, dispatch 재전송, `PUBLISH_UNKNOWN` 수동 확정 |
+
+같은 token을 함께 쓰면, NiFi 설정에 들어 있는 token이 유출되었을 때 운영자 전용 수동 확정 권한까지 넘어갑니다.
+
+API 설정에는 token 원문 대신 **SHA-256 digest만** 저장합니다. `config.yaml` 파일이 유출되어도 원문을 알 수
+없게 하기 위해서입니다. NiFi 쪽에서는 원문이 sensitive Parameter로 저장되어 UI에 보이지 않습니다.
+
+> [!WARNING]
+> NiFi와 API 사이가 HTTP이므로 token은 네트워크에서 평문으로 전송됩니다. API 포트(8080)는 NiFi 노드와
+> 운영 관리망에서만 접근할 수 있도록 방화벽으로 제한합니다. 또한 API worker가 NiFi PG-05를 호출하는
+> 방향(9443)에는 token이 없으므로, 이 포트도 API worker 호스트에서만 접근할 수 있게 제한합니다.
+
+### 4-2. 생성
 
 token은 두 개를 **서로 다르게** 만듭니다. 원문은 비밀 저장소에 보관합니다.
 
@@ -392,7 +638,7 @@ Job PG 이름만 바꾸려면 `names`를 쓰기보다 배포 스크립트의 세
 | `CONTROL.LISTEN.PORT` | PG-05가 모든 NiFi 노드에서 여는 HTTP 포트. API `nifi.receiver_url`의 포트와 같게 | 0·5단계 |
 | `META.JDBC.*` | `nifi_runtime` 계정 정보와 PostgreSQL JDBC jar 경로 | 3·6단계 |
 | `ORACLE.JDBC.URL` | `jdbc:oracle:thin:@//<host>:<port>/<service>` | 0단계 |
-| `ORACLE.JDBC.USER`, `PASSWORD` | `NIFI_READER` 계정 정보 | 1단계 |
+| `ORACLE.JDBC.USER`, `PASSWORD` | `NIFI_READER` 또는 1-1-1에서 확인한 기존 계정 정보 | 1단계 |
 | `ORACLE.JDBC.DRIVER.PATH` | ojdbc11 jar 경로 (모든 노드에서 같은 경로) | 6단계 |
 | `ORACLE.POOL.MAX` | Job 하나의 Oracle 연결 상한. DBA가 승인한 세션 수 이내 | DBA |
 | `ORACLE.NUMBER.DEFAULT.*` | precision 없는 `NUMBER`의 기본 처리값. 보통 그대로 둠 | — |
